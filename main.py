@@ -16,6 +16,7 @@ and rigorously backtest.
 import os
 import time
 import yaml
+import pandas as pd
 from dotenv import load_dotenv
 
 from core.state_manager import StateManager
@@ -145,14 +146,6 @@ def main():
             api_key = os.environ.get(f"{name.upper()}_API_KEY", "")
             api_secret = os.environ.get(f"{name.upper()}_API_SECRET", "")
             passphrase = os.environ.get(f"{name.upper()}_PASSPHRASE", "")
-            exchange_config = {
-                "apiKey": api_key,
-                "secret": api_secret,
-                "enableRateLimit": True,
-            }
-            if passphrase:
-                exchange_config["password"] = passphrase
-            # OKX needs the passphrase in the ccxt config
             executors[name] = ExecutionManager(
                 exchange_id=name,
                 api_key=api_key,
@@ -162,6 +155,9 @@ def main():
                 notifier=notifier,
                 dry_run=True,
             )
+            # OKX requires a passphrase — inject it onto the ccxt exchange object
+            if passphrase:
+                executors[name].exchange.password = passphrase
 
     # OANDA executor (Forex/Commodities)
     oanda_key = os.environ.get("OANDA_API_KEY")
@@ -219,14 +215,74 @@ def main():
         f"{len(ml_models)} ML models loaded."
     )
 
+    # --- NSE analysis setup ---
+    from data_feeds.nse_feed import NSEFeed
+    from long_term.fundamentals import FundamentalsFetcher
+    from long_term.screener import EquityScreener
+    from long_term.news_sentiment import NewsSentiment
+    nse_feed = NSEFeed()
+    nse_watchlist = CONFIG.get("nse", {}).get("watchlist",
+        ["SCOM", "EQTY", "KCB", "BAT", "EABL", "SAFARICOM", "DTK",
+         "COOP", "ABSA", "KNC", "NIC"])
+    nse_interval = CONFIG.get("nse", {}).get("analysis_interval_minutes", 60) * 60
+    last_nse_check = 0
+    fundamentals = FundamentalsFetcher()
+    news = NewsSentiment()
+
+    def check_nse_stocks():
+        """Analyze NSE stocks and send alerts through all channels (Telegram,
+        Discord, email, dashboard) — this is the NSE notification pipeline."""
+        results = []
+        for ticker in nse_watchlist:
+            try:
+                df = nse_feed.get_ohlcv(ticker, timeframe="1d", limit=200)
+                if df is None or len(df) < 30:
+                    continue
+
+                profile = fundamentals.get_profile(ticker)
+                sentiment = news.get_sentiment(ticker)
+
+                # Technical context
+                df["ma50"] = df["close"].rolling(50).mean()
+                df["ma200"] = df["close"].rolling(200).mean()
+                last = df.iloc[-1]
+                above_200 = last["close"] > last["ma200"] if not pd.isna(last.get("ma200")) else None
+                golden_cross = last["ma50"] > last["ma200"] if not pd.isna(last.get("ma200")) and not pd.isna(last.get("ma50")) else None
+
+                price = float(last["close"])
+                msg_parts = [f"NSE: {ticker} @ KES {price:.2f}"]
+                if above_200 is not None:
+                    msg_parts.append(f"{'Above' if above_200 else 'Below'} 200DMA")
+                if golden_cross is not None:
+                    msg_parts.append("Golden cross" if golden_cross else "No golden cross")
+                if sentiment and sentiment.get("avg_sentiment") is not None:
+                    msg_parts.append(f"News: {sentiment['label']} ({sentiment['avg_sentiment']:+.2f})")
+
+                results.append("\n  ".join(msg_parts))
+            except Exception:
+                continue
+
+        if results:
+            message = "NSE Kenya Analysis:\n" + "\n".join(results)
+            notifier.notify("nse_alert", message)
+
     while True:
         risk_state = state.get_risk_state()
         if risk_state["trading_halted"]:
             time.sleep(30)
             continue
 
+        # --- NSE analysis on schedule ---
+        now = time.time()
+        if now - last_nse_check >= nse_interval:
+            try:
+                check_nse_stocks()
+                last_nse_check = now
+            except Exception as e:
+                print(f"NSE analysis error: {e}")
+
         for exchange_name, symbol in all_markets:
-            # Skip NSE — alert/analysis only, no automated execution
+            # Skip NSE — handled by the analysis loop above
             if exchange_name == "nse":
                 continue
 

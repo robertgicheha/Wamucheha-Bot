@@ -40,12 +40,12 @@ class FeedRouter:
         self._init_feeds(config)
 
     def _init_feeds(self, config: dict):
-        # ccxt feeds (Binance for crypto)
+        # ccxt feeds (Binance, OKX, etc.)
         for ex_cfg in config.get("execution", {}).get("exchanges", []):
             if not ex_cfg.get("enabled"):
                 continue
             name = ex_cfg["name"]
-            if name in ("binance", "kraken", "coinbase", "bybit"):
+            if name in ("binance", "okx", "kraken", "coinbase", "bybit"):
                 api_key = os.environ.get(f"{name.upper()}_API_KEY", "")
                 api_secret = os.environ.get(f"{name.upper()}_API_SECRET", "")
                 self.feeds[name] = MarketData(name, api_key, api_secret)
