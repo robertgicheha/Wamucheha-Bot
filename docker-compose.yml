@@ -1,0 +1,87 @@
+version: "3.8"
+
+# 4 separate services — not one monolith.
+# Keep execution logic separate from strategy logic — this is the single biggest
+# thing that prevents catastrophic bugs (a bad signal shouldn't be able to bypass
+# risk limits).
+
+services:
+  # Service 1: Data Ingestion + Strategy/Signal Engine + Risk/Execution Manager
+  # (the trading engine — runs the main loop)
+  engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.engine
+    container_name: trading-engine
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - engine-data:/app/data
+      - ml-models:/app/ml/saved_models
+    networks:
+      - trading-net
+    depends_on:
+      - dashboard
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://dashboard:8000/health', timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # Service 2: Dashboard / Control API
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile.dashboard
+    container_name: trading-dashboard
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "${DASHBOARD_PORT:-8000}:8000"
+    volumes:
+      - engine-data:/app/data:ro
+      - ./config:/app/config:ro
+    networks:
+      - trading-net
+
+  # Service 3: Long-term Equity Screener (runs weekly on schedule)
+  screener:
+    build:
+      context: .
+      dockerfile: Dockerfile.screener
+    container_name: trading-screener
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - ./config:/app/config:ro
+      - screener-data:/app/data
+    networks:
+      - trading-net
+
+  # Service 4: Heartbeat Watchdog (runs on a SEPARATE machine ideally,
+  # but included here for completeness — in production, run this outside
+  # the same Docker host as the other services)
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile.engine
+    container_name: trading-watchdog
+    restart: unless-stopped
+    env_file: .env
+    entrypoint: ["python", "scripts/heartbeat_monitor.py"]
+    networks:
+      - trading-net
+
+volumes:
+  engine-data:
+    driver: local
+  ml-models:
+    driver: local
+  screener-data:
+    driver: local
+
+networks:
+  trading-net:
+    driver: bridge

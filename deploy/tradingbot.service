@@ -1,0 +1,24 @@
+[Unit]
+Description=Trading Bot - Execution Engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+WorkingDirectory=/opt/trading_bot
+EnvironmentFile=/opt/trading_bot/.env
+ExecStart=/opt/trading_bot/venv/bin/python /opt/trading_bot/main.py
+Restart=always
+RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
+# If it crash-loops 5x in 5 min, systemd stops retrying and this unit fails —
+# which you should have separate infra-level alerting on (e.g. a simple
+# `systemctl is-active` check in cron, or a monitoring agent).
+
+StandardOutput=append:/opt/trading_bot/logs/bot.log
+StandardError=append:/opt/trading_bot/logs/bot_error.log
+
+[Install]
+WantedBy=multi-user.target

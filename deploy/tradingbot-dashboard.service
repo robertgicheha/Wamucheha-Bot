@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading Bot - Dashboard
+After=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+WorkingDirectory=/opt/trading_bot
+EnvironmentFile=/opt/trading_bot/.env
+ExecStart=/opt/trading_bot/venv/bin/uvicorn dashboard.app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

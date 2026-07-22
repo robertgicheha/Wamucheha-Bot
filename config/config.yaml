@@ -1,0 +1,69 @@
+# All risk parameters live here so you never have to touch code to change them.
+
+account:
+  stake_amount: 100.0          # overridden by STAKE_AMOUNT env var if set
+  currency: USD
+  stake_wallet_address: ""     # cold wallet / separate account, bot has no access
+
+risk:
+  max_consecutive_losses: 8          # hard stop, per your spec
+  max_daily_loss_pct: 15             # % of trading_balance; hit this -> stop for the day
+  max_position_pct: 2                # % of trading_balance risked on any single trade
+  stop_loss_pct: 1.5                 # per-trade stop loss, always attached at order time
+  take_profit_pct: 3.0               # optional per-trade target
+  profit_withdrawal_threshold: 500   # when trading_balance hits this, sweep excess to stake wallet
+  profit_withdrawal_keep: 200        # amount left in trading_balance after a sweep
+  volatility_circuit_breaker_pct: 5  # pause trading if price moves this % in the window below
+  volatility_window_minutes: 5
+
+execution:
+  exchanges:
+    - name: binance
+      enabled: true
+      markets: ["BTC/USDT", "ETH/USDT"]
+    - name: okx
+      enabled: false
+      markets: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+    - name: oanda
+      enabled: false
+      markets: []
+    - name: alpaca
+      enabled: false
+      markets: []
+  oanda_markets: ["EUR/USD", "XAU/USD"]
+  alpaca_markets: ["AAPL", "SPY", "GLD", "QQQ"]
+  order_type: market            # market | limit
+  max_slippage_pct: 0.5
+  idempotency: true              # attach client order IDs, dedupe on retry
+
+ml:
+  use_lstm: true                 # enable/disable LSTM filter on signals
+  lstm_min_confidence: 0.6       # minimum probability from LSTM to allow a trade
+  lstm_model_type: pytorch       # pytorch | tensorflow
+
+long_term:
+  universe:
+    - source: sp500
+    - source: nse_kenya
+  screens:
+    min_dividend_years_growth: 5
+    max_payout_ratio: 70
+    min_market_cap_usd: 500000000
+  rebalance_alert_schedule: "0 8 * * MON"   # cron: Monday 8am
+
+nse:
+  watchlist: ["SCOM", "EQTY", "KCB", "BAT", "EABL", "SAFARICOM", "DTK",
+              "COOP", "ABSA", "KNC", "NIC"]
+  analysis_interval_minutes: 60   # how often to check NSE stocks for alerts
+
+alerts:
+  channels: [telegram, discord, email, dashboard]
+  notify_on:
+    - trade_opened
+    - trade_closed
+    - circuit_breaker_triggered
+    - daily_loss_limit_hit
+    - profit_swept_to_stake
+    - heartbeat_missed
+    - long_term_signal
+    - nse_alert

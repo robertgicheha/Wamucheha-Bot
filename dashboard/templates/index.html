@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Trading Bot Dashboard</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; background: #0f1115; color: #e6e6e6; padding: 2rem; }
+    .card { background: #1a1d24; border-radius: 10px; padding: 1.2rem; margin-bottom: 1rem; }
+    .halted { border-left: 4px solid #e05252; }
+    .ok { border-left: 4px solid #4caf7d; }
+    .stat { display: inline-block; margin-right: 2rem; }
+    .stat .label { color: #999; font-size: 0.8rem; }
+    .stat .value { font-size: 1.4rem; font-weight: 600; }
+    button { background: #e05252; color: white; border: none; padding: 0.6rem 1.2rem;
+             border-radius: 6px; cursor: pointer; margin-right: 0.5rem; }
+    button.resume { background: #4caf7d; }
+    .event { padding: 0.4rem 0; border-bottom: 1px solid #2a2d35; font-size: 0.9rem; }
+    .high { color: #ff8080; }
+  </style>
+</head>
+<body>
+  <h2>Trading Bot Status</h2>
+  <div id="statusCard" class="card">Loading...</div>
+  <div class="card">
+    <input id="key" placeholder="dashboard secret key" type="password" style="padding:0.5rem;">
+    <button onclick="killSwitch()">Kill Switch</button>
+    <button class="resume" onclick="resume()">Resume Trading</button>
+  </div>
+  <h3>Recent Events</h3>
+  <div id="events" class="card"></div>
+
+<script>
+async function refresh() {
+  const res = await fetch('/api/status');
+  const data = await res.json();
+  const rs = data.risk_state || {};
+  const halted = rs.trading_halted;
+  document.getElementById('statusCard').className = 'card ' + (halted ? 'halted' : 'ok');
+  document.getElementById('statusCard').innerHTML = `
+    <div class="stat"><div class="label">Status</div><div class="value">${halted ? 'HALTED' : 'ACTIVE'}</div></div>
+    <div class="stat"><div class="label">Trading Balance</div><div class="value">$${(rs.trading_balance||0).toFixed(2)}</div></div>
+    <div class="stat"><div class="label">Consecutive Losses</div><div class="value">${rs.consecutive_losses||0}</div></div>
+    <div class="stat"><div class="label">Daily PnL</div><div class="value">$${(rs.daily_pnl||0).toFixed(2)}</div></div>
+    ${halted ? `<div style="margin-top:0.5rem;color:#ff8080;">Reason: ${rs.halt_reason||''}</div>` : ''}
+  `;
+  const ev = document.getElementById('events');
+  ev.innerHTML = (data.recent_events || []).map(e =>
+    `<div class="event ${e.priority==='high'?'high':''}">[${e.ts}] <b>${e.type}</b> — ${e.message}</div>`
+  ).join('');
+}
+async function killSwitch() {
+  await fetch('/api/kill-switch', { method: 'POST', headers: { 'X-Dashboard-Key': document.getElementById('key').value }});
+  refresh();
+}
+async function resume() {
+  await fetch('/api/resume', { method: 'POST', headers: { 'X-Dashboard-Key': document.getElementById('key').value }});
+  refresh();
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
