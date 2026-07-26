@@ -1,32 +1,27 @@
 """
-TensorFlow/Keras LSTM price-direction predictor.
+LSTM-based short-horizon price direction predictor (PyTorch).
 
-Alternative backend to PyTorch LSTM. Both use the same enriched 15-feature set
-and label definition for apples-to-apples comparison. Selected via
-config.yaml -> ml.lstm_model_type: tensorflow.
+Predicts a PROBABILITY of price being higher N bars ahead, from a window of
+recent OHLCV + enriched technical features. Used as a secondary filter
+alongside the rule-based strategy ensemble — it can only veto trades, never
+create them.
 
-Same honest scope:
-- Predicts PROBABILITY of price being higher N bars ahead
-- Does NOT predict price targets
-- Wired in as a filter alongside rule-based strategy
-- Risk manager still has final veto power
+Enhanced feature set (15 features vs original 4):
+- Price returns, high-low range, volume change
+- RSI, MACD histogram, Bollinger %B
+- ADX trend strength, Stochastic %K
+- OBV momentum, ATR volatility
+- EMA alignment, price vs EMA50/200
 """
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 from pathlib import Path
-
-try:
-    import tensorflow as tf
-    from tensorflow import keras
-    from tensorflow.keras import layers
-    _has_tf = True
-except ImportError:
-    _has_tf = False
 
 MODEL_DIR = Path(__file__).parent / "saved_models"
 MODEL_DIR.mkdir(exist_ok=True)
 
-# Same 15-feature set as the PyTorch version
 FEATURE_COLS = [
     "return", "high_low_range", "volume_change",
     "rsi_norm", "macd_hist_norm", "bb_pct_b",
@@ -38,10 +33,23 @@ LOOKBACK = 30
 HORIZON = 5
 
 
-def _build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Same enriched feature engineering as the PyTorch version."""
-    df = df.copy()
+class LSTMNet(nn.Module):
+    def __init__(self, n_features: int, hidden_size: int = 48, num_layers: int = 2):
+        super().__init__()
+        self.lstm = nn.LSTM(n_features, hidden_size, num_layers, batch_first=True, dropout=0.3)
+        self.attention = nn.Linear(hidden_size, 1)
+        self.fc = nn.Linear(hidden_size, 1)
+        self.sigmoid = nn.Sigmoid()
 
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        attn_weights = torch.softmax(self.attention(out), dim=1)
+        context = (out * attn_weights).sum(dim=1)
+        return self.sigmoid(self.fc(context))
+
+
+def _build_features(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
     df["return"] = df["close"].pct_change()
     df["high_low_range"] = (df["high"] - df["low"]) / df["close"]
     df["volume_change"] = df["volume"].pct_change()
@@ -124,90 +132,90 @@ def _make_sequences(features: np.ndarray, closes: np.ndarray,
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
 
-class TFLSTMPricePredictor:
-    def __init__(self, symbol: str = "default", lookback: int = LOOKBACK,
-                 horizon: int = HORIZON):
-        if not _has_tf:
-            raise ImportError("TensorFlow not installed: pip install tensorflow")
+class LSTMPricePredictor:
+    def __init__(self, symbol: str = "default", lookback: int = LOOKBACK, horizon: int = HORIZON):
         self.symbol = symbol
         self.lookback = lookback
         self.horizon = horizon
-        self.model = self._build_model(len(FEATURE_COLS))
+        self.model = LSTMNet(n_features=len(FEATURE_COLS))
         self._feature_mean = None
         self._feature_std = None
         self._is_trained = False
 
     def _model_path(self) -> Path:
-        return MODEL_DIR / f"tf_lstm_{self.symbol.replace('/', '_')}.keras"
+        return MODEL_DIR / f"lstm_{self.symbol.replace('/', '_')}.pt"
 
-    def _meta_path(self) -> Path:
-        return MODEL_DIR / f"tf_lstm_{self.symbol.replace('/', '_')}.npz"
-
-    def _build_model(self, n_features: int) -> keras.Model:
-        model = keras.Sequential([
-            layers.Input(shape=(self.lookback, n_features)),
-            layers.LSTM(48, return_sequences=True),
-            layers.Dropout(0.3),
-            layers.LSTM(32),
-            layers.Dropout(0.3),
-            layers.Dense(1, activation="sigmoid"),
-        ])
-        model.compile(
-            optimizer=keras.optimizers.Adam(learning_rate=5e-4, weight_decay=1e-5),
-            loss="binary_crossentropy",
-            metrics=["accuracy"],
-        )
-        return model
-
-    def train(self, df: pd.DataFrame, epochs: int = 30, train_frac: float = 0.7,
-              batch_size: int = 32, verbose: bool = 1) -> dict:
+    def train(self, df: pd.DataFrame, epochs: int = 30, lr: float = 5e-4,
+              train_frac: float = 0.7, verbose: bool = True) -> dict:
         feat_df = _build_features(df)
         if len(feat_df) < self.lookback + self.horizon + 50:
-            raise ValueError("Not enough data — need ~100+ bars after feature warmup.")
+            raise ValueError("Not enough data to train — need at least ~100 bars after feature warmup.")
 
         features = feat_df[FEATURE_COLS].values
         self._feature_mean = features.mean(axis=0)
         self._feature_std = features.std(axis=0) + 1e-8
         features_norm = (features - self._feature_mean) / self._feature_std
 
-        X, y = _make_sequences(features_norm, feat_df["close"].values,
-                               self.lookback, self.horizon)
+        X, y = _make_sequences(features_norm, feat_df["close"].values, self.lookback, self.horizon)
         split = int(len(X) * train_frac)
         X_train, X_test = X[:split], X[split:]
         y_train, y_test = y[:split], y[split:]
 
-        callbacks = [
-            keras.callbacks.EarlyStopping(
-                monitor="val_loss", patience=6, restore_best_weights=True
-            ),
-        ]
+        X_train_t = torch.from_numpy(X_train)
+        y_train_t = torch.from_numpy(y_train).unsqueeze(1)
+        X_test_t = torch.from_numpy(X_test)
+        y_test_t = torch.from_numpy(y_test).unsqueeze(1)
 
-        self.model.fit(
-            X_train, y_train,
-            validation_data=(X_test, y_test),
-            epochs=epochs,
-            batch_size=batch_size,
-            callbacks=callbacks,
-            verbose=verbose,
-        )
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=1e-5)
+        loss_fn = nn.BCELoss()
 
-        test_loss, test_acc = self.model.evaluate(X_test, y_test, verbose=0)
-        baseline_acc = max(y_test.mean(), 1 - y_test.mean())
+        best_acc = 0
+        patience_counter = 0
+        self.model.train()
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            preds = self.model(X_train_t)
+            loss = loss_fn(preds, y_train_t)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            optimizer.step()
+
+            if (epoch + 1) % 5 == 0:
+                self.model.eval()
+                with torch.no_grad():
+                    test_preds = self.model(X_test_t)
+                    test_acc = ((test_preds > 0.5).float() == y_test_t).float().mean().item()
+                if test_acc > best_acc:
+                    best_acc = test_acc
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                if patience_counter >= 6:
+                    if verbose:
+                        print(f"  Early stopping at epoch {epoch+1}")
+                    break
+                self.model.train()
+                if verbose:
+                    print(f"  epoch {epoch+1}/{epochs} — loss: {loss.item():.4f} — test_acc: {test_acc:.4f}")
+
+        self.model.eval()
+        with torch.no_grad():
+            test_preds = self.model(X_test_t)
+            test_acc = ((test_preds > 0.5).float() == y_test_t).float().mean().item()
+            baseline_acc = max(y_test.mean(), 1 - y_test.mean())
 
         self._is_trained = True
         result = {
-            "test_accuracy": round(float(test_acc), 4),
-            "test_loss": round(float(test_loss), 4),
+            "test_accuracy": round(test_acc, 4),
             "naive_baseline_accuracy": round(float(baseline_acc), 4),
             "n_train_samples": len(X_train),
             "n_test_samples": len(X_test),
         }
-
         if verbose:
             print(f"\nTest accuracy: {result['test_accuracy']}")
             print(f"Naive baseline: {result['naive_baseline_accuracy']}")
             if result["test_accuracy"] <= result["naive_baseline_accuracy"] + 0.02:
-                print("WARNING: Model barely beats naive baseline.")
+                print("WARNING: Model barely beats naive baseline — no real predictive edge detected.")
         return result
 
     def predict_proba(self, df: pd.DataFrame) -> float | None:
@@ -219,31 +227,34 @@ class TFLSTMPricePredictor:
 
         features = feat_df[FEATURE_COLS].values[-self.lookback:]
         features_norm = (features - self._feature_mean) / self._feature_std
-        X = np.expand_dims(features_norm.astype(np.float32), axis=0)
+        X = torch.from_numpy(features_norm.astype(np.float32)).unsqueeze(0)
 
-        prob = self.model(X, training=False).numpy()[0][0]
-        return float(prob)
+        self.model.eval()
+        with torch.no_grad():
+            prob = self.model(X).item()
+        return prob
 
     def save(self):
-        self.model.save(self._model_path())
-        np.savez(
-            self._meta_path(),
-            feature_mean=self._feature_mean,
-            feature_std=self._feature_std,
-            lookback=self.lookback,
-            horizon=self.horizon,
-        )
+        torch.save({
+            "model_state": self.model.state_dict(),
+            "feature_mean": self._feature_mean,
+            "feature_std": self._feature_std,
+            "lookback": self.lookback,
+            "horizon": self.horizon,
+        }, self._model_path())
 
     def load(self) -> bool:
-        model_path = self._model_path()
-        meta_path = self._meta_path()
-        if not model_path.exists() or not meta_path.exists():
+        path = self._model_path()
+        if not path.exists():
             return False
-        self.model = keras.models.load_model(model_path)
-        meta = np.load(meta_path)
-        self._feature_mean = meta["feature_mean"]
-        self._feature_std = meta["feature_std"]
-        self.lookback = int(meta["lookback"])
-        self.horizon = int(meta["horizon"])
+        try:
+            checkpoint = torch.load(path, weights_only=True)
+        except Exception:
+            checkpoint = torch.load(path, weights_only=False)
+        self.model.load_state_dict(checkpoint["model_state"])
+        self._feature_mean = checkpoint["feature_mean"]
+        self._feature_std = checkpoint["feature_std"]
+        self.lookback = checkpoint["lookback"]
+        self.horizon = checkpoint["horizon"]
         self._is_trained = True
         return True

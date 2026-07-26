@@ -15,6 +15,11 @@
     button.resume { background: #4caf7d; }
     .event { padding: 0.4rem 0; border-bottom: 1px solid #2a2d35; font-size: 0.9rem; }
     .high { color: #ff8080; }
+    .regime { padding: 0.8rem 0; }
+    .regime .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; margin-right: 0.5rem; }
+    .regime .risk-on { background: #2d5a3d; color: #7ddf9d; }
+    .regime .risk-off { background: #5a2d2d; color: #df7d7d; }
+    .regime .neutral { background: #4a4a2d; color: #dfdf7d; }
   </style>
 </head>
 <body>
@@ -25,6 +30,9 @@
     <button onclick="killSwitch()">Kill Switch</button>
     <button class="resume" onclick="resume()">Resume Trading</button>
   </div>
+  <h3>Market Intelligence</h3>
+  <div id="regimeCard" class="card regime">Loading...</div>
+
   <h3>All-Time Profit / Loss</h3>
   <div id="profitCard" class="card">Loading...</div>
 
@@ -47,10 +55,24 @@ async function refresh() {
   document.getElementById('statusCard').innerHTML = `
     <div class="stat"><div class="label">Status</div><div class="value">${halted ? 'HALTED' : 'ACTIVE'}</div></div>
     <div class="stat"><div class="label">Trading Balance</div><div class="value">$${(rs.trading_balance||0).toFixed(2)}</div></div>
+    <div class="stat"><div class="label">Peak Balance</div><div class="value">$${(rs.peak_balance||0).toFixed(2)}</div></div>
     <div class="stat"><div class="label">Consecutive Losses</div><div class="value">${rs.consecutive_losses||0}</div></div>
     <div class="stat"><div class="label">Daily PnL</div><div class="value">$${(rs.daily_pnl||0).toFixed(2)}</div></div>
     ${halted ? `<div style="margin-top:0.5rem;color:#ff8080;">Reason: ${rs.halt_reason||''}</div>` : ''}
   `;
+
+  // Market intelligence
+  const regime = data.market_regime || {};
+  const fng = regime.fear_greed;
+  const fngLabel = fng ? (fng.value < 25 ? 'Extreme Fear' : fng.value < 45 ? 'Fear' : fng.value < 55 ? 'Neutral' : fng.value < 75 ? 'Greed' : 'Extreme Greed') : 'Unknown';
+  const fngClass = fng ? (fng.value < 45 ? 'risk-off' : fng.value > 55 ? 'risk-on' : 'neutral') : 'neutral';
+  document.getElementById('regimeCard').innerHTML = `
+    ${fng ? `<span class="tag ${fngClass}">Fear & Greed: ${fng.value} - ${fngLabel}</span>` : ''}
+    ${regime.dxy_trend ? `<span class="tag ${regime.dxy_trend === 'strengthening' ? 'risk-off' : 'risk-on'}">DXY: ${regime.dxy_trend}</span>` : ''}
+    ${regime.regime ? `<span class="tag ${regime.regime === 'risk_on' ? 'risk-on' : regime.regime === 'risk_off' ? 'risk-off' : 'neutral'}">Regime: ${regime.regime}</span>` : ''}
+    ${!fng && !regime.dxy_trend ? '<span style="color:#666;">Market intelligence loading...</span>' : ''}
+  `;
+
   const ev = document.getElementById('events');
   ev.innerHTML = (data.recent_events || []).map(e =>
     `<div class="event ${e.priority==='high'?'high':''}">[${e.ts}] <b>${e.type}</b> — ${e.message}</div>`
@@ -59,8 +81,8 @@ async function refresh() {
   const profitRes = await fetch('/api/profit');
   const p = await profitRes.json();
   document.getElementById('profitCard').innerHTML = `
-    <div class="stat"><div class="label">Total Trades</div><div class="value">${p.total_trades||0}</div></div>
-    <div class="stat"><div class="label">Win Rate</div><div class="value">${p.win_rate_pct||0}%</div></div>
+    <div class="stat"><div class="label">Total Trades</div><div class="value">${p.total||0}</div></div>
+    <div class="stat"><div class="label">Win Rate</div><div class="value">${(p.win_rate||0).toFixed(1)}%</div></div>
     <div class="stat"><div class="label">Total Made</div><div class="value">$${(p.total_won||0).toFixed(2)}</div></div>
     <div class="stat"><div class="label">Total Lost</div><div class="value">$${(p.total_lost||0).toFixed(2)}</div></div>
     <div class="stat"><div class="label">Net PnL</div><div class="value">$${(p.net_pnl||0).toFixed(2)}</div></div>
@@ -76,8 +98,8 @@ async function refresh() {
   const hourlyRes = await fetch('/api/hourly-logs?n=24');
   const h = await hourlyRes.json();
   document.getElementById('hourly').innerHTML = (h.hourly_logs || []).map(r =>
-    `<div class="event">${r.period_end.slice(0,16)}Z — trades=${r.trades_closed} ` +
-    `(${r.wins}W/${r.losses}L) hourPnL=${r.hour_pnl.toFixed(2)} bal=$${r.trading_balance.toFixed(2)}</div>`
+    `<div class="event">${(r.ts||'').slice(0,16)}Z — trades=${r.trades_this_hour||0} ` +
+    `(${r.wins_this_hour||0}W/${r.losses_this_hour||0}L) PnL=$${(r.hour_pnl||0).toFixed(2)} bal=$${(r.trading_balance||0).toFixed(2)}</div>`
   ).join('') || '<div class="event">No hourly reports yet — first one lands within an hour of the bot starting.</div>';
 }
 async function killSwitch() {

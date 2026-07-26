@@ -2,13 +2,17 @@
 Dashboard + control API.
 
 /health          -> polled by the local watchdog to detect a dead/frozen bot
-/api/status      -> current risk state, open positions, recent events
+/api/status      -> current risk state, open positions, recent events, market regime
 /api/kill-switch -> POST, manually halt all trading immediately (auth required)
 /api/resume      -> POST, manually resume after review (auth required)
+/api/trades      -> recent closed trades
+/api/profit      -> all-time stats
+/api/hourly-logs -> hourly report history
 /                -> simple live-updating HTML view
 """
 import json
 import os
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -17,7 +21,6 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi import Request
 
-import sys
 sys.path.append(str(Path(__file__).parent.parent))
 from core.state_manager import StateManager, SNAPSHOT_PATH
 from core.risk_manager import RiskManager
@@ -31,6 +34,16 @@ DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET_KEY", "change_me")
 
 _start_time = datetime.now(timezone.utc)
 
+# Shared state manager instance
+_state_manager = None
+
+
+def _get_state():
+    global _state_manager
+    if _state_manager is None:
+        _state_manager = StateManager(stake_amount=0)
+    return _state_manager
+
 
 def _load_snapshot():
     if SNAPSHOT_PATH.exists():
@@ -41,15 +54,27 @@ def _load_snapshot():
 def _load_recent_events(n=25):
     if not EVENT_LOG.exists():
         return []
-    lines = EVENT_LOG.read_text().strip().splitlines()[-n:]
-    return [json.loads(l) for l in reversed(lines)]
+    try:
+        lines = EVENT_LOG.read_text().strip().splitlines()[-n:]
+        return [json.loads(l) for l in reversed(lines)]
+    except Exception:
+        return []
+
+
+def _load_market_regime():
+    """Load cached market regime from the intel cache."""
+    cache_dir = Path(__file__).parent.parent / "data" / "intel_cache"
+    cache_file = cache_dir / "regime.json"
+    if cache_file.exists():
+        try:
+            return json.loads(cache_file.read_text())
+        except Exception:
+            pass
+    return {}
 
 
 @app.get("/health")
 def health():
-    """Watchdog on the local machine polls this. If it stops responding or the
-    'last_trade_engine_tick' is stale, the watchdog fires an alert independently
-    of anything the VPS itself is able to report (since it's the VPS that's failing)."""
     snapshot = _load_snapshot()
     return {
         "status": "ok",
@@ -64,18 +89,19 @@ def status():
     return {
         "risk_state": _load_snapshot(),
         "recent_events": _load_recent_events(),
+        "market_regime": _load_market_regime(),
     }
 
 
 @app.get("/api/trades")
 def trades(n: int = 20):
-    state = StateManager(stake_amount=0)
+    state = _get_state()
     return {"trades": state.get_recent_trades(n)}
 
 
 @app.get("/api/profit")
 def profit():
-    state = StateManager(stake_amount=0)
+    state = _get_state()
     return state.get_all_time_stats()
 
 
@@ -88,7 +114,7 @@ def hourly_logs(n: int = 24):
 def kill_switch(x_dashboard_key: str = Header(None)):
     if x_dashboard_key != DASHBOARD_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
-    state = StateManager(stake_amount=0)
+    state = _get_state()
     state.update_risk_state(trading_halted=1, halt_reason="Manual kill switch via dashboard")
     return {"status": "halted"}
 
@@ -97,8 +123,8 @@ def kill_switch(x_dashboard_key: str = Header(None)):
 def resume(x_dashboard_key: str = Header(None)):
     if x_dashboard_key != DASHBOARD_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
-    state = StateManager(stake_amount=0)
-    state.update_risk_state(trading_halted=0, halt_reason=None, consecutive_losses=0)
+    state = _get_state()
+    state.update_risk_state(trading_halted=0, halt_reason=None)
     return {"status": "resumed"}
 
 

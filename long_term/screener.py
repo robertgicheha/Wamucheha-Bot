@@ -1,17 +1,9 @@
 """
-Long-term equity screener.
-
-Deliberately does NOT predict returns or claim to find "the stock that will make
-you richest." It applies transparent, disclosed rules to fundamentals and trend
-data, and tells you *why* a name passed — so you can evaluate the reasoning
-yourself rather than trusting a black box.
+Long-term equity screener with transparent, disclosed rules.
 
 Two kinds of output:
-1. `screen_universe()` — batch pass/fail against your config rules (dividend
-   growth proxy, payout ratio, market cap floor).
-2. `trend_alert()` — technical context (is it above its 200-day average, recent
-   momentum) to flag *when* a fundamentally-good name might be worth a closer look,
-   not a timing guarantee.
+1. `screen_universe()` — batch pass/fail against config rules.
+2. `trend_context()` — technical context for fundamentally-good names.
 """
 import pandas as pd
 from long_term.fundamentals import FundamentalsFetcher
@@ -19,8 +11,6 @@ from long_term.fundamentals import FundamentalsFetcher
 
 class EquityScreener:
     def __init__(self, config: dict, fundamentals: FundamentalsFetcher, market_data_fn):
-        """market_data_fn(ticker) -> pandas DataFrame of daily OHLCV, caller-supplied
-        so this module doesn't hardcode a specific price data vendor."""
         self.cfg = config["long_term"]["screens"]
         self.fundamentals = fundamentals
         self.market_data_fn = market_data_fn
@@ -44,15 +34,22 @@ class EquityScreener:
         payout = profile.get("payout_ratio")
         if payout is not None:
             if payout <= self.cfg["max_payout_ratio"]:
-                reasons_pass.append(f"Payout ratio {payout:.0f}% — dividend looks sustainable, "
-                                     f"room to grow without straining earnings")
+                reasons_pass.append(f"Payout ratio {payout:.0f}% — sustainable")
             else:
-                reasons_fail.append(f"Payout ratio {payout:.0f}% is high — dividend cut risk "
-                                     f"if earnings dip")
+                reasons_fail.append(f"Payout ratio {payout:.0f}% is high")
 
         div_yield = profile.get("dividend_yield")
         if div_yield:
             reasons_pass.append(f"Dividend yield {div_yield:.2f}%")
+
+        # Dividend growth years check
+        div_growth_years = profile.get("dividend_growth_years")
+        min_div_years = self.cfg.get("min_dividend_years_growth")
+        if div_growth_years is not None and min_div_years is not None:
+            if div_growth_years >= min_div_years:
+                reasons_pass.append(f"Dividend growing for {div_growth_years} years (>= {min_div_years})")
+            else:
+                reasons_fail.append(f"Dividend growth only {div_growth_years} years (< {min_div_years})")
 
         pe = profile.get("pe_ratio")
         if pe:
@@ -61,16 +58,16 @@ class EquityScreener:
         peg = profile.get("peg_ratio")
         if peg is not None:
             if peg < 1.5:
-                reasons_pass.append(f"PEG {peg:.2f} — growth looks reasonably priced relative to earnings")
+                reasons_pass.append(f"PEG {peg:.2f} — growth reasonably priced")
             else:
-                reasons_pass.append(f"PEG {peg:.2f} — richly priced relative to growth, worth a closer look")
+                reasons_pass.append(f"PEG {peg:.2f} — richly priced")
 
         rev_growth = profile.get("revenue_growth_pct")
         if rev_growth is not None:
             if rev_growth > 0:
                 reasons_pass.append(f"Revenue growth +{rev_growth:.1f}% YoY")
             else:
-                reasons_fail.append(f"Revenue growth {rev_growth:.1f}% YoY — shrinking top line")
+                reasons_fail.append(f"Revenue growth {rev_growth:.1f}% YoY — shrinking")
 
         passed = len(reasons_fail) == 0 and len(reasons_pass) > 0
 
@@ -87,7 +84,6 @@ class EquityScreener:
         return [r for r in results if r is not None]
 
     def trend_context(self, ticker: str) -> dict | None:
-        """Non-predictive technical context: trend direction and momentum only."""
         df = self.market_data_fn(ticker)
         if df is None or len(df) < 200:
             return None
@@ -106,8 +102,7 @@ class EquityScreener:
             "above_200dma": bool(above_200),
             "golden_cross": bool(golden_cross),
             "momentum_30d_pct": round(momentum_30d, 2) if momentum_30d is not None else None,
-            "note": "Trend context only — not a prediction of future performance. "
-                    "Combine with the fundamentals screen, not instead of it.",
+            "note": "Trend context only — not a prediction.",
         }
 
     def format_alert(self, screen_result: dict, trend: dict | None = None,
@@ -120,9 +115,8 @@ class EquityScreener:
         if trend:
             lines.append(f"  Trend: {'above' if trend['above_200dma'] else 'below'} 200DMA, "
                           f"{'golden cross' if trend['golden_cross'] else 'no golden cross'}, "
-                          f"30d momentum {trend['momentum_30d_pct']}%")
+                          f"30d momentum {trend.get('momentum_30d_pct', 'N/A')}%")
         if news and news.get("avg_sentiment") is not None:
-            lines.append(f"  News sentiment: {news['label']} ({news['avg_sentiment']:+.2f} "
-                          f"across {len(news['headlines'])} recent headlines — read them, "
-                          f"don't trade off the score alone)")
+            lines.append(f"  News: {news['label']} ({news['avg_sentiment']:+.2f})")
         return "\n".join(lines)
+

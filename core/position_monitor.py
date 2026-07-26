@@ -37,7 +37,8 @@ _peak_prices: dict[str, float] = {}
 def check_and_close_positions(state_manager, executors: dict, feed_router,
                                nse_exchange_names=("nse",),
                                trailing_activate_pct: float = 1.5,
-                               trailing_distance_pct: float = 1.0):
+                               trailing_distance_pct: float = 1.0,
+                               strategy_cfg: dict = None):
     """Call once per main loop tick. Mutates state via executor.close_trade()."""
     positions = state_manager.get_open_positions()
 
@@ -59,7 +60,7 @@ def check_and_close_positions(state_manager, executors: dict, feed_router,
             logger.warning(f"Position monitor: failed to fetch {symbol}: {e}")
             continue
 
-        if df is None or len(df) < 25:
+        if df is None or len(df) < 50:
             continue
 
         last_price = float(df.iloc[-1]["close"])
@@ -87,6 +88,7 @@ def check_and_close_positions(state_manager, executors: dict, feed_router,
             df, pos_with_peak,
             trailing_activate_pct=trailing_activate_pct,
             trailing_distance_pct=trailing_distance_pct,
+            cfg=strategy_cfg,
         )
         if exit_signal:
             _do_close(executor, state_manager, client_order_id, exit_signal["exit_price"], exit_signal["reason"])

@@ -1,5 +1,5 @@
 """
-State persistence layer.
+State persistence layer with SQLAlchemy ORM.
 
 The #1 cause of blown-up retail trading bots: state lives only in memory, the process
 crashes or the VPS reboots, and the bot comes back up with consecutive_losses=0 and
@@ -10,77 +10,139 @@ Everything risk-critical is written to SQLite on every state change (not batched
 using atomic transactions. A JSON snapshot is also written after every trade for
 human-readable backups and for the local watchdog to inspect without needing to
 speak SQL.
+
+This version uses SQLAlchemy ORM for schema management while keeping raw SQL
+fallback compatibility for hot-backup and existing tooling.
 """
 import json
-import sqlite3
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
-from contextlib import contextmanager
+
+from sqlalchemy import (
+    create_engine, Column, Integer, Float, String, DateTime, func,
+)
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
 DB_PATH = Path(__file__).parent.parent / "data" / "state.db"
 SNAPSHOT_PATH = Path(__file__).parent.parent / "data" / "state_snapshot.json"
 BACKUP_DIR = Path(__file__).parent.parent / "data" / "backups"
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS risk_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    trading_balance REAL NOT NULL,
-    peak_balance REAL NOT NULL DEFAULT 0,
-    consecutive_losses INTEGER NOT NULL DEFAULT 0,
-    daily_pnl REAL NOT NULL DEFAULT 0,
-    daily_reset_at TEXT NOT NULL,
-    trading_halted INTEGER NOT NULL DEFAULT 0,
-    halt_reason TEXT,
-    updated_at TEXT NOT NULL
-);
+engine = create_engine(
+    f"sqlite:///{DB_PATH}",
+    echo=False,
+    connect_args={"check_same_thread": False},
+    pool_pre_ping=True,
+)
+Base = declarative_base()
+SessionLocal = sessionmaker(bind=engine)
 
-CREATE TABLE IF NOT EXISTS trades (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_order_id TEXT UNIQUE NOT NULL,
-    exchange TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    side TEXT NOT NULL,
-    amount REAL NOT NULL,
-    entry_price REAL,
-    exit_price REAL,
-    status TEXT NOT NULL DEFAULT 'open',
-    pnl REAL,
-    opened_at TEXT NOT NULL,
-    closed_at TEXT
-);
 
-CREATE TABLE IF NOT EXISTS open_positions (
-    client_order_id TEXT PRIMARY KEY,
-    exchange TEXT NOT NULL,
-    symbol TEXT NOT NULL,
-    side TEXT NOT NULL,
-    amount REAL NOT NULL,
-    entry_price REAL NOT NULL,
-    stop_loss_price REAL,
-    take_profit_price REAL,
-    opened_at TEXT NOT NULL
-);
-"""
+class RiskStateRow(Base):
+    __tablename__ = "risk_state"
+
+    id = Column(Integer, primary_key=True, default=1)
+    trading_balance = Column(Float, nullable=False, default=0)
+    peak_balance = Column(Float, nullable=False, default=0)
+    consecutive_losses = Column(Integer, nullable=False, default=0)
+    daily_pnl = Column(Float, nullable=False, default=0)
+    daily_reset_at = Column(String, nullable=False)
+    trading_halted = Column(Integer, nullable=False, default=0)
+    halt_reason = Column(String, nullable=True)
+    updated_at = Column(String, nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "trading_balance": self.trading_balance,
+            "peak_balance": self.peak_balance,
+            "consecutive_losses": self.consecutive_losses,
+            "daily_pnl": self.daily_pnl,
+            "daily_reset_at": self.daily_reset_at,
+            "trading_halted": self.trading_halted,
+            "halt_reason": self.halt_reason,
+            "updated_at": self.updated_at,
+        }
+
+
+class TradeRow(Base):
+    __tablename__ = "trades"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    client_order_id = Column(String, unique=True, nullable=False)
+    exchange = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
+    side = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=True)
+    exit_price = Column(Float, nullable=True)
+    status = Column(String, nullable=False, default="open")
+    pnl = Column(Float, nullable=True)
+    opened_at = Column(String, nullable=False)
+    closed_at = Column(String, nullable=True)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "client_order_id": self.client_order_id,
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "side": self.side,
+            "amount": self.amount,
+            "entry_price": self.entry_price,
+            "exit_price": self.exit_price,
+            "status": self.status,
+            "pnl": self.pnl,
+            "opened_at": self.opened_at,
+            "closed_at": self.closed_at,
+        }
+
+
+class OpenPositionRow(Base):
+    __tablename__ = "open_positions"
+
+    client_order_id = Column(String, primary_key=True)
+    exchange = Column(String, nullable=False)
+    symbol = Column(String, nullable=False)
+    side = Column(String, nullable=False)
+    amount = Column(Float, nullable=False)
+    entry_price = Column(Float, nullable=False)
+    stop_loss_price = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
+    opened_at = Column(String, nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "client_order_id": self.client_order_id,
+            "exchange": self.exchange,
+            "symbol": self.symbol,
+            "side": self.side,
+            "amount": self.amount,
+            "entry_price": self.entry_price,
+            "stop_loss_price": self.stop_loss_price,
+            "take_profit_price": self.take_profit_price,
+            "opened_at": self.opened_at,
+        }
 
 
 class StateManager:
     def __init__(self, stake_amount: float):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(DB_PATH, isolation_level=None)  # autocommit off manually
-        self.conn.execute("PRAGMA journal_mode=WAL")  # crash-safe writes
-        self.conn.executescript(SCHEMA)
+        Base.metadata.create_all(engine)
         self._init_row(stake_amount)
 
     def _init_row(self, stake_amount: float):
-        cur = self.conn.execute("SELECT id FROM risk_state WHERE id = 1")
-        if cur.fetchone() is None:
-            self.conn.execute(
-                "INSERT INTO risk_state (id, trading_balance, daily_reset_at, updated_at) "
-                "VALUES (1, 0, ?, ?)",
-                (self._today(), self._now()),
-            )
+        with Session(engine) as session:
+            row = session.get(RiskStateRow, 1)
+            if row is None:
+                session.add(RiskStateRow(
+                    id=1,
+                    trading_balance=0,
+                    daily_reset_at=self._today(),
+                    updated_at=self._now(),
+                ))
+                session.commit()
 
     @staticmethod
     def _now():
@@ -90,89 +152,116 @@ class StateManager:
     def _today():
         return datetime.now(timezone.utc).date().isoformat()
 
-    @contextmanager
-    def transaction(self):
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
-            yield self.conn
-            self.conn.execute("COMMIT")
-        except Exception:
-            self.conn.execute("ROLLBACK")
-            raise
-        finally:
-            self.snapshot()  # every state-changing transaction gets snapshotted
-
     def get_risk_state(self) -> dict:
-        cur = self.conn.execute("SELECT * FROM risk_state WHERE id = 1")
-        cols = [d[0] for d in cur.description]
-        row = cur.fetchone()
-        return dict(zip(cols, row))
+        with Session(engine) as session:
+            row = session.get(RiskStateRow, 1)
+            return row.to_dict() if row else {}
 
     def update_risk_state(self, **fields):
-        with self.transaction() as conn:
-            fields["updated_at"] = self._now()
-            set_clause = ", ".join(f"{k} = ?" for k in fields)
-            conn.execute(f"UPDATE risk_state SET {set_clause} WHERE id = 1", tuple(fields.values()))
+        with Session(engine) as session:
+            with session.begin():
+                row = session.get(RiskStateRow, 1)
+                if row is None:
+                    return
+                fields["updated_at"] = self._now()
+                for key, value in fields.items():
+                    if hasattr(row, key):
+                        setattr(row, key, value)
+        self.snapshot()
 
     def record_trade_open(self, client_order_id, exchange, symbol, side, amount,
                            entry_price, stop_loss_price=None, take_profit_price=None):
-        with self.transaction() as conn:
-            now = self._now()
-            conn.execute(
-                "INSERT INTO trades (client_order_id, exchange, symbol, side, amount, "
-                "entry_price, status, opened_at) VALUES (?,?,?,?,?,?, 'open', ?)",
-                (client_order_id, exchange, symbol, side, amount, entry_price, now),
-            )
-            conn.execute(
-                "INSERT INTO open_positions (client_order_id, exchange, symbol, side, amount, "
-                "entry_price, stop_loss_price, take_profit_price, opened_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (client_order_id, exchange, symbol, side, amount, entry_price,
-                 stop_loss_price, take_profit_price, now),
-            )
+        now = self._now()
+        with Session(engine) as session:
+            with session.begin():
+                session.add(TradeRow(
+                    client_order_id=client_order_id,
+                    exchange=exchange,
+                    symbol=symbol,
+                    side=side,
+                    amount=amount,
+                    entry_price=entry_price,
+                    status="open",
+                    opened_at=now,
+                ))
+                session.add(OpenPositionRow(
+                    client_order_id=client_order_id,
+                    exchange=exchange,
+                    symbol=symbol,
+                    side=side,
+                    amount=amount,
+                    entry_price=entry_price,
+                    stop_loss_price=stop_loss_price,
+                    take_profit_price=take_profit_price,
+                    opened_at=now,
+                ))
+        self.snapshot()
 
     def record_trade_close(self, client_order_id, exit_price, pnl):
-        with self.transaction() as conn:
-            conn.execute(
-                "UPDATE trades SET exit_price=?, status='closed', pnl=?, closed_at=? "
-                "WHERE client_order_id=?",
-                (exit_price, pnl, self._now(), client_order_id),
-            )
-            conn.execute("DELETE FROM open_positions WHERE client_order_id=?", (client_order_id,))
+        with Session(engine) as session:
+            with session.begin():
+                trade = session.query(TradeRow).filter_by(
+                    client_order_id=client_order_id
+                ).first()
+                if trade:
+                    trade.exit_price = exit_price
+                    trade.pnl = pnl
+                    trade.status = "closed"
+                    trade.closed_at = self._now()
+                session.query(OpenPositionRow).filter_by(
+                    client_order_id=client_order_id
+                ).delete()
+        self.snapshot()
 
-    def get_open_positions(self):
-        cur = self.conn.execute("SELECT * FROM open_positions")
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    def get_open_positions(self) -> list:
+        with Session(engine) as session:
+            rows = session.query(OpenPositionRow).all()
+            return [r.to_dict() for r in rows]
 
     def get_recent_trades(self, n: int = 20) -> list:
-        cur = self.conn.execute(
-            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (n,)
-        )
-        cols = [d[0] for d in cur.description]
-        return [dict(zip(cols, row)) for row in cur.fetchall()]
+        with Session(engine) as session:
+            rows = session.query(TradeRow).order_by(
+                TradeRow.id.desc()
+            ).limit(n).all()
+            return [r.to_dict() for r in rows]
 
     def get_all_time_stats(self) -> dict:
-        cur = self.conn.execute(
-            "SELECT COUNT(*) as total, "
-            "SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, "
-            "SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses, "
-            "SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END) as total_won, "
-            "SUM(CASE WHEN pnl <= 0 THEN pnl ELSE 0 END) as total_lost, "
-            "SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END) as net_pnl "
-            "FROM trades WHERE status = 'closed'"
-        )
-        cols = [d[0] for d in cur.description]
-        row = cur.fetchone()
-        data = dict(zip(cols, row))
-        total = data["total"] or 0
-        data["win_rate"] = (data["wins"] / total * 100) if total > 0 else 0
-        return data
+        with Session(engine) as session:
+            total = session.query(func.count(TradeRow.id)).filter(
+                TradeRow.status == "closed"
+            ).scalar() or 0
+            wins = session.query(func.count(TradeRow.id)).filter(
+                TradeRow.status == "closed", TradeRow.pnl > 0
+            ).scalar() or 0
+            losses = session.query(func.count(TradeRow.id)).filter(
+                TradeRow.status == "closed", TradeRow.pnl <= 0
+            ).scalar() or 0
+            total_won = session.query(func.sum(TradeRow.pnl)).filter(
+                TradeRow.status == "closed", TradeRow.pnl > 0
+            ).scalar() or 0
+            total_lost = session.query(func.sum(TradeRow.pnl)).filter(
+                TradeRow.status == "closed", TradeRow.pnl <= 0
+            ).scalar() or 0
+            net_pnl = session.query(func.sum(TradeRow.pnl)).filter(
+                TradeRow.status == "closed"
+            ).scalar() or 0
+
+        win_rate = (wins / total * 100) if total > 0 else 0
+        return {
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "total_won": total_won,
+            "total_lost": total_lost,
+            "net_pnl": net_pnl,
+            "win_rate": win_rate,
+        }
 
     def is_duplicate_order(self, client_order_id) -> bool:
-        cur = self.conn.execute(
-            "SELECT 1 FROM trades WHERE client_order_id = ?", (client_order_id,)
-        )
-        return cur.fetchone() is not None
+        with Session(engine) as session:
+            return session.query(TradeRow).filter_by(
+                client_order_id=client_order_id
+            ).first() is not None
 
     def snapshot(self):
         """Human-readable JSON dump — read by dashboard and the local watchdog."""
@@ -184,6 +273,11 @@ class StateManager:
         """Hot-copy the SQLite DB (safe even while WAL is active) into data/backups/."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest = BACKUP_DIR / f"state_{ts}.db"
-        with sqlite3.connect(dest) as dest_conn:
-            self.conn.backup(dest_conn)
+        import sqlite3
+        with sqlite3.connect(str(dest)) as dest_conn:
+            raw_conn = engine.raw_connection()
+            try:
+                raw_conn.backup(dest_conn)
+            finally:
+                raw_conn.close()
         return dest

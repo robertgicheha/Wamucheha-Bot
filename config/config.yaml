@@ -14,7 +14,7 @@ risk:
   take_profit_pct: 3.0               # optional per-trade target
   profit_withdrawal_threshold: 500   # when trading_balance hits this, sweep excess to stake wallet
   profit_withdrawal_keep: 200        # amount left in trading_balance after a sweep
-  volatility_circuit_breaker_pct: 5  # pause trading if price moves this % in the window below
+  volatility_circuit_breaker_pct: 3  # pause trading if price moves this % in the window below
   volatility_window_minutes: 5
   trailing_stop_activate_pct: 1.5    # start trailing once a position is up this much
   trailing_stop_distance_pct: 1.0    # trail this far behind the peak price once activated
@@ -23,15 +23,15 @@ execution:
   exchanges:
     - name: binance
       enabled: true
-      markets: ["BTC/USDT", "ETH/USDT"]
+      markets: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
     - name: okx
-      enabled: false
-      markets: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+      enabled: true
+      markets: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "ADA/USDT"]
     - name: oanda
       enabled: true
       markets: []
     - name: alpaca
-      enabled: false
+      enabled: true
       markets: []
     - name: mt5
       enabled: false
@@ -45,6 +45,8 @@ execution:
     - "EUR/JPY"
     - "EUR/GBP"
     - "USD/CAD"
+    - "USD/JPY"
+    - "GBP/JPY"
   mt5_markets:
     - "XAUUSD"
     - "BTCUSD"
@@ -54,15 +56,41 @@ execution:
     - "EURJPY"
     - "EURGBP"
     - "USDCAD"
-  alpaca_markets: ["AAPL", "SPY", "GLD", "QQQ"]
+  alpaca_markets: ["AAPL", "MSFT", "SPY", "QQQ", "GLD", "TLT"]
   order_type: market            # market | limit
   max_slippage_pct: 0.5
   idempotency: true              # attach client order IDs, dedupe on retry
+
+strategy:
+  ema_fast: 9
+  ema_slow: 21
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  volume_spike_threshold: 1.5
+  min_signal_score: 3            # minimum ensemble score to trigger entry (out of 5 strategies)
+  enable_shorts: true             # allow sell/short signals on exchanges that support it
+
+  # Individual strategy weights in the ensemble (must sum to 1.0)
+  weights:
+    ema_crossover: 0.25
+    macd: 0.25
+    bollinger: 0.20
+    rsi_divergence: 0.15
+    momentum: 0.15
 
 ml:
   use_lstm: true                 # enable/disable LSTM filter on signals
   lstm_min_confidence: 0.6       # minimum probability from LSTM to allow a trade
   lstm_model_type: pytorch       # pytorch | tensorflow
+  auto_retrain_hours: 168        # retrain models every 7 days
+  min_train_samples: 500         # minimum OHLCV bars needed to train
+
+intelligence:
+  fear_greed_enabled: true       # use Fear & Greed index as market regime filter
+  dxy_enabled: true              # use Dollar Index for forex correlation
+  correlation_lookback: 20       # bars for cross-asset correlation
+  news_sentiment_enabled: true   # use news sentiment as additional filter
 
 long_term:
   universe:
@@ -90,3 +118,4 @@ alerts:
     - heartbeat_missed
     - long_term_signal
     - nse_alert
+    - market_regime_change

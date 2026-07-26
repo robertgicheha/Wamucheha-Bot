@@ -9,10 +9,9 @@ Wires together state, risk, execution, and alerting across multiple asset classe
 - MT5 (XAUUSD, BTCUSD, GBPUSD, EURUSD, AUDUSD, EURJPY, EURGBP, USDCAD)
 - Kenyan Stocks (NSE — analysis/alerts only, no automated execution)
 
-Replace `get_strategy_signal()` with your real signal logic — the risk/execution
-alerting plumbing around it is the part designed to be trustworthy; the strategy
-itself is where your edge (if any) has to come from, and that's on you to develop
-and rigorously backtest.
+Features a multi-strategy ensemble (EMA, MACD, Bollinger, RSI, Momentum) with
+optional LSTM ML filtering, market regime intelligence (Fear & Greed, DXY trend),
+and automatic model retraining.
 """
 import os
 import time
@@ -32,19 +31,17 @@ from strategy.technical_strategy import generate_signal, generate_signal_with_ml
 from ml.lstm_predictor import LSTMPricePredictor
 from core.position_monitor import check_and_close_positions
 from reporting.hourly_report import HourlyReporter
+from long_term.market_intelligence import MarketIntelligence
+from control.telegram_bot import TelegramControlBot
+from control.discord_bot import DiscordControlBot
 
 load_dotenv()
 
-# --- LIVE_TRADING switch ---
-# Defaults to dry-run (safe) unless explicitly set to "true". This is the ONLY
-# place that decides whether real orders get submitted. Flip it in .env, not
-# in code, so it's obvious and auditable which mode the bot is running in.
 LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").lower() == "true"
 
 with open("config/config.yaml") as f:
     CONFIG = yaml.safe_load(f)
 
-# --- Stake amount override: .env STAKE_AMOUNT takes precedence over config.yaml ---
 _env_stake = os.environ.get("STAKE_AMOUNT")
 if _env_stake is not None:
     try:
@@ -70,71 +67,103 @@ def build_notifier():
 
 
 def load_ml_models(config: dict) -> dict:
-    """Load trained ML models for symbols that have them. Returns
-    {symbol: predictor} dict. Models that aren't trained/loaded are skipped."""
+    """Load trained ML models for symbols that have them."""
+    if not config.get("ml", {}).get("use_lstm", True):
+        print("  ML LSTM filter is disabled in config.")
+        return {}
     models = {}
     symbols_to_check = []
     for ex_cfg in config.get("execution", {}).get("exchanges", []):
         if ex_cfg.get("enabled"):
             symbols_to_check.extend(ex_cfg.get("markets", []))
+    oanda_markets = config.get("execution", {}).get("oanda_markets", [])
+    symbols_to_check.extend(oanda_markets)
+    mt5_markets = config.get("execution", {}).get("mt5_markets", [])
+    symbols_to_check.extend(mt5_markets)
+    alpaca_markets = config.get("execution", {}).get("alpaca_markets", [])
+    symbols_to_check.extend(alpaca_markets)
 
     for symbol in symbols_to_check:
         predictor = LSTMPricePredictor(symbol=symbol)
         if predictor.load():
             models[symbol] = predictor
-            print(f"  Loaded PyTorch LSTM model for {symbol}")
+            print(f"  Loaded LSTM model for {symbol}")
     return models
 
 
+def maybe_retrain_models(config: dict, feed_router: FeedRouter, ml_models: dict):
+    """Periodically retrain ML models to avoid staleness."""
+    retrain_hours = config.get("ml", {}).get("auto_retrain_hours", 168)
+    min_samples = config.get("ml", {}).get("min_train_samples", 500)
+    retrain_file = "data/.last_retrain"
+    os.makedirs("data", exist_ok=True)
+
+    if os.path.exists(retrain_file):
+        last = float(open(retrain_file).read().strip())
+        if (time.time() - last) < retrain_hours * 3600:
+            return
+
+    print("Auto-retraining ML models...")
+    all_symbols = []
+    for ex_cfg in config.get("execution", {}).get("exchanges", []):
+        if ex_cfg.get("enabled"):
+            all_symbols.extend(ex_cfg.get("markets", []))
+    all_symbols.extend(config.get("execution", {}).get("oanda_markets", []))
+
+    for symbol in all_symbols:
+        try:
+            df = feed_router.get_ohlcv(symbol, timeframe="15m", limit=min_samples + 200)
+            if df is None or len(df) < min_samples:
+                continue
+            predictor = LSTMPricePredictor(symbol=symbol)
+            result = predictor.train(df, epochs=20, verbose=False)
+            if result["test_accuracy"] > result["naive_baseline_accuracy"] + 0.02:
+                predictor.save()
+                ml_models[symbol] = predictor
+                print(f"  Retrained {symbol}: acc={result['test_accuracy']:.3f}")
+            else:
+                print(f"  Skipped {symbol}: no edge (acc={result['test_accuracy']:.3f})")
+        except Exception as e:
+            print(f"  Retrain failed for {symbol}: {e}")
+
+    with open(retrain_file, "w") as f:
+        f.write(str(time.time()))
+
+
 def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: float,
-                         risk_fraction: float, ml_models: dict = None) -> dict | None:
-    """
-    Strategy signal with optional ML filter. If an LSTM model is available for
-    this symbol, it acts as an additional conservative filter — it can only
-    reduce trades, never add them.
-    """
+                         risk_fraction: float, ml_models: dict = None,
+                         market_regime: dict = None) -> dict | None:
+    """Strategy signal with optional ML filter and market regime adjustment."""
     try:
         df = feed_router.get_ohlcv(symbol, timeframe="15m", limit=200)
     except Exception as e:
         print(f"  Failed to fetch data for {symbol}: {e}")
         return None
 
-    if df is None or len(df) < 25:
+    if df is None or len(df) < 50:
         return None
 
     predictor = ml_models.get(symbol) if ml_models else None
-    return generate_signal_with_ml(
-        df, risk_fraction, trading_balance, lstm_predictor=predictor
+    strategy_cfg = CONFIG.get("strategy", {})
+    ml_confidence = CONFIG.get("ml", {}).get("lstm_min_confidence", 0.6)
+
+    signal = generate_signal_with_ml(
+        df, risk_fraction, trading_balance,
+        lstm_predictor=predictor,
+        ml_min_confidence=ml_confidence,
+        cfg=strategy_cfg,
     )
 
+    if signal is None:
+        return None
 
-def classify_exchange(symbol: str, config: dict) -> str:
-    """Returns the exchange/broker name that should execute trades for this symbol."""
-    from data_feeds.feed_router import OANDA_INSTRUMENTS, OANDA_COMMODITIES, NSE_TICKERS, MT5_SYMBOLS
+    # Market regime filter: reduce confidence in risk-off environments
+    if market_regime and market_regime.get("regime") == "risk_off":
+        score = signal.get("score", 0)
+        if score < 0.7:
+            return None  # require stronger signals during risk-off
 
-    clean = symbol.upper().replace("_", "/")
-    ticker = symbol.split("/")[0].split(".")[0].upper()
-
-    if ".NSE" in symbol.upper() or ticker in NSE_TICKERS:
-        return "nse"  # alert-only, no execution
-
-    if clean in OANDA_INSTRUMENTS or clean in OANDA_COMMODITIES:
-        return "oanda"
-
-    # MT5 symbols (XAUUSD, EURUSD, BTCUSD, etc.)
-    if ticker in MT5_SYMBOLS and config.get("execution", {}).get("exchanges", []):
-        for ex_cfg in config["execution"]["exchanges"]:
-            if ex_cfg.get("name") == "mt5" and ex_cfg.get("enabled"):
-                return "mt5"
-
-    if "/" not in symbol and ticker.isalpha() and len(ticker) <= 5:
-        return "alpaca"
-
-    # Default: first enabled ccxt exchange
-    for ex_cfg in config.get("execution", {}).get("exchanges", []):
-        if ex_cfg.get("enabled") and ex_cfg["name"] in ("binance", "okx", "kraken", "coinbase", "bybit"):
-            return ex_cfg["name"]
-    return "unknown"
+    return signal
 
 
 def main():
@@ -142,15 +171,14 @@ def main():
     state = StateManager(stake_amount=CONFIG["account"]["stake_amount"])
     risk = RiskManager(state, CONFIG, notifier)
 
-    # --- Initialize feed router (multi-asset data) ---
     feed_router = FeedRouter(CONFIG)
     print(f"Active feeds: {list(feed_router.get_available_feeds().keys())}")
 
-    # --- Initialize ML models ---
     print("Loading ML models...")
     ml_models = load_ml_models(CONFIG)
 
-    # --- Initialize executors per exchange/broker ---
+    market_intel = MarketIntelligence(CONFIG)
+
     executors = {}
 
     # ccxt executors (Binance, OKX, etc.)
@@ -171,11 +199,11 @@ def main():
                 notifier=notifier,
                 dry_run=not LIVE_TRADING,
             )
-            # OKX requires a passphrase — inject it onto the ccxt exchange object
             if passphrase:
                 executors[name].exchange.password = passphrase
+            print(f"  {name.upper()} executor initialized")
 
-    # OANDA executor (Forex/Commodities)
+    # OANDA executor
     oanda_key = os.environ.get("OANDA_API_KEY")
     oanda_account = os.environ.get("OANDA_ACCOUNT_ID")
     if oanda_key and oanda_account:
@@ -189,9 +217,9 @@ def main():
             practice=practice,
             dry_run=not LIVE_TRADING,
         )
-        print("  OANDA executor initialized (Forex/Commodities)")
+        print("  OANDA executor initialized")
 
-    # Alpaca executor (US Stocks/ETFs)
+    # Alpaca executor
     alpaca_key = os.environ.get("ALPACA_API_KEY")
     alpaca_secret = os.environ.get("ALPACA_API_SECRET")
     if alpaca_key and alpaca_secret:
@@ -205,9 +233,9 @@ def main():
             paper=paper,
             dry_run=not LIVE_TRADING,
         )
-        print("  Alpaca executor initialized (US Stocks/ETFs)")
+        print("  Alpaca executor initialized")
 
-    # MT5 executor (MetaTrader 5 — Forex, Gold, Crypto, CFDs)
+    # MT5 executor
     mt5_login = int(os.environ.get("MT5_LOGIN", "0"))
     mt5_password = os.environ.get("MT5_PASSWORD", "")
     mt5_server = os.environ.get("MT5_SERVER", "")
@@ -223,48 +251,54 @@ def main():
         )
         if mt5_exec.connect():
             executors["mt5"] = mt5_exec
-            print("  MT5 executor initialized (MetaTrader 5)")
+            print("  MT5 executor initialized")
         else:
-            print("  WARNING: MT5 connection failed — MT5 symbols will be skipped")
+            print("  WARNING: MT5 connection failed")
 
-    # Build unified market list from config
+    # Build unified market list
     all_markets = []
     for ex_cfg in CONFIG["execution"]["exchanges"]:
         if ex_cfg.get("enabled"):
             for symbol in ex_cfg.get("markets", []):
                 all_markets.append((ex_cfg["name"], symbol))
 
-    # Add OANDA markets if configured
-    oanda_markets = CONFIG.get("execution", {}).get("oanda_markets", [])
-    for symbol in oanda_markets:
+    for symbol in CONFIG.get("execution", {}).get("oanda_markets", []):
         all_markets.append(("oanda", symbol))
-
-    # Add Alpaca markets if configured
-    alpaca_markets = CONFIG.get("execution", {}).get("alpaca_markets", [])
-    for symbol in alpaca_markets:
+    for symbol in CONFIG.get("execution", {}).get("alpaca_markets", []):
         all_markets.append(("alpaca", symbol))
-
-    # Add MT5 markets if configured
-    mt5_markets = CONFIG.get("execution", {}).get("mt5_markets", [])
-    for symbol in mt5_markets:
+    for symbol in CONFIG.get("execution", {}).get("mt5_markets", []):
         all_markets.append(("mt5", symbol))
 
-    print(f"Trading {len(all_markets)} symbols across {len(executors)} exchanges/brokers")
+    print(f"\nTrading {len(all_markets)} symbols across {len(executors)} exchanges/brokers")
     mode_str = "LIVE — REAL MONEY" if LIVE_TRADING else "DRY-RUN (simulated, no real orders)"
-    print(f"*** MODE: {mode_str} *** (set LIVE_TRADING=true in .env to go live)")
+    print(f"*** MODE: {mode_str} ***")
     notifier.notify("startup",
-        f"Trading bot started in {mode_str}. {len(all_markets)} symbols, "
-        f"{len(executors)} exchanges/brokers, "
-        f"{len(ml_models)} ML models loaded.",
+        f"Bot started in {mode_str}. {len(all_markets)} symbols, {len(executors)} brokers, "
+        f"{len(ml_models)} ML models.",
         priority="high" if LIVE_TRADING else "normal",
     )
 
+    # --- Interactive control bots ---
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    if tg_token:
+        tg_bot = TelegramControlBot(state_manager=state, risk_manager=risk)
+        tg_bot.start(tg_token)
+        print("  Telegram control bot started")
+    else:
+        print("  Telegram control bot: no token configured (skipped)")
+
+    dc_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+    if dc_token:
+        dc_bot = DiscordControlBot(state_manager=state, risk_manager=risk)
+        dc_bot.start(dc_token)
+        print("  Discord control bot started")
+    else:
+        print("  Discord control bot: no token configured (skipped)")
+
     hourly_reporter = HourlyReporter(state, notifier, interval_minutes=60)
 
-    # --- NSE analysis setup ---
     from data_feeds.nse_feed import NSEFeed
     from long_term.fundamentals import FundamentalsFetcher
-    from long_term.screener import EquityScreener
     from long_term.news_sentiment import NewsSentiment
     nse_feed = NSEFeed()
     nse_watchlist = CONFIG.get("nse", {}).get("watchlist",
@@ -272,29 +306,24 @@ def main():
          "COOP", "ABSA", "KNC", "NIC"])
     nse_interval = CONFIG.get("nse", {}).get("analysis_interval_minutes", 60) * 60
     last_nse_check = 0
+    last_retrain_check = 0
     fundamentals = FundamentalsFetcher()
     news = NewsSentiment()
 
     def check_nse_stocks():
-        """Analyze NSE stocks and send alerts through all channels (Telegram,
-        Discord, email, dashboard) — this is the NSE notification pipeline."""
         results = []
         for ticker in nse_watchlist:
             try:
                 df = nse_feed.get_ohlcv(ticker, timeframe="1d", limit=200)
                 if df is None or len(df) < 30:
                     continue
-
                 profile = fundamentals.get_profile(ticker)
                 sentiment = news.get_sentiment(ticker)
-
-                # Technical context
                 df["ma50"] = df["close"].rolling(50).mean()
                 df["ma200"] = df["close"].rolling(200).mean()
                 last = df.iloc[-1]
                 above_200 = last["close"] > last["ma200"] if not pd.isna(last.get("ma200")) else None
                 golden_cross = last["ma50"] > last["ma200"] if not pd.isna(last.get("ma200")) and not pd.isna(last.get("ma50")) else None
-
                 price = float(last["close"])
                 msg_parts = [f"NSE: {ticker} @ KES {price:.2f}"]
                 if above_200 is not None:
@@ -303,14 +332,11 @@ def main():
                     msg_parts.append("Golden cross" if golden_cross else "No golden cross")
                 if sentiment and sentiment.get("avg_sentiment") is not None:
                     msg_parts.append(f"News: {sentiment['label']} ({sentiment['avg_sentiment']:+.2f})")
-
                 results.append("\n  ".join(msg_parts))
             except Exception:
                 continue
-
         if results:
-            message = "NSE Kenya Analysis:\n" + "\n".join(results)
-            notifier.notify("nse_alert", message)
+            notifier.notify("nse_alert", "NSE Kenya Analysis:\n" + "\n".join(results))
 
     while True:
         risk_state = state.get_risk_state()
@@ -318,8 +344,9 @@ def main():
             time.sleep(30)
             continue
 
-        # --- NSE analysis on schedule ---
         now = time.time()
+
+        # NSE analysis on schedule
         if now - last_nse_check >= nse_interval:
             try:
                 check_nse_stocks()
@@ -327,19 +354,34 @@ def main():
             except Exception as e:
                 print(f"NSE analysis error: {e}")
 
-        # --- 1. Check existing open positions for an exit (this is what actually SELLS) ---
+        # Auto-retrain ML models (once per cycle)
+        if now - last_retrain_check >= 3600:
+            try:
+                maybe_retrain_models(CONFIG, feed_router, ml_models)
+                last_retrain_check = now
+            except Exception as e:
+                print(f"Retrain check error: {e}")
+
+        # Get market regime
+        market_regime = None
+        try:
+            market_regime = market_intel.get_market_regime(feed_router)
+        except Exception as e:
+            print(f"Market intel error: {e}")
+
+        # Check open positions for exits
         try:
             check_and_close_positions(
                 state, executors, feed_router,
                 trailing_activate_pct=CONFIG["risk"].get("trailing_stop_activate_pct", 1.5),
                 trailing_distance_pct=CONFIG["risk"].get("trailing_stop_distance_pct", 1.0),
+                strategy_cfg=CONFIG.get("strategy", {}),
             )
         except Exception as e:
             print(f"Position monitor error: {e}")
 
-        # --- 2. Look for new entries ---
+        # Look for new entries
         for exchange_name, symbol in all_markets:
-            # Skip NSE — handled by the analysis loop above
             if exchange_name == "nse":
                 continue
 
@@ -352,6 +394,7 @@ def main():
                 trading_balance=risk_state["trading_balance"],
                 risk_fraction=CONFIG["risk"]["max_position_pct"] / 100,
                 ml_models=ml_models,
+                market_regime=market_regime,
             )
 
             if signal:
@@ -364,7 +407,7 @@ def main():
                     take_profit_pct=CONFIG["risk"]["take_profit_pct"],
                 )
 
-        # --- 3. Hourly transaction/PnL report -> dashboard + Telegram + Discord ---
+        # Hourly report
         try:
             hourly_reporter.maybe_report()
         except Exception as e:
