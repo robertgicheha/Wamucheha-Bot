@@ -22,6 +22,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from core.state_manager import StateManager, SNAPSHOT_PATH
 from core.risk_manager import RiskManager
 from alerts.notifier import Notifier, EVENT_LOG
+from reporting.hourly_report import read_hourly_log
 
 app = FastAPI(title="Trading Bot Dashboard")
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
@@ -64,6 +65,23 @@ def status():
         "risk_state": _load_snapshot(),
         "recent_events": _load_recent_events(),
     }
+
+
+@app.get("/api/trades")
+def trades(n: int = 20):
+    state = StateManager(stake_amount=0)
+    return {"trades": state.get_recent_trades(n)}
+
+
+@app.get("/api/profit")
+def profit():
+    state = StateManager(stake_amount=0)
+    return state.get_all_time_stats()
+
+
+@app.get("/api/hourly-logs")
+def hourly_logs(n: int = 24):
+    return {"hourly_logs": read_hourly_log(n)}
 
 
 @app.post("/api/kill-switch")

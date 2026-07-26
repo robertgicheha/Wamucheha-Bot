@@ -7,7 +7,8 @@ account:
 
 risk:
   max_consecutive_losses: 8          # hard stop, per your spec
-  max_daily_loss_pct: 15             # % of trading_balance; hit this -> stop for the day
+  max_daily_loss_pct: 5              # % of trading_balance; drawdown limit < 5%
+  max_drawdown_pct: 5                # peak-to-trough drawdown halt limit
   max_position_pct: 2                # % of trading_balance risked on any single trade
   stop_loss_pct: 1.5                 # per-trade stop loss, always attached at order time
   take_profit_pct: 3.0               # optional per-trade target
@@ -15,6 +16,8 @@ risk:
   profit_withdrawal_keep: 200        # amount left in trading_balance after a sweep
   volatility_circuit_breaker_pct: 5  # pause trading if price moves this % in the window below
   volatility_window_minutes: 5
+  trailing_stop_activate_pct: 1.5    # start trailing once a position is up this much
+  trailing_stop_distance_pct: 1.0    # trail this far behind the peak price once activated
 
 execution:
   exchanges:
@@ -25,12 +28,32 @@ execution:
       enabled: false
       markets: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
     - name: oanda
-      enabled: false
+      enabled: true
       markets: []
     - name: alpaca
       enabled: false
       markets: []
-  oanda_markets: ["EUR/USD", "XAU/USD"]
+    - name: mt5
+      enabled: false
+      markets: []
+  oanda_markets:
+    - "XAU/USD"
+    - "BTC/USD"
+    - "GBP/USD"
+    - "EUR/USD"
+    - "AUD/USD"
+    - "EUR/JPY"
+    - "EUR/GBP"
+    - "USD/CAD"
+  mt5_markets:
+    - "XAUUSD"
+    - "BTCUSD"
+    - "GBPUSD"
+    - "EURUSD"
+    - "AUDUSD"
+    - "EURJPY"
+    - "EURGBP"
+    - "USDCAD"
   alpaca_markets: ["AAPL", "SPY", "GLD", "QQQ"]
   order_type: market            # market | limit
   max_slippage_pct: 0.5

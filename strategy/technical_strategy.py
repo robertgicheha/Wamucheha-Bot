@@ -88,6 +88,67 @@ def generate_signal(df: pd.DataFrame, risk_fraction_of_balance: float,
     return None
 
 
+def generate_exit_signal(df: pd.DataFrame, position: dict,
+                          trailing_activate_pct: float = 1.5,
+                          trailing_distance_pct: float = 1.0) -> dict | None:
+    """
+    Proactive exit signal — fires BEFORE the fixed TP/SL levels if the
+    technical picture deteriorates. This is the "suspenders" to the fixed
+    TP/SL "belt".
+
+    Exit conditions checked:
+    1. Trend reversal: EMA9 crosses below EMA21 (for longs) — momentum is lost.
+    2. RSI exhaustion: RSI > 80 (for longs) — overbought, high probability of pullback.
+    3. Trailing stop: price has risen trailing_activate_pct% above entry, then
+       drops trailing_distance_pct% below the peak — giving back too much profit.
+
+    Returns {"exit_price": float, "reason": str} or None.
+    """
+    if len(df) < 25:
+        return None
+
+    df = compute_indicators(df)
+    prev, last = df.iloc[-2], df.iloc[-1]
+    entry_price = position["entry_price"]
+    side = position["side"]
+    peak_price = position.get("peak_price", entry_price)
+    last_price = float(last["close"])
+
+    if side == "buy":
+        # 1. Trend reversal — EMA9 crosses below EMA21
+        if prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]:
+            return {"exit_price": last_price, "reason": "trend_reversal_ema_cross"}
+
+        # 2. RSI exhaustion
+        if not pd.isna(last["rsi"]) and last["rsi"] > 80:
+            return {"exit_price": last_price, "reason": "rsi_overbought_exhaustion"}
+
+        # 3. Trailing stop
+        profit_pct = (peak_price - entry_price) / entry_price * 100
+        if profit_pct >= trailing_activate_pct:
+            drawdown_from_peak = (peak_price - last_price) / peak_price * 100
+            if drawdown_from_peak >= trailing_distance_pct:
+                return {"exit_price": last_price, "reason": "trailing_stop_hit"}
+
+    else:  # short/sell
+        # 1. Trend reversal — EMA9 crosses above EMA21
+        if prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]:
+            return {"exit_price": last_price, "reason": "trend_reversal_ema_cross"}
+
+        # 2. RSI exhaustion (oversold for shorts)
+        if not pd.isna(last["rsi"]) and last["rsi"] < 20:
+            return {"exit_price": last_price, "reason": "rsi_oversold_exhaustion"}
+
+        # 3. Trailing stop for shorts
+        profit_pct = (entry_price - peak_price) / entry_price * 100
+        if profit_pct >= trailing_activate_pct:
+            drawdown_from_peak = (last_price - peak_price) / peak_price * 100
+            if drawdown_from_peak >= trailing_distance_pct:
+                return {"exit_price": last_price, "reason": "trailing_stop_hit"}
+
+    return None
+
+
 def generate_signal_with_ml(df: pd.DataFrame, risk_fraction_of_balance: float,
                              trading_balance: float, lstm_predictor=None,
                              ml_min_confidence: float = 0.6, **kwargs) -> dict | None:

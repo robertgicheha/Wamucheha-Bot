@@ -3,9 +3,10 @@ Main entry point — run this on the VPS.
 
 Wires together state, risk, execution, and alerting across multiple asset classes:
 - Crypto (Binance, OKX via ccxt)
-- Forex (EUR/USD via OANDA)
-- Commodities (XAU/USD via OANDA)
+- Forex (EUR/USD, GBP/USD, etc. via OANDA or MT5)
+- Commodities (XAU/USD via OANDA or MT5)
 - US Stocks/ETFs (AAPL, SPY via Alpaca)
+- MT5 (XAUUSD, BTCUSD, GBPUSD, EURUSD, AUDUSD, EURJPY, EURGBP, USDCAD)
 - Kenyan Stocks (NSE — analysis/alerts only, no automated execution)
 
 Replace `get_strategy_signal()` with your real signal logic — the risk/execution
@@ -24,12 +25,21 @@ from core.risk_manager import RiskManager
 from core.execution_manager import ExecutionManager
 from core.oanda_executor import OandaExecutor
 from core.alpaca_executor import AlpacaExecutor
+from core.mt5_executor import MT5Executor
 from alerts.notifier import Notifier
 from data_feeds.feed_router import FeedRouter
 from strategy.technical_strategy import generate_signal, generate_signal_with_ml
 from ml.lstm_predictor import LSTMPricePredictor
+from core.position_monitor import check_and_close_positions
+from reporting.hourly_report import HourlyReporter
 
 load_dotenv()
+
+# --- LIVE_TRADING switch ---
+# Defaults to dry-run (safe) unless explicitly set to "true". This is the ONLY
+# place that decides whether real orders get submitted. Flip it in .env, not
+# in code, so it's obvious and auditable which mode the bot is running in.
+LIVE_TRADING = os.environ.get("LIVE_TRADING", "false").lower() == "true"
 
 with open("config/config.yaml") as f:
     CONFIG = yaml.safe_load(f)
@@ -100,7 +110,7 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
 
 def classify_exchange(symbol: str, config: dict) -> str:
     """Returns the exchange/broker name that should execute trades for this symbol."""
-    from data_feeds.feed_router import OANDA_INSTRUMENTS, OANDA_COMMODITIES, NSE_TICKERS
+    from data_feeds.feed_router import OANDA_INSTRUMENTS, OANDA_COMMODITIES, NSE_TICKERS, MT5_SYMBOLS
 
     clean = symbol.upper().replace("_", "/")
     ticker = symbol.split("/")[0].split(".")[0].upper()
@@ -110,6 +120,12 @@ def classify_exchange(symbol: str, config: dict) -> str:
 
     if clean in OANDA_INSTRUMENTS or clean in OANDA_COMMODITIES:
         return "oanda"
+
+    # MT5 symbols (XAUUSD, EURUSD, BTCUSD, etc.)
+    if ticker in MT5_SYMBOLS and config.get("execution", {}).get("exchanges", []):
+        for ex_cfg in config["execution"]["exchanges"]:
+            if ex_cfg.get("name") == "mt5" and ex_cfg.get("enabled"):
+                return "mt5"
 
     if "/" not in symbol and ticker.isalpha() and len(ticker) <= 5:
         return "alpaca"
@@ -145,7 +161,7 @@ def main():
         if name in ("binance", "okx", "kraken", "coinbase", "bybit"):
             api_key = os.environ.get(f"{name.upper()}_API_KEY", "")
             api_secret = os.environ.get(f"{name.upper()}_API_SECRET", "")
-            passphrase = os.environ.get(f"{name.upper()}_PASSPHRASE", "")
+            passphrase = os.environ.get(f"{name.upper()}_PASSPHRASE", "") or os.environ.get(f"{name.upper()}_API_PASSPHRASE", "")
             executors[name] = ExecutionManager(
                 exchange_id=name,
                 api_key=api_key,
@@ -153,7 +169,7 @@ def main():
                 state_manager=state,
                 risk_manager=risk,
                 notifier=notifier,
-                dry_run=True,
+                dry_run=not LIVE_TRADING,
             )
             # OKX requires a passphrase — inject it onto the ccxt exchange object
             if passphrase:
@@ -171,7 +187,7 @@ def main():
             risk_manager=risk,
             notifier=notifier,
             practice=practice,
-            dry_run=True,
+            dry_run=not LIVE_TRADING,
         )
         print("  OANDA executor initialized (Forex/Commodities)")
 
@@ -187,9 +203,29 @@ def main():
             risk_manager=risk,
             notifier=notifier,
             paper=paper,
-            dry_run=True,
+            dry_run=not LIVE_TRADING,
         )
         print("  Alpaca executor initialized (US Stocks/ETFs)")
+
+    # MT5 executor (MetaTrader 5 — Forex, Gold, Crypto, CFDs)
+    mt5_login = int(os.environ.get("MT5_LOGIN", "0"))
+    mt5_password = os.environ.get("MT5_PASSWORD", "")
+    mt5_server = os.environ.get("MT5_SERVER", "")
+    if mt5_login:
+        mt5_exec = MT5Executor(
+            state_manager=state,
+            risk_manager=risk,
+            notifier=notifier,
+            login=mt5_login,
+            password=mt5_password,
+            server=mt5_server,
+            dry_run=not LIVE_TRADING,
+        )
+        if mt5_exec.connect():
+            executors["mt5"] = mt5_exec
+            print("  MT5 executor initialized (MetaTrader 5)")
+        else:
+            print("  WARNING: MT5 connection failed — MT5 symbols will be skipped")
 
     # Build unified market list from config
     all_markets = []
@@ -208,12 +244,22 @@ def main():
     for symbol in alpaca_markets:
         all_markets.append(("alpaca", symbol))
 
+    # Add MT5 markets if configured
+    mt5_markets = CONFIG.get("execution", {}).get("mt5_markets", [])
+    for symbol in mt5_markets:
+        all_markets.append(("mt5", symbol))
+
     print(f"Trading {len(all_markets)} symbols across {len(executors)} exchanges/brokers")
+    mode_str = "LIVE — REAL MONEY" if LIVE_TRADING else "DRY-RUN (simulated, no real orders)"
+    print(f"*** MODE: {mode_str} *** (set LIVE_TRADING=true in .env to go live)")
     notifier.notify("startup",
-        f"Trading bot started. {len(all_markets)} symbols, "
+        f"Trading bot started in {mode_str}. {len(all_markets)} symbols, "
         f"{len(executors)} exchanges/brokers, "
-        f"{len(ml_models)} ML models loaded."
+        f"{len(ml_models)} ML models loaded.",
+        priority="high" if LIVE_TRADING else "normal",
     )
+
+    hourly_reporter = HourlyReporter(state, notifier, interval_minutes=60)
 
     # --- NSE analysis setup ---
     from data_feeds.nse_feed import NSEFeed
@@ -281,6 +327,17 @@ def main():
             except Exception as e:
                 print(f"NSE analysis error: {e}")
 
+        # --- 1. Check existing open positions for an exit (this is what actually SELLS) ---
+        try:
+            check_and_close_positions(
+                state, executors, feed_router,
+                trailing_activate_pct=CONFIG["risk"].get("trailing_stop_activate_pct", 1.5),
+                trailing_distance_pct=CONFIG["risk"].get("trailing_stop_distance_pct", 1.0),
+            )
+        except Exception as e:
+            print(f"Position monitor error: {e}")
+
+        # --- 2. Look for new entries ---
         for exchange_name, symbol in all_markets:
             # Skip NSE — handled by the analysis loop above
             if exchange_name == "nse":
@@ -306,6 +363,12 @@ def main():
                     stop_loss_pct=CONFIG["risk"]["stop_loss_pct"],
                     take_profit_pct=CONFIG["risk"]["take_profit_pct"],
                 )
+
+        # --- 3. Hourly transaction/PnL report -> dashboard + Telegram + Discord ---
+        try:
+            hourly_reporter.maybe_report()
+        except Exception as e:
+            print(f"Hourly reporter error: {e}")
 
         time.sleep(15)
 

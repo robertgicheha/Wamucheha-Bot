@@ -25,6 +25,15 @@
     <button onclick="killSwitch()">Kill Switch</button>
     <button class="resume" onclick="resume()">Resume Trading</button>
   </div>
+  <h3>All-Time Profit / Loss</h3>
+  <div id="profitCard" class="card">Loading...</div>
+
+  <h3>Recent Trades</h3>
+  <div id="trades" class="card"></div>
+
+  <h3>Hourly Reports</h3>
+  <div id="hourly" class="card"></div>
+
   <h3>Recent Events</h3>
   <div id="events" class="card"></div>
 
@@ -46,6 +55,30 @@ async function refresh() {
   ev.innerHTML = (data.recent_events || []).map(e =>
     `<div class="event ${e.priority==='high'?'high':''}">[${e.ts}] <b>${e.type}</b> — ${e.message}</div>`
   ).join('');
+
+  const profitRes = await fetch('/api/profit');
+  const p = await profitRes.json();
+  document.getElementById('profitCard').innerHTML = `
+    <div class="stat"><div class="label">Total Trades</div><div class="value">${p.total_trades||0}</div></div>
+    <div class="stat"><div class="label">Win Rate</div><div class="value">${p.win_rate_pct||0}%</div></div>
+    <div class="stat"><div class="label">Total Made</div><div class="value">$${(p.total_won||0).toFixed(2)}</div></div>
+    <div class="stat"><div class="label">Total Lost</div><div class="value">$${(p.total_lost||0).toFixed(2)}</div></div>
+    <div class="stat"><div class="label">Net PnL</div><div class="value">$${(p.net_pnl||0).toFixed(2)}</div></div>
+  `;
+
+  const tradesRes = await fetch('/api/trades?n=15');
+  const t = await tradesRes.json();
+  document.getElementById('trades').innerHTML = (t.trades || []).map(tr =>
+    `<div class="event">[${tr.status}] ${tr.side.toUpperCase()} ${tr.symbol} ` +
+    `pnl=${tr.pnl != null ? tr.pnl.toFixed(2) : 'open'} (${tr.exchange}) — opened ${tr.opened_at}</div>`
+  ).join('') || '<div class="event">No trades yet.</div>';
+
+  const hourlyRes = await fetch('/api/hourly-logs?n=24');
+  const h = await hourlyRes.json();
+  document.getElementById('hourly').innerHTML = (h.hourly_logs || []).map(r =>
+    `<div class="event">${r.period_end.slice(0,16)}Z — trades=${r.trades_closed} ` +
+    `(${r.wins}W/${r.losses}L) hourPnL=${r.hour_pnl.toFixed(2)} bal=$${r.trading_balance.toFixed(2)}</div>`
+  ).join('') || '<div class="event">No hourly reports yet — first one lands within an hour of the bot starting.</div>';
 }
 async function killSwitch() {
   await fetch('/api/kill-switch', { method: 'POST', headers: { 'X-Dashboard-Key': document.getElementById('key').value }});

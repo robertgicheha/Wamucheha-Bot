@@ -26,6 +26,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS risk_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     trading_balance REAL NOT NULL,
+    peak_balance REAL NOT NULL DEFAULT 0,
     consecutive_losses INTEGER NOT NULL DEFAULT 0,
     daily_pnl REAL NOT NULL DEFAULT 0,
     daily_reset_at TEXT NOT NULL,
@@ -142,6 +143,30 @@ class StateManager:
         cur = self.conn.execute("SELECT * FROM open_positions")
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_recent_trades(self, n: int = 20) -> list:
+        cur = self.conn.execute(
+            "SELECT * FROM trades ORDER BY id DESC LIMIT ?", (n,)
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def get_all_time_stats(self) -> dict:
+        cur = self.conn.execute(
+            "SELECT COUNT(*) as total, "
+            "SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins, "
+            "SUM(CASE WHEN pnl <= 0 THEN 1 ELSE 0 END) as losses, "
+            "SUM(CASE WHEN pnl > 0 THEN pnl ELSE 0 END) as total_won, "
+            "SUM(CASE WHEN pnl <= 0 THEN pnl ELSE 0 END) as total_lost, "
+            "SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END) as net_pnl "
+            "FROM trades WHERE status = 'closed'"
+        )
+        cols = [d[0] for d in cur.description]
+        row = cur.fetchone()
+        data = dict(zip(cols, row))
+        total = data["total"] or 0
+        data["win_rate"] = (data["wins"] / total * 100) if total > 0 else 0
+        return data
 
     def is_duplicate_order(self, client_order_id) -> bool:
         cur = self.conn.execute(

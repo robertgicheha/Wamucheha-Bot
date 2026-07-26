@@ -36,6 +36,57 @@ sudo ufw allow from YOUR_HOME_IP to any port 8000
 sudo ufw enable
 ```
 
+## Part 1b — Interactive Telegram/Discord control bots
+
+These are separate long-running processes from the alert channels — the alerts
+in `.env` (`TELEGRAM_BOT_TOKEN`+`TELEGRAM_CHAT_ID`, `DISCORD_WEBHOOK_URL`) only
+ever push notifications out. To actually type `/status`, `/kill`, `/restart`
+etc. from your phone, you need these running too:
+
+```bash
+sudo cp deploy/tradingbot-telegram.service /etc/systemd/system/
+sudo cp deploy/tradingbot-discord.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tradingbot-telegram tradingbot-discord
+```
+
+Before starting them, fill in `.env`:
+- `TELEGRAM_ALLOWED_USER_IDS` — your numeric Telegram user ID (message
+  [@userinfobot](https://t.me/userinfobot) to get it), comma-separated if more
+  than one person should have control. **Leave this blank and the bot refuses
+  every command from everyone** — it fails closed on purpose since these
+  commands can halt/resume/restart something trading real money.
+- `DISCORD_BOT_TOKEN` — a real bot token from the
+  [Discord Developer Portal](https://discord.com/developers/applications)
+  (New Application → Bot → Reset Token). This is different from
+  `DISCORD_WEBHOOK_URL`; a webhook can't receive commands, only a real bot can.
+  Enable "Message Content Intent" under Bot settings, then invite it to your
+  server via OAuth2 → URL Generator (scope: `bot`, permissions: Send Messages
+  + Read Message History).
+- `DISCORD_ALLOWED_USER_IDS` — same fail-closed logic as Telegram. Get your
+  Discord user ID via User Settings → Advanced → Enable Developer Mode, then
+  right-click your name → Copy User ID.
+- `DISCORD_CONTROL_CHANNEL_ID` (optional) — restrict commands to one channel.
+
+**`/restart` needs one narrowly-scoped sudo rule.** The `tradingbot` OS user
+normally can't restart systemd services. Grant it permission for exactly this
+command and nothing else:
+```bash
+sudo visudo -f /etc/sudoers.d/tradingbot-restart
+```
+Add this single line (adjust the path to `systemctl` if `which systemctl`
+differs on your distro):
+```
+tradingbot ALL=(root) NOPASSWD: /bin/systemctl restart tradingbot tradingbot-dashboard tradingbot-screener
+```
+Save, then `sudo chmod 440 /etc/sudoers.d/tradingbot-restart`. This is
+deliberately the *only* elevated permission the control bots have — they
+cannot run arbitrary shell commands, only this exact restart line.
+
+Test it from Telegram/Discord with `/status` first (read-only, safe), then
+`/kill` + `/resume` (auth-gated by `DASHBOARD_SECRET_KEY` through the
+dashboard API), then finally `/restart` once you trust the sudoers rule works.
+
 **Backups via cron** (run as the tradingbot user):
 ```bash
 crontab -e
@@ -74,7 +125,9 @@ ssh-copy-id -i ~/.ssh/tradingbot_backup.pub you@your-local-ip   # or use a dyndn
 
 ## Part 3 — Verify before any real money
 
-1. Set `ALPACA_PAPER=true` and `dry_run=True` in the execution manager.
+1. Set `ALPACA_PAPER=true` and leave `LIVE_TRADING=false` (or unset) in `.env` —
+   this is now the single switch that controls dry-run vs. real orders across
+   every exchange/broker; you no longer need to edit any code.
 2. Run for at least a few weeks watching Telegram/Discord alerts fire correctly.
 3. Manually kill the VPS process (`sudo systemctl stop tradingbot`) and confirm the
    watchdog alerts you within `HEARTBEAT_ALERT_AFTER_MINUTES`.

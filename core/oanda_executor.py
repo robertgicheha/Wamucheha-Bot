@@ -144,8 +144,6 @@ class OandaExecutor:
                     "instrument": instrument,
                     "units": str(close_units),
                     "timeInForce": "FOK",
-                    "type": "MARKET_ORDER",
-                    "reduceOnly": True,
                 }
             }, timeout=15)
             resp.raise_for_status()

@@ -43,6 +43,15 @@ class RiskManager:
             self._halt("Daily loss limit reached", until_tomorrow=True)
             return RiskDecision(False, "Daily loss limit hit")
 
+        # Peak-to-trough drawdown enforcement
+        peak = risk_state.get("peak_balance", risk_state["trading_balance"])
+        if peak > 0:
+            drawdown_pct = (peak - risk_state["trading_balance"]) / peak * 100
+            max_dd = self.cfg.get("max_drawdown_pct", 5)
+            if drawdown_pct >= max_dd:
+                self._halt(f"Max drawdown {drawdown_pct:.1f}% exceeded limit {max_dd}%")
+                return RiskDecision(False, f"Max drawdown limit hit ({drawdown_pct:.1f}%)")
+
         if risk_state["trading_balance"] <= 0:
             return RiskDecision(False, "No trading balance — profit buffer exhausted. "
                                         "Stake is protected and untouched.")
@@ -66,8 +75,14 @@ class RiskManager:
         else:
             new_streak = risk_state["consecutive_losses"] + 1
 
+        # Track peak balance for drawdown enforcement
+        peak = risk_state.get("peak_balance", new_balance)
+        if new_balance > peak:
+            peak = new_balance
+
         self.state.update_risk_state(
             trading_balance=max(new_balance, 0),
+            peak_balance=peak,
             consecutive_losses=new_streak,
             daily_pnl=new_daily_pnl,
         )

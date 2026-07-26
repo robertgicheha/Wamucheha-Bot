@@ -3,8 +3,9 @@ Multi-asset feed router.
 
 Routes symbol requests to the correct data feed based on asset class:
 - Crypto (BTC/USDT, ETH/USDT) -> ccxt via MarketData (Binance)
-- Forex (EUR/USD, GBP/USD) -> OANDA
-- Commodities (XAU/USD, XAG/USD) -> OANDA
+- Forex (EUR/USD, GBP/USD) -> OANDA or MT5
+- Commodities (XAU/USD, XAG/USD) -> OANDA or MT5
+- MT5 symbols (XAUUSD, BTCUSD, etc.) -> MetaTrader 5
 - US Stocks/ETFs (AAPL, SPY, GLD) -> Alpaca
 - Kenyan Stocks (SCOM, EQTY) -> NSE scraper
 
@@ -17,6 +18,7 @@ from data_feeds.market_data import MarketData
 from data_feeds.oanda_feed import OandaFeed
 from data_feeds.alpaca_feed import AlpacaFeed
 from data_feeds.nse_feed import NSEFeed
+from data_feeds.mt5_feed import MT5Feed
 
 
 # Forex instruments that OANDA handles
@@ -32,6 +34,15 @@ OANDA_COMMODITIES = {"XAU/USD", "XAG/USD", "XAU_USD", "XAG_USD"}
 # NSE tickers — anything ending with .NSE or matching known NSE codes
 NSE_TICKERS = {"SCOM", "EQTY", "KCB", "BAT", "EABL", "SAFARICOM", "DTK",
                "COOP", "ABSA", "KNC", "NIC", "KEGN", "I&M", "HFCK"}
+
+# MT5 symbols (no slashes, no dots — XAUUSD, EURUSD, BTCUSD, etc.)
+MT5_SYMBOLS = {
+    "XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD",
+    "GBPUSD", "EURUSD", "AUDUSD", "NZDUSD",
+    "USDCAD", "USDCHF", "USDJPY",
+    "EURGBP", "EURJPY", "GBPJPY",
+    "AUDNZD", "EURAUD", "GBPAUD",
+}
 
 
 class FeedRouter:
@@ -68,6 +79,15 @@ class FeedRouter:
         apify_token = os.environ.get("APIFY_TOKEN")
         self.feeds["nse"] = NSEFeed(apify_token=apify_token)
 
+        # MT5 feed for MetaTrader 5 symbols
+        mt5_login = int(os.environ.get("MT5_LOGIN", "0"))
+        mt5_password = os.environ.get("MT5_PASSWORD", "")
+        mt5_server = os.environ.get("MT5_SERVER", "")
+        if mt5_login:
+            mt5_feed = MT5Feed(login=mt5_login, password=mt5_password, server=mt5_server)
+            if mt5_feed.connect():
+                self.feeds["mt5"] = mt5_feed
+
     def _classify_symbol(self, symbol: str) -> str:
         """Returns the feed name to use for a given symbol."""
         clean = symbol.upper().replace("_", "/")
@@ -84,6 +104,10 @@ class FeedRouter:
         # OANDA forex/commodities
         if clean in OANDA_INSTRUMENTS or clean in OANDA_COMMODITIES:
             return "oanda"
+
+        # MT5 symbols (XAUUSD, EURUSD, BTCUSD, etc.)
+        if ticker in MT5_SYMBOLS and "mt5" in self.feeds:
+            return "mt5"
 
         # US stocks/ETFs: 1-5 uppercase letters (not a known crypto pair)
         if "/" not in symbol and ticker.isalpha() and len(ticker) <= 5:

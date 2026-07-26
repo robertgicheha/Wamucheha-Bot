@@ -224,7 +224,28 @@ TELEGRAM_CHAT_ID=123456789
 ```
 
 You'll get alerts for: trade opened/closed, circuit breakers, daily PnL,
-profit sweeps, NSE analysis, and heartbeat misses.
+profit sweeps, NSE analysis, heartbeat misses, and an hourly transaction/PnL
+report (every trade closed in the last hour + running account totals).
+
+### Control the bot from Telegram/Discord (not just alerts)
+
+The steps above only make the bot able to *talk to you*. To *control* it —
+check status, see profit/loss, view past hourly logs, and kill/resume/restart —
+run the separate interactive control bots:
+
+```bash
+python control/telegram_bot.py     # polls Telegram for commands
+python control/discord_bot.py      # real Discord bot, not the webhook above
+```
+
+Commands: `/status /positions /profit /trades /logs [n] /kill /resume /restart /refresh`
+
+Both fail closed: nobody can issue a command until you list their user ID in
+`TELEGRAM_ALLOWED_USER_IDS` / `DISCORD_ALLOWED_USER_IDS` in `.env`. Full setup
+(bot tokens, intents, the sudoers rule `/restart` needs) is in
+`deploy/DEPLOYMENT.md` Part 1b. For 24/7 use, install them as systemd services
+just like the engine — units are in `deploy/tradingbot-telegram.service` and
+`deploy/tradingbot-discord.service`.
 
 ## Link Discord alerts
 
@@ -361,6 +382,39 @@ Services:
 │  - Set STAKE_AMOUNT in .env (e.g. 10, 100, 500)        │
 └─────────────────────────────────────────────────────────┘
 ```
+
+## Going live — the one switch that matters
+
+`LIVE_TRADING=false` in `.env` (the default) means every exchange/broker
+executor runs in dry-run: signals still fire, trades are still logged and
+scored, but no real order ever reaches Binance/OKX/OANDA/Alpaca. Set
+`LIVE_TRADING=true` only after you're satisfied with weeks of dry-run/paper
+results — this is the only place that decides real-vs-simulated, on purpose,
+so it's one clearly auditable line instead of scattered across executor code.
+
+## How the bot actually buys and sells
+
+**Entry** (`strategy/technical_strategy.generate_signal`): EMA(9)/EMA(21)
+bullish crossover, confirmed by RSI between 45–70 (momentum without being
+overbought) and above-average volume (real participation, not a thin tick).
+An optional LSTM model can only make this MORE conservative — it can veto a
+signal, never create one on its own.
+
+**Exit** (`core/position_monitor.py` + `strategy/technical_strategy.generate_exit_signal`),
+checked every ~15 seconds against every open position, in this order:
+1. Fixed stop-loss / take-profit — the floor, also placed as a real
+   exchange-side order at entry in live mode so it protects you even if the
+   bot process dies.
+2. Trend reversal — EMA(9) crosses back below EMA(21): the move that
+   justified the entry is over.
+3. RSI exhaustion — RSI pushes above 80 after a run: momentum is stretched,
+   take the win.
+4. Trailing stop — once a position is up `trailing_stop_activate_pct`
+   (config.yaml), a stop trails `trailing_stop_distance_pct` behind the peak
+   price so a winner can't fully round-trip back to breakeven.
+
+None of this guarantees profit. It's a disciplined, debuggable rule set with
+a real exit path — not a claim that it beats the market.
 
 ## Risk rules
 
