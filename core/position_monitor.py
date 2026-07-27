@@ -64,7 +64,11 @@ def check_and_close_positions(state_manager, executors: dict, feed_router,
             continue
 
         last_price = float(df.iloc[-1]["close"])
-        _peak_prices[client_order_id] = max(_peak_prices.get(client_order_id, pos["entry_price"]), last_price)
+        if pos["side"] == "buy":
+            _peak_prices[client_order_id] = max(_peak_prices.get(client_order_id, pos["entry_price"]), last_price)
+        else:
+            # For shorts, track the LOWEST price (best exit point for a short)
+            _peak_prices[client_order_id] = min(_peak_prices.get(client_order_id, pos["entry_price"]), last_price)
         pos_with_peak = {**pos, "peak_price": _peak_prices[client_order_id]}
 
         # 1. Fixed stop-loss / take-profit (the floor)
@@ -96,5 +100,5 @@ def check_and_close_positions(state_manager, executors: dict, feed_router,
 
 def _do_close(executor, state_manager, client_order_id, exit_price, reason):
     logger.info(f"Closing {client_order_id} @ {exit_price} — reason: {reason}")
-    executor.close_trade(client_order_id, exit_price)
+    executor.close_trade(client_order_id, exit_price, reason=reason)
     _peak_prices.pop(client_order_id, None)

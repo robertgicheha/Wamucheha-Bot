@@ -87,13 +87,10 @@ class RiskManager:
             daily_pnl=new_daily_pnl,
         )
 
-        self.notifier.notify(
-            "trade_closed",
-            f"Trade closed. PnL: {pnl:+.2f} USD. Trading balance: {max(new_balance,0):.2f}. "
-            f"Consecutive losses: {new_streak}/{self.cfg['max_consecutive_losses']}. "
-            f"Stake ({self.stake_amount} USD) untouched.",
-        )
 
+        # NOTE: trade close notification is handled by execution_manager.close_trade()
+        # via notifier.notify_trade_closed() -- rich Telegram/Discord messages with PnL,
+        # session stats, and strategy info. No need to duplicate here.
         if new_streak >= self.cfg["max_consecutive_losses"]:
             self._halt(f"{new_streak} consecutive losses reached")
 

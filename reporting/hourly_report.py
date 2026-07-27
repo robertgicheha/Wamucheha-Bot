@@ -1,13 +1,11 @@
 """
-Hourly trading report — summaries of trades, wins/losses, PnL, and balance.
+Enhanced hourly trading report — with styled summaries pushed to Telegram and Discord.
 
-Writes an hourly log entry to data/hourly_log.jsonl and optionally pushes
-a summary to Telegram/Discord. The dashboard reads this log for the
-/hourly-logs endpoint.
+Computes comprehensive hourly stats and pushes rich-formatted reports.
 """
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 logger = logging.getLogger("hourly_report")
@@ -44,41 +42,49 @@ class HourlyReporter:
             "hour_pnl": stats["hour_pnl"],
             "consecutive_losses": risk_state["consecutive_losses"],
             "trading_halted": bool(risk_state["trading_halted"]),
+            "symbols_traded": stats.get("symbols_traded", []),
+            "best_trade": stats.get("best_trade", 0),
+            "worst_trade": stats.get("worst_trade", 0),
         }
 
         with open(HOURLY_LOG, "a") as f:
             f.write(json.dumps(entry, default=str) + "\n")
 
-        summary = (
-            f"Hourly Report: {stats['trades_this_hour']} trades "
-            f"({stats['wins_this_hour']}W/{stats['losses_this_hour']}L), "
-            f"PnL: {stats['hour_pnl']:+.2f} USD, "
-            f"Balance: {risk_state['trading_balance']:.2f} USD, "
-            f"Open: {len(positions)}"
-        )
-        self.notifier.notify("hourly_report", summary)
+        # Push styled summary to Telegram and Discord
+        self.notifier.notify_hourly_summary(entry)
 
 
 def _compute_hourly_stats(state_manager) -> dict:
-    conn = state_manager.conn
-    from datetime import timedelta
+    """Compute comprehensive hourly statistics using SQLAlchemy."""
+    from sqlalchemy.orm import Session
+    from core.state_manager import TradeRow, engine
+
     one_hour_ago = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
 
-    cur = conn.execute(
-        "SELECT status, pnl FROM trades WHERE closed_at >= ?",
-        (one_hour_ago,),
-    )
-    rows = cur.fetchall()
-    trades = len(rows)
-    wins = sum(1 for r in rows if r[1] is not None and r[1] > 0)
-    losses = sum(1 for r in rows if r[1] is not None and r[1] <= 0)
-    hour_pnl = sum(r[1] for r in rows if r[1] is not None)
+    with Session(engine) as session:
+        trades = session.query(TradeRow).filter(
+            TradeRow.closed_at >= one_hour_ago,
+            TradeRow.status == "closed",
+        ).all()
+
+        trade_count = len(trades)
+        wins = sum(1 for t in trades if t.pnl is not None and t.pnl > 0)
+        losses = sum(1 for t in trades if t.pnl is not None and t.pnl <= 0)
+        hour_pnl = sum(t.pnl for t in trades if t.pnl is not None)
+
+        symbols = list(set(t.symbol for t in trades))
+        pnl_values = [t.pnl for t in trades if t.pnl is not None]
+        best_trade = max(pnl_values) if pnl_values else 0
+        worst_trade = min(pnl_values) if pnl_values else 0
 
     return {
-        "trades_this_hour": trades,
+        "trades_this_hour": trade_count,
         "wins_this_hour": wins,
         "losses_this_hour": losses,
         "hour_pnl": hour_pnl,
+        "symbols_traded": symbols,
+        "best_trade": best_trade,
+        "worst_trade": worst_trade,
     }
 
 

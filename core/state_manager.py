@@ -1,18 +1,11 @@
 """
-State persistence layer with SQLAlchemy ORM.
+State persistence layer with SQLAlchemy ORM — enhanced version.
 
-The #1 cause of blown-up retail trading bots: state lives only in memory, the process
-crashes or the VPS reboots, and the bot comes back up with consecutive_losses=0 and
-no memory of open positions — so it happily starts trading again right through a
-circuit breaker that should still be active.
-
-Everything risk-critical is written to SQLite on every state change (not batched),
-using atomic transactions. A JSON snapshot is also written after every trade for
-human-readable backups and for the local watchdog to inspect without needing to
-speak SQL.
-
-This version uses SQLAlchemy ORM for schema management while keeping raw SQL
-fallback compatibility for hot-backup and existing tooling.
+Extended with:
+- Trade metadata (strategies used, scores, reasons, regime)
+- Hourly aggregated stats cached for fast dashboard access
+- Per-symbol performance tracking
+- Trade history queries with filtering
 """
 import json
 import shutil
@@ -20,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import (
-    create_engine, Column, Integer, Float, String, DateTime, func,
+    create_engine, Column, Integer, Float, String, DateTime, func, Text,
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
@@ -78,6 +71,11 @@ class TradeRow(Base):
     exit_price = Column(Float, nullable=True)
     status = Column(String, nullable=False, default="open")
     pnl = Column(Float, nullable=True)
+    pnl_pct = Column(Float, nullable=True)
+    reason = Column(String, nullable=True)
+    strategies = Column(Text, nullable=True)  # JSON list of strategy names
+    score = Column(Float, nullable=True)
+    regime = Column(String, nullable=True)
     opened_at = Column(String, nullable=False)
     closed_at = Column(String, nullable=True)
 
@@ -93,6 +91,11 @@ class TradeRow(Base):
             "exit_price": self.exit_price,
             "status": self.status,
             "pnl": self.pnl,
+            "pnl_pct": self.pnl_pct,
+            "reason": self.reason,
+            "strategies": json.loads(self.strategies) if self.strategies else [],
+            "score": self.score,
+            "regime": self.regime,
             "opened_at": self.opened_at,
             "closed_at": self.closed_at,
         }
@@ -125,10 +128,32 @@ class OpenPositionRow(Base):
         }
 
 
+# Create new tables if they don't exist (safe migration)
+def _safe_migrate():
+    """Add new columns to existing tables if needed."""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.execute("PRAGMA table_info(trades)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        new_cols = {
+            "pnl_pct": "REAL", "reason": "TEXT", "strategies": "TEXT",
+            "score": "REAL", "regime": "TEXT",
+        }
+        for col_name, col_type in new_cols.items():
+            if col_name not in existing_cols:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 class StateManager:
     def __init__(self, stake_amount: float):
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        _safe_migrate()
         Base.metadata.create_all(engine)
         self._init_row(stake_amount)
 
@@ -170,8 +195,10 @@ class StateManager:
         self.snapshot()
 
     def record_trade_open(self, client_order_id, exchange, symbol, side, amount,
-                           entry_price, stop_loss_price=None, take_profit_price=None):
+                           entry_price, stop_loss_price=None, take_profit_price=None,
+                           strategies=None, score=None, regime=None):
         now = self._now()
+        strategies_json = json.dumps(strategies) if strategies else None
         with Session(engine) as session:
             with session.begin():
                 session.add(TradeRow(
@@ -182,6 +209,9 @@ class StateManager:
                     amount=amount,
                     entry_price=entry_price,
                     status="open",
+                    strategies=strategies_json,
+                    score=score,
+                    regime=regime,
                     opened_at=now,
                 ))
                 session.add(OpenPositionRow(
@@ -197,7 +227,8 @@ class StateManager:
                 ))
         self.snapshot()
 
-    def record_trade_close(self, client_order_id, exit_price, pnl):
+    def record_trade_close(self, client_order_id, exit_price, pnl, reason=""):
+        direction = 1
         with Session(engine) as session:
             with session.begin():
                 trade = session.query(TradeRow).filter_by(
@@ -208,6 +239,14 @@ class StateManager:
                     trade.pnl = pnl
                     trade.status = "closed"
                     trade.closed_at = self._now()
+                    trade.reason = reason
+                    # Calculate PnL percentage
+                    if trade.entry_price and trade.entry_price > 0:
+                        if trade.side == "buy":
+                            trade.pnl_pct = (exit_price - trade.entry_price) / trade.entry_price * 100
+                        else:
+                            trade.pnl_pct = (trade.entry_price - exit_price) / trade.entry_price * 100
+                    direction = 1 if trade.side == "buy" else -1
                 session.query(OpenPositionRow).filter_by(
                     client_order_id=client_order_id
                 ).delete()
@@ -224,6 +263,64 @@ class StateManager:
                 TradeRow.id.desc()
             ).limit(n).all()
             return [r.to_dict() for r in rows]
+
+    def get_trades_by_symbol(self, symbol: str, n: int = 50) -> list:
+        with Session(engine) as session:
+            rows = session.query(TradeRow).filter_by(
+                symbol=symbol
+            ).order_by(TradeRow.id.desc()).limit(n).all()
+            return [r.to_dict() for r in rows]
+
+    def get_trades_by_timeframe(self, hours: int = 24) -> list:
+        """Get trades from the last N hours."""
+        from datetime import timedelta
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        with Session(engine) as session:
+            rows = session.query(TradeRow).filter(
+                TradeRow.closed_at >= cutoff,
+                TradeRow.status == "closed",
+            ).order_by(TradeRow.id.desc()).all()
+            return [r.to_dict() for r in rows]
+
+    def get_symbol_stats(self) -> dict:
+        """Per-symbol performance breakdown."""
+        with Session(engine) as session:
+            symbols = session.query(TradeRow.symbol).distinct().all()
+            result = {}
+            for (symbol,) in symbols:
+                trades = session.query(TradeRow).filter_by(
+                    symbol=symbol, status="closed"
+                ).all()
+                wins = sum(1 for t in trades if t.pnl and t.pnl > 0)
+                total_pnl = sum(t.pnl for t in trades if t.pnl is not None)
+                result[symbol] = {
+                    "total_trades": len(trades),
+                    "wins": wins,
+                    "losses": len(trades) - wins,
+                    "win_rate": (wins / len(trades) * 100) if trades else 0,
+                    "total_pnl": total_pnl,
+                    "avg_pnl": (total_pnl / len(trades)) if trades else 0,
+                }
+            return result
+
+    def get_equity_curve(self, n: int = 100) -> list:
+        """Get equity curve data points (cumulative PnL over trades)."""
+        with Session(engine) as session:
+            rows = session.query(TradeRow).filter_by(
+                status="closed"
+            ).order_by(TradeRow.id.asc()).limit(n).all()
+            cumulative = 0
+            curve = []
+            for r in rows:
+                cumulative += r.pnl or 0
+                curve.append({
+                    "trade_id": r.id,
+                    "symbol": r.symbol,
+                    "pnl": r.pnl,
+                    "cumulative_pnl": cumulative,
+                    "closed_at": r.closed_at,
+                })
+            return curve
 
     def get_all_time_stats(self) -> dict:
         with Session(engine) as session:
@@ -245,6 +342,15 @@ class StateManager:
             net_pnl = session.query(func.sum(TradeRow.pnl)).filter(
                 TradeRow.status == "closed"
             ).scalar() or 0
+            avg_pnl = (net_pnl / total) if total > 0 else 0
+
+            # Best and worst trades
+            best = session.query(func.max(TradeRow.pnl)).filter(
+                TradeRow.status == "closed"
+            ).scalar() or 0
+            worst = session.query(func.min(TradeRow.pnl)).filter(
+                TradeRow.status == "closed"
+            ).scalar() or 0
 
         win_rate = (wins / total * 100) if total > 0 else 0
         return {
@@ -255,6 +361,10 @@ class StateManager:
             "total_lost": total_lost,
             "net_pnl": net_pnl,
             "win_rate": win_rate,
+            "avg_pnl": avg_pnl,
+            "best_trade": best,
+            "worst_trade": worst,
+            "profit_factor": (total_won / abs(total_lost)) if total_lost else 0,
         }
 
     def is_duplicate_order(self, client_order_id) -> bool:
@@ -264,13 +374,11 @@ class StateManager:
             ).first() is not None
 
     def snapshot(self):
-        """Human-readable JSON dump — read by dashboard and the local watchdog."""
         state = self.get_risk_state()
         state["open_positions"] = self.get_open_positions()
         SNAPSHOT_PATH.write_text(json.dumps(state, indent=2, default=str))
 
     def backup_now(self) -> Path:
-        """Hot-copy the SQLite DB (safe even while WAL is active) into data/backups/."""
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest = BACKUP_DIR / f"state_{ts}.db"
         import sqlite3
