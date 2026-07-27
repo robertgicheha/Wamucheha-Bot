@@ -1,17 +1,8 @@
 """
-Execution manager.
+Execution manager — enhanced with trade metadata tracking.
 
-Common bot failure modes this addresses:
-1. Network blip during order submission -> bot retries -> exchange actually received
-   the first request -> DOUBLE ORDER. Fixed with client-side idempotency keys and a
-   duplicate check against persisted state before every submission.
-2. Stop-loss tracked only in the bot's memory -> bot crashes -> position sits naked
-   with no protection until the bot comes back. Fixed by placing the stop-loss as a
-   real exchange-side order (OCO/stop order) at trade entry, not just in-memory logic.
-3. Exchange rate-limiting -> bot hammers the API -> gets temp-banned. Fixed with
-   exponential backoff via tenacity.
-4. Partial fills ignored -> position size tracked wrong. Fixed by reading back the
-   actual filled amount from the order response, never assuming full fill.
+Passes strategy information, scores, and regime data through to the
+notification system for rich trade logging.
 """
 import uuid
 import ccxt
@@ -46,7 +37,8 @@ class ExecutionManager:
         return self.exchange.create_order(symbol, order_type, side, amount, params=params)
 
     def open_trade(self, symbol: str, side: str, proposed_amount: float,
-                    entry_price: float, stop_loss_pct: float, take_profit_pct: float):
+                    entry_price: float, stop_loss_pct: float, take_profit_pct: float,
+                    strategies: list = None, score: float = 0, regime: str = ""):
         decision = self.risk.pre_trade_check(proposed_amount)
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"{symbol} {side} rejected: {decision.reason}")
@@ -54,9 +46,8 @@ class ExecutionManager:
 
         client_order_id = self._new_client_order_id(symbol)
 
-        # idempotency guard: check persisted state, not memory
         if self.state.is_duplicate_order(client_order_id):
-            return None  # should never happen with fresh UUIDs, but the guard is cheap insurance
+            return None
 
         stop_price = entry_price * (1 - stop_loss_pct / 100) if side == "buy" \
             else entry_price * (1 + stop_loss_pct / 100)
@@ -74,7 +65,6 @@ class ExecutionManager:
             fill_price = order.get("average") or order.get("price") or entry_price
             filled_amount = order.get("filled", decision.position_size)
 
-            # attach a real exchange-side stop order — not just tracked in memory
             stop_side = "sell" if side == "buy" else "buy"
             self._submit_order(
                 symbol, stop_side, filled_amount, "stop_market",
@@ -84,15 +74,21 @@ class ExecutionManager:
         self.state.record_trade_open(
             client_order_id, self.exchange_id, symbol, side, filled_amount,
             fill_price, stop_price, target_price,
+            strategies=strategies, score=score, regime=regime,
         )
-        self.notifier.notify(
-            "trade_opened",
-            f"{side.upper()} {filled_amount:.6f} {symbol} @ {fill_price:.4f} "
-            f"(SL: {stop_price:.4f}, TP: {target_price:.4f}) [{'DRY-RUN' if self.dry_run else 'LIVE'}]",
+
+        # Rich notification
+        self.notifier.notify_trade_opened(
+            symbol=symbol, side=side, amount=filled_amount,
+            entry_price=fill_price, stop_loss=stop_price,
+            take_profit=target_price, exchange=self.exchange_id,
+            dry_run=self.dry_run, strategies=strategies,
+            score=score, regime=regime,
         )
+
         return client_order_id
 
-    def close_trade(self, client_order_id: str, exit_price: float):
+    def close_trade(self, client_order_id: str, exit_price: float, reason: str = ""):
         positions = {p["client_order_id"]: p for p in self.state.get_open_positions()}
         pos = positions.get(client_order_id)
         if not pos:
@@ -108,5 +104,31 @@ class ExecutionManager:
         direction = 1 if pos["side"] == "buy" else -1
         pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
 
-        self.state.record_trade_close(client_order_id, exit_price, pnl)
+        # Get trade metadata for rich notification
+        from sqlalchemy.orm import Session
+        from core.state_manager import TradeRow, engine
+        strategies = None
+        score = None
+        regime = None
+        with Session(engine) as session:
+            trade = session.query(TradeRow).filter_by(
+                client_order_id=client_order_id
+            ).first()
+            if trade:
+                strategies = trade.strategies
+                score = trade.score
+                regime = trade.regime
+                if strategies:
+                    import json
+                    strategies = json.loads(strategies)
+
+        self.state.record_trade_close(client_order_id, exit_price, pnl, reason)
         self.risk.on_trade_closed(pnl)
+
+        # Rich notification
+        self.notifier.notify_trade_closed(
+            symbol=pos["symbol"], side=pos["side"], amount=pos["amount"],
+            entry_price=pos["entry_price"], exit_price=exit_price,
+            pnl=pnl, exchange=self.exchange_id, reason=reason,
+            strategies=strategies,
+        )

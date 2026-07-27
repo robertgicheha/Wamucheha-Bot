@@ -159,9 +159,12 @@ class TFLSTMPricePredictor:
         )
         return model
 
-    def train(self, df: pd.DataFrame, epochs: int = 30, train_frac: float = 0.7,
+    def train(self, df: pd.DataFrame, epochs: int = 30, lr: float = 5e-4, train_frac: float = 0.7,
               batch_size: int = 32, verbose: bool = 1) -> dict:
         feat_df = _build_features(df)
+        # Dynamically set learning rate if caller overrides the default
+        if lr != 5e-4:
+            keras.backend.set_value(self.model.optimizer.learning_rate, lr)
         if len(feat_df) < self.lookback + self.horizon + 50:
             raise ValueError("Not enough data — need ~100+ bars after feature warmup.")
 

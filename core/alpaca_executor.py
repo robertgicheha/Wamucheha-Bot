@@ -74,7 +74,8 @@ class AlpacaExecutor:
         return resp.json()
 
     def open_trade(self, symbol: str, side: str, proposed_amount: float,
-                    entry_price: float, stop_loss_pct: float, take_profit_pct: float):
+                    entry_price: float, stop_loss_pct: float, take_profit_pct: float,
+                    strategies: list = None, score: float = 0, regime: str = ""):
         """
         proposed_amount is in USD (notional). Alpaca supports fractional shares.
         qty = notional / price for market buy.
@@ -107,7 +108,6 @@ class AlpacaExecutor:
                 time_in_force="day",
             )
             order_id = result.get("id", client_order_id)
-            # Alpaca market orders fill almost instantly — poll for fill
             import time
             for _ in range(10):
                 time.sleep(0.5)
@@ -120,7 +120,6 @@ class AlpacaExecutor:
                 fill_price = entry_price
                 filled_qty = qty
 
-            # Place stop-loss order (Alpaca supports stop orders natively)
             sl_price = entry_price * (1 - stop_loss_pct / 100) if side == "buy" \
                 else entry_price * (1 + stop_loss_pct / 100)
             sl_side = "sell" if side == "buy" else "buy"
@@ -147,16 +146,18 @@ class AlpacaExecutor:
         self.state.record_trade_open(
             order_id, "alpaca", symbol, side, filled_qty,
             fill_price, sl_price, tp_price,
+            strategies=strategies, score=score, regime=regime,
         )
-        self.notifier.notify(
-            "trade_opened",
-            f"Alpaca {side.upper()} {filled_qty:.4f} {symbol} @ {fill_price:.2f} "
-            f"(SL: {sl_price:.2f}, TP: {tp_price:.2f}) "
-            f"[{'DRY-RUN' if self.dry_run else 'LIVE'}]",
+        self.notifier.notify_trade_opened(
+            symbol=symbol, side=side, amount=filled_qty,
+            entry_price=fill_price, stop_loss=sl_price,
+            take_profit=tp_price, exchange="alpaca",
+            dry_run=self.dry_run, strategies=strategies,
+            score=score, regime=regime,
         )
         return order_id
 
-    def close_trade(self, client_order_id: str, exit_price: float):
+    def close_trade(self, client_order_id: str, exit_price: float, reason: str = ""):
         positions = {p["client_order_id"]: p for p in self.state.get_open_positions()}
         pos = positions.get(client_order_id)
         if not pos:
@@ -178,7 +179,6 @@ class AlpacaExecutor:
                 )
                 return
 
-            # Cancel any remaining stop orders for this symbol
             try:
                 url = f"{self.base_url}/v2/orders"
                 resp = requests.get(url, headers=self._headers(),
@@ -194,5 +194,22 @@ class AlpacaExecutor:
         direction = 1 if pos["side"] == "buy" else -1
         pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
 
-        self.state.record_trade_close(client_order_id, exit_price, pnl)
+        # Get trade metadata
+        from sqlalchemy.orm import Session
+        from core.state_manager import TradeRow, engine
+        strategies = None
+        with Session(engine) as session:
+            trade = session.query(TradeRow).filter_by(client_order_id=client_order_id).first()
+            if trade and trade.strategies:
+                import json
+                strategies = json.loads(trade.strategies)
+
+        self.state.record_trade_close(client_order_id, exit_price, pnl, reason)
         self.risk.on_trade_closed(pnl)
+
+        self.notifier.notify_trade_closed(
+            symbol=pos["symbol"], side=pos["side"], amount=pos["amount"],
+            entry_price=pos["entry_price"], exit_price=exit_price,
+            pnl=pnl, exchange="alpaca", reason=reason,
+            strategies=strategies,
+        )

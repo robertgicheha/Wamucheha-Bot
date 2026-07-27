@@ -9,9 +9,9 @@ Wires together state, risk, execution, and alerting across multiple asset classe
 - MT5 (XAUUSD, BTCUSD, GBPUSD, EURUSD, AUDUSD, EURJPY, EURGBP, USDCAD)
 - Kenyan Stocks (NSE — analysis/alerts only, no automated execution)
 
-Features a multi-strategy ensemble (EMA, MACD, Bollinger, RSI, Momentum) with
-optional LSTM ML filtering, market regime intelligence (Fear & Greed, DXY trend),
-and automatic model retraining.
+Features a 10-strategy ensemble (EMA, MACD, Bollinger, RSI, Momentum, VWAP,
+Keltner, Ichimoku, Supertrend, Scalping) with adaptive regime-aware weighting,
+optional LSTM ML filtering, market regime intelligence, and automatic model retraining.
 """
 import os
 import time
@@ -63,6 +63,7 @@ def build_notifier():
             "smtp_host": os.environ.get("EMAIL_SMTP_HOST"),
             "smtp_port": int(os.environ.get("EMAIL_SMTP_PORT", 587)),
         },
+        discord_webhook_trades=os.environ.get("DISCORD_WEBHOOK_TRADES") or os.environ.get("DISCORD_WEBHOOK_URL"),
     )
 
 
@@ -161,7 +162,7 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
     if market_regime and market_regime.get("regime") == "risk_off":
         score = signal.get("score", 0)
         if score < 0.7:
-            return None  # require stronger signals during risk-off
+            return None
 
     return signal
 
@@ -170,6 +171,10 @@ def main():
     notifier = build_notifier()
     state = StateManager(stake_amount=CONFIG["account"]["stake_amount"])
     risk = RiskManager(state, CONFIG, notifier)
+
+    # Set starting balance for session stats
+    risk_state = state.get_risk_state()
+    notifier.update_start_balance(risk_state.get("trading_balance", 0))
 
     feed_router = FeedRouter(CONFIG)
     print(f"Active feeds: {list(feed_router.get_available_feeds().keys())}")
@@ -272,9 +277,10 @@ def main():
     print(f"\nTrading {len(all_markets)} symbols across {len(executors)} exchanges/brokers")
     mode_str = "LIVE — REAL MONEY" if LIVE_TRADING else "DRY-RUN (simulated, no real orders)"
     print(f"*** MODE: {mode_str} ***")
+    print(f"Strategy: 10-strategy adaptive ensemble with regime-aware weighting")
     notifier.notify("startup",
         f"Bot started in {mode_str}. {len(all_markets)} symbols, {len(executors)} brokers, "
-        f"{len(ml_models)} ML models.",
+        f"{len(ml_models)} ML models. 10-strategy adaptive ensemble active.",
         priority="high" if LIVE_TRADING else "normal",
     )
 
@@ -405,6 +411,9 @@ def main():
                     entry_price=signal["entry_price"],
                     stop_loss_pct=CONFIG["risk"]["stop_loss_pct"],
                     take_profit_pct=CONFIG["risk"]["take_profit_pct"],
+                    strategies=signal.get("strategies", []),
+                    score=signal.get("score", 0),
+                    regime=signal.get("regime", ""),
                 )
 
         # Hourly report

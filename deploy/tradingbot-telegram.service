@@ -1,0 +1,18 @@
+[Unit]
+Description=Trading Bot - Telegram Control Bot
+After=network-online.target
+
+[Service]
+Type=simple
+User=tradingbot
+WorkingDirectory=/opt/trading_bot
+EnvironmentFile=/opt/trading_bot/.env
+ExecStart=/opt/trading_bot/venv/bin/python /opt/trading_bot/control/telegram_bot.py
+Restart=always
+RestartSec=10
+
+StandardOutput=append:/opt/trading_bot/logs/telegram_bot.log
+StandardError=append:/opt/trading_bot/logs/telegram_bot_error.log
+
+[Install]
+WantedBy=multi-user.target

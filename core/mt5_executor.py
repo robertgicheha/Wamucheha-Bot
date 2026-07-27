@@ -96,7 +96,8 @@ class MT5Executor:
             return 0.0
 
     def open_trade(self, symbol: str, side: str, proposed_amount: float,
-                    entry_price: float, stop_loss_pct: float, take_profit_pct: float):
+                    entry_price: float, stop_loss_pct: float, take_profit_pct: float,
+                    strategies: list = None, score: float = 0, regime: str = ""):
         decision = self.risk.pre_trade_check(proposed_amount)
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"MT5 {symbol} {side} rejected: {decision.reason}")
@@ -155,16 +156,18 @@ class MT5Executor:
         self.state.record_trade_open(
             client_order_id, "mt5", symbol, side, lots,
             fill_price, sl_price, tp_price,
+            strategies=strategies, score=score, regime=regime,
         )
-        self.notifier.notify(
-            "trade_opened",
-            f"MT5 {side.upper()} {lots} lots {symbol} @ {fill_price:.5f} "
-            f"(SL: {sl_price:.5f}, TP: {tp_price:.5f}) "
-            f"[{'DRY-RUN' if self.dry_run else 'LIVE'}]",
+        self.notifier.notify_trade_opened(
+            symbol=symbol, side=side, amount=lots,
+            entry_price=fill_price, stop_loss=sl_price,
+            take_profit=tp_price, exchange="mt5",
+            dry_run=self.dry_run, strategies=strategies,
+            score=score, regime=regime,
         )
         return client_order_id
 
-    def close_trade(self, client_order_id: str, exit_price: float):
+    def close_trade(self, client_order_id: str, exit_price: float, reason: str = ""):
         positions = {p["client_order_id"]: p for p in self.state.get_open_positions()}
         pos = positions.get(client_order_id)
         if not pos:
@@ -199,8 +202,25 @@ class MT5Executor:
         direction = 1 if pos["side"] == "buy" else -1
         pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
 
-        self.state.record_trade_close(client_order_id, exit_price, pnl)
+        # Get trade metadata
+        from sqlalchemy.orm import Session
+        from core.state_manager import TradeRow, engine
+        strategies = None
+        with Session(engine) as session:
+            trade = session.query(TradeRow).filter_by(client_order_id=client_order_id).first()
+            if trade and trade.strategies:
+                import json
+                strategies = json.loads(trade.strategies)
+
+        self.state.record_trade_close(client_order_id, exit_price, pnl, reason)
         self.risk.on_trade_closed(pnl)
+
+        self.notifier.notify_trade_closed(
+            symbol=pos["symbol"], side=pos["side"], amount=pos["amount"],
+            entry_price=pos["entry_price"], exit_price=exit_price,
+            pnl=pnl, exchange="mt5", reason=reason,
+            strategies=strategies,
+        )
 
     def _find_position_ticket(self, symbol: str) -> int:
         """Find the ticket number for an open position on this symbol."""

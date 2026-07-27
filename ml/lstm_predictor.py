@@ -47,7 +47,7 @@ class LSTMPricePredictor:
         return self._backend_type
 
     def train(self, df, epochs=30, lr=5e-4, train_frac=0.7, verbose=True, **kwargs):
-        return self._backend.train(df, epochs=epochs, train_frac=train_frac, verbose=verbose)
+        return self._backend.train(df, epochs=epochs, lr=lr, train_frac=train_frac, verbose=verbose)
 
     def predict_proba(self, df):
         return self._backend.predict_proba(df)

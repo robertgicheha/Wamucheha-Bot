@@ -68,16 +68,22 @@ strategy:
   rsi_overbought: 70
   rsi_oversold: 30
   volume_spike_threshold: 1.5
-  min_signal_score: 3            # minimum ensemble score to trigger entry (out of 5 strategies)
+  min_signal_score: 3            # minimum ensemble score to trigger entry (out of 5 base strategies)
   enable_shorts: true             # allow sell/short signals on exchanges that support it
 
-  # Individual strategy weights in the ensemble (must sum to 1.0)
+  # Individual strategy weights in the 10-strategy ensemble (will be normalized)
+  # Weights are adapted automatically based on market regime (trending vs ranging)
   weights:
-    ema_crossover: 0.25
-    macd: 0.25
-    bollinger: 0.20
-    rsi_divergence: 0.15
-    momentum: 0.15
+    ema_crossover: 0.15
+    macd: 0.12
+    bollinger: 0.10
+    rsi_divergence: 0.10
+    momentum: 0.10
+    vwap_reversion: 0.10
+    keltner_breakout: 0.08
+    ichimoku: 0.08
+    supertrend: 0.10
+    scalping: 0.07
 
 ml:
   use_lstm: true                 # enable/disable LSTM filter on signals
@@ -119,3 +125,4 @@ alerts:
     - long_term_signal
     - nse_alert
     - market_regime_change
+    - hourly_summary
