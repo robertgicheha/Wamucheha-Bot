@@ -13,6 +13,8 @@ services:
       context: .
       dockerfile: Dockerfile.engine
     container_name: trading-engine
+    cpus: "${ENGINE_CPU}"
+    mem_limit: "${ENGINE_MEM}"
     restart: unless-stopped
     env_file: .env
     volumes:
@@ -36,10 +38,12 @@ services:
       context: .
       dockerfile: Dockerfile.dashboard
     container_name: trading-dashboard
+    cpus: "${DASH_CPU}"
+    mem_limit: "${DASH_MEM}"
     restart: unless-stopped
     env_file: .env
     ports:
-      - "${DASHBOARD_PORT:-8000}:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - engine-data:/app/data:ro
       - ./config:/app/config:ro
@@ -52,6 +56,8 @@ services:
       context: .
       dockerfile: Dockerfile.screener
     container_name: trading-screener
+    cpus: "${SCREENER_CPU}"
+    mem_limit: "${SCREENER_MEM}"
     restart: unless-stopped
     env_file: .env
     volumes:
@@ -68,6 +74,8 @@ services:
       context: .
       dockerfile: Dockerfile.engine
     container_name: trading-watchdog
+    cpus: "${WATCHDOG_CPU}"
+    mem_limit: "${WATCHDOG_MEM}"
     restart: unless-stopped
     env_file: .env
     entrypoint: ["python", "scripts/heartbeat_monitor.py"]

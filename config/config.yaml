@@ -140,7 +140,7 @@ strategy:
     volatility_forecast: 0.05
 
 ml:
-  use_lstm: true                 # enable/disable LSTM filter on signals
+  use_lstm: false                 # enable/disable LSTM filter on signals
   lstm_min_confidence: 0.6       # minimum probability from LSTM to allow a trade
   lstm_model_type: pytorch       # pytorch | tensorflow
   auto_retrain_hours: 168        # retrain models every 7 days
