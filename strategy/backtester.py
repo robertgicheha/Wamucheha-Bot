@@ -1,5 +1,5 @@
 """
-Simple event-driven backtester for the strategies in strategy/technical_strategy.py.
+Event-driven backtester for the 20-strategy ensemble in strategy/technical_strategy.py.
 
 Deliberately models:
 - Trading fees (both entry and exit)
@@ -11,6 +11,10 @@ This does NOT model partial fills, order book depth, or funding rates (for
 perpetuals) — for a real capital decision, those all matter more as size grows.
 Treat any backtest, including this one, as a lower bound on how wrong you could be,
 not a promise of live performance.
+
+Note: Portfolio-level strategies (arbitrage, rotation, DCA, safe-haven, options)
+are NOT backtested here — they require multi-symbol data and real-time price feeds.
+Backtest covers the 19 single-symbol strategies in the ensemble.
 """
 import pandas as pd
 from strategy.technical_strategy import generate_signal

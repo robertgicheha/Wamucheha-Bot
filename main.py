@@ -9,9 +9,13 @@ Wires together state, risk, execution, and alerting across multiple asset classe
 - MT5 (XAUUSD, BTCUSD, GBPUSD, EURUSD, AUDUSD, EURJPY, EURGBP, USDCAD)
 - Kenyan Stocks (NSE — analysis/alerts only, no automated execution)
 
-Features a 10-strategy ensemble (EMA, MACD, Bollinger, RSI, Momentum, VWAP,
-Keltner, Ichimoku, Supertrend, Scalping) with adaptive regime-aware weighting,
-optional LSTM ML filtering, market regime intelligence, and automatic model retraining.
+Architecture layers:
+  Strategy: 20-strategy adaptive ensemble (10 categories)
+  Aggregation: Signal aggregator with conflict resolution
+  Risk: Portfolio-level risk (correlation, asset-class caps, position reconciliation)
+  Execution: ccxt/OANDA/Alpaca/MT5 with slippage tracking
+  Data: Feature store with indicator caching
+  Monitoring: Structured JSON logging, API failure tracking, strategy performance
 """
 import os
 import time
@@ -25,9 +29,20 @@ from core.execution_manager import ExecutionManager
 from core.oanda_executor import OandaExecutor
 from core.alpaca_executor import AlpacaExecutor
 from core.mt5_executor import MT5Executor
+from core.feature_store import init_feature_store, get_feature_store
+from core.structured_logger import (
+    slippage_tracker, api_failure_tracker, strategy_perf_tracker,
+    log_trade_open, log_trade_close, log_signal, log_risk_event, log_system_event,
+)
 from alerts.notifier import Notifier
 from data_feeds.feed_router import FeedRouter
-from strategy.technical_strategy import generate_signal, generate_signal_with_ml
+from strategy.technical_strategy import (
+    generate_signal, generate_signal_with_ml,
+    detect_cross_exchange_arbitrage, detect_triangular_arbitrage,
+    generate_portfolio_rotation_signal, generate_dca_signal,
+    generate_safe_haven_rotation_signal, generate_options_signal,
+)
+from strategy.signal_aggregator import SignalAggregator
 from ml.lstm_predictor import LSTMPricePredictor
 from core.position_monitor import check_and_close_positions
 from reporting.hourly_report import HourlyReporter
@@ -133,30 +148,54 @@ def maybe_retrain_models(config: dict, feed_router: FeedRouter, ml_models: dict)
 
 def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: float,
                          risk_fraction: float, ml_models: dict = None,
-                         market_regime: dict = None) -> dict | None:
-    """Strategy signal with optional ML filter and market regime adjustment."""
-    try:
-        df = feed_router.get_ohlcv(symbol, timeframe="15m", limit=200)
-    except Exception as e:
-        print(f"  Failed to fetch data for {symbol}: {e}")
-        return None
+                         market_regime: dict = None,
+                         news_sentiment=None,
+                         strategy_cfg: dict = None,
+                         feature_store=None) -> dict | None:
+    """Strategy signal with FeatureStore caching, ML filter, sentiment, and regime adjustment."""
+    cfg = strategy_cfg or CONFIG.get("strategy", {})
+    ml_confidence = CONFIG.get("ml", {}).get("lstm_min_confidence", 0.6)
+
+    # Use feature store for cached indicators (avoids recomputing every tick)
+    if feature_store:
+        df = feature_store.get(symbol, "15m", 200)
+    else:
+        try:
+            df = feed_router.get_ohlcv(symbol, timeframe="15m", limit=200)
+        except Exception as e:
+            api_failure_tracker.record_failure(symbol.split("/")[0], e, "get_ohlcv")
+            return None
 
     if df is None or len(df) < 50:
         return None
 
     predictor = ml_models.get(symbol) if ml_models else None
-    strategy_cfg = CONFIG.get("strategy", {})
-    ml_confidence = CONFIG.get("ml", {}).get("lstm_min_confidence", 0.6)
+
+    # Fetch sentiment for this symbol if available
+    sentiment_score = None
+    if news_sentiment and CONFIG.get("intelligence", {}).get("news_sentiment_enabled", True):
+        try:
+            sentiment = news_sentiment.get_sentiment(symbol, limit=5)
+            if sentiment and sentiment.get("avg_sentiment") is not None:
+                sentiment_score = sentiment["avg_sentiment"]
+        except Exception:
+            pass
 
     signal = generate_signal_with_ml(
         df, risk_fraction, trading_balance,
         lstm_predictor=predictor,
         ml_min_confidence=ml_confidence,
-        cfg=strategy_cfg,
+        cfg=cfg,
+        sentiment_score=sentiment_score,
     )
 
     if signal is None:
         return None
+
+    # Log the signal
+    log_signal(symbol, signal["side"], signal.get("score", 0),
+               [], market_regime.get("regime", "unknown") if market_regime else "unknown",
+               signal.get("strategies", []))
 
     # Market regime filter: reduce confidence in risk-off environments
     if market_regime and market_regime.get("regime") == "risk_off":
@@ -172,14 +211,22 @@ def main():
     state = StateManager(stake_amount=CONFIG["account"]["stake_amount"])
     risk = RiskManager(state, CONFIG, notifier)
 
-    # Set starting balance for session stats
     risk_state = state.get_risk_state()
     notifier.update_start_balance(risk_state.get("trading_balance", 0))
 
     feed_router = FeedRouter(CONFIG)
-    print(f"Active feeds: {list(feed_router.get_available_feeds().keys())}")
+    log_system_event("startup", f"Active feeds: {list(feed_router.get_available_feeds().keys())}")
 
-    print("Loading ML models...")
+    # Initialize feature store (precomputed indicator cache)
+    strategy_cfg = CONFIG.get("strategy", {})
+    feature_store = init_feature_store(feed_router, strategy_cfg)
+    log_system_event("startup", "Feature store initialized (indicator caching active)")
+
+    # Initialize signal aggregator (conflict resolution)
+    signal_aggregator = SignalAggregator(CONFIG.get("strategy", {}))
+    log_system_event("startup", "Signal aggregator initialized (conflict resolution active)")
+
+    log_system_event("startup", "Loading ML models...")
     ml_models = load_ml_models(CONFIG)
 
     market_intel = MarketIntelligence(CONFIG)
@@ -277,10 +324,15 @@ def main():
     print(f"\nTrading {len(all_markets)} symbols across {len(executors)} exchanges/brokers")
     mode_str = "LIVE — REAL MONEY" if LIVE_TRADING else "DRY-RUN (simulated, no real orders)"
     print(f"*** MODE: {mode_str} ***")
-    print(f"Strategy: 10-strategy adaptive ensemble with regime-aware weighting")
+    print(f"Strategy: 20-strategy adaptive ensemble (10 categories) + portfolio-level strategies")
+    log_system_event("startup",
+        f"Bot started in {mode_str}. {len(all_markets)} symbols, {len(executors)} brokers, "
+        f"{len(ml_models)} ML models. 20-strategy adaptive ensemble + feature store + "
+        f"signal aggregation + portfolio risk active.")
     notifier.notify("startup",
         f"Bot started in {mode_str}. {len(all_markets)} symbols, {len(executors)} brokers, "
-        f"{len(ml_models)} ML models. 10-strategy adaptive ensemble active.",
+        f"{len(ml_models)} ML models. Architecture: 20 strategies, feature store, "
+        f"signal aggregation, portfolio risk controls.",
         priority="high" if LIVE_TRADING else "normal",
     )
 
@@ -386,7 +438,7 @@ def main():
         except Exception as e:
             print(f"Position monitor error: {e}")
 
-        # Look for new entries
+        # Look for new entries (single-symbol ensemble)
         for exchange_name, symbol in all_markets:
             if exchange_name == "nse":
                 continue
@@ -401,6 +453,9 @@ def main():
                 risk_fraction=CONFIG["risk"]["max_position_pct"] / 100,
                 ml_models=ml_models,
                 market_regime=market_regime,
+                news_sentiment=news,
+                strategy_cfg=CONFIG.get("strategy", {}),
+                feature_store=feature_store,
             )
 
             if signal:
@@ -416,11 +471,126 @@ def main():
                     regime=signal.get("regime", ""),
                 )
 
+        # --- Portfolio-Level Strategies ---
+
+        # Cross-exchange arbitrage (crypto only, runs every 5 minutes)
+        last_arb_check = getattr(main, "_last_arb_check", 0)
+        if now - last_arb_check >= 300:
+            try:
+                arb_prices = {}
+                for ex_name in ["binance", "okx", "kraken"]:
+                    ex_executor = executors.get(ex_name)
+                    if ex_executor is None:
+                        continue
+                    ex_prices = {}
+                    for _, sym in all_markets:
+                        if _ == ex_name:
+                            try:
+                                ex_prices[sym] = feed_router.latest_price(sym)
+                            except Exception:
+                                pass
+                    if ex_prices:
+                        arb_prices[ex_name] = ex_prices
+
+                min_spread = CONFIG.get("strategy", {}).get("cross_exchange_min_spread_pct", 0.3)
+                arb_opps = detect_cross_exchange_arbitrage(arb_prices, min_spread_pct=min_spread)
+                for opp in arb_opps:
+                    print(f"  ARBITRAGE: {opp['symbol']} — buy on {opp['buy_exchange']} "
+                          f"({opp['buy_price']:.2f}), sell on {opp['sell_exchange']} "
+                          f"({opp['sell_price']:.2f}), spread {opp['spread_pct']:.2f}%")
+                    notifier.notify("arbitrage_opportunity",
+                        f"Arb: {opp['symbol']} | {opp['buy_exchange']} -> {opp['sell_exchange']} "
+                        f"| spread {opp['spread_pct']:.2f}%")
+
+                # Triangular arbitrage
+                tri_prices = {}
+                for _, sym in all_markets:
+                    try:
+                        tri_prices[sym] = feed_router.latest_price(sym)
+                    except Exception:
+                        pass
+                tri_opps = detect_triangular_arbitrage(tri_prices,
+                    min_profit_pct=CONFIG.get("strategy", {}).get("triangular_min_profit_pct", 0.1))
+                for opp in tri_opps:
+                    print(f"  TRI-ARB: {' -> '.join(opp['path'])} ({opp['direction']}), "
+                          f"profit {opp['profit_pct']:.3f}%")
+                    notifier.notify("arbitrage_opportunity",
+                        f"Triangular: {' -> '.join(opp['path'])} | {opp['profit_pct']:.3f}%")
+
+                main._last_arb_check = now
+            except Exception as e:
+                print(f"Arbitrage detection error: {e}")
+
+        # Safe-haven rotation (equities vs gold, runs every 15 minutes)
+        last_sh_check = getattr(main, "_last_sh_check", 0)
+        if now - last_sh_check >= 900:
+            try:
+                equity_df = feed_router.get_ohlcv("SPY", timeframe="1h", limit=100)
+                gold_df = feed_router.get_ohlcv("GLD", timeframe="1h", limit=100)
+                if equity_df is not None and gold_df is not None:
+                    threshold = CONFIG.get("strategy", {}).get("safe_haven_drawdown_threshold", -5.0)
+                    sh_signal = generate_safe_haven_rotation_signal(equity_df, gold_df, threshold)
+                    if sh_signal:
+                        print(f"  SAFE-HAVEN: {sh_signal['action']} "
+                              f"(equity DD: {sh_signal['equity_drawdown_pct']:.1f}%, "
+                              f"gold: {sh_signal['gold_momentum_pct']:.1f}%)")
+                        notifier.notify("portfolio_rotation",
+                            f"Safe-Haven: {sh_signal['action']} | "
+                            f"Equity DD {sh_signal['equity_drawdown_pct']:.1f}% | "
+                            f"Gold momentum {sh_signal['gold_momentum_pct']:.1f}%")
+                main._last_sh_check = now
+            except Exception as e:
+                print(f"Safe-haven rotation error: {e}")
+
+        # DCA signals (runs every 4 hours for configured DCA symbols)
+        last_dca_check = getattr(main, "_last_dca_check", 0)
+        if now - last_dca_check >= 14400:
+            try:
+                dca_symbols = CONFIG.get("strategy", {}).get("dca_symbols", ["BTC/USDT", "ETH/USDT"])
+                dca_cfg = {
+                    "dca_base_amount": CONFIG.get("strategy", {}).get("dca_base_amount", 100),
+                    "dca_volatility_sizing": CONFIG.get("strategy", {}).get("dca_volatility_sizing", True),
+                }
+                for dca_sym in dca_symbols:
+                    df = feed_router.get_ohlcv(dca_sym, timeframe="1h", limit=200)
+                    if df is not None and len(df) >= 50:
+                        dca_signal = generate_dca_signal(df, cfg=dca_cfg)
+                        if dca_signal:
+                            print(f"  DCA: {dca_sym} — amount ${dca_signal['amount']:.2f} "
+                                  f"(vol_scale={dca_signal['vol_scale']:.2f})")
+                main._last_dca_check = now
+            except Exception as e:
+                print(f"DCA signal error: {e}")
+
+        # Options signals (runs every 30 minutes for stocks/ETFs)
+        last_opt_check = getattr(main, "_last_opt_check", 0)
+        if now - last_opt_check >= 1800:
+            try:
+                options_symbols = CONFIG.get("execution", {}).get("alpaca_markets", [])
+                for opt_sym in options_symbols:
+                    df = feed_router.get_ohlcv(opt_sym, timeframe="1h", limit=100)
+                    if df is not None and len(df) >= 50:
+                        opt_signal = generate_options_signal(df, cfg=CONFIG.get("strategy", {}))
+                        if opt_signal:
+                            print(f"  OPTIONS: {opt_sym} — "
+                                  f"{', '.join(opt_signal.get('strategies', []))}")
+                            notifier.notify("options_signal",
+                                f"Options: {opt_sym} — {len(opt_signal['signals'])} signal(s)")
+                main._last_opt_check = now
+            except Exception as e:
+                print(f"Options signal error: {e}")
+
         # Hourly report
         try:
             hourly_reporter.maybe_report()
         except Exception as e:
             print(f"Hourly reporter error: {e}")
+
+        # Portfolio position reconciliation (check exchange balances vs tracked state)
+        try:
+            risk.maybe_reconcile_positions(state, executors)
+        except Exception as e:
+            print(f"Position reconciliation error: {e}")
 
         time.sleep(15)
 

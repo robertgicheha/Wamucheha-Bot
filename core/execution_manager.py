@@ -1,12 +1,14 @@
 """
-Execution manager — enhanced with trade metadata tracking.
+Execution manager — enhanced with trade metadata, slippage tracking, and portfolio risk.
 
 Passes strategy information, scores, and regime data through to the
-notification system for rich trade logging.
+notification system for rich trade logging. Tracks slippage between
+signal price and actual fill price.
 """
 import uuid
 import ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from core.structured_logger import slippage_tracker, strategy_perf_tracker, api_failure_tracker, log_trade_open, log_trade_close
 
 
 class ExecutionManager:
@@ -39,7 +41,8 @@ class ExecutionManager:
     def open_trade(self, symbol: str, side: str, proposed_amount: float,
                     entry_price: float, stop_loss_pct: float, take_profit_pct: float,
                     strategies: list = None, score: float = 0, regime: str = ""):
-        decision = self.risk.pre_trade_check(proposed_amount)
+        # Portfolio-level risk check (correlation, asset-class caps, max positions)
+        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol)
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"{symbol} {side} rejected: {decision.reason}")
             return None
@@ -58,24 +61,43 @@ class ExecutionManager:
             fill_price = entry_price
             filled_amount = decision.position_size
         else:
-            order = self._submit_order(
-                symbol, side, decision.position_size, "market",
-                {"clientOrderId": client_order_id},
-            )
-            fill_price = order.get("average") or order.get("price") or entry_price
-            filled_amount = order.get("filled", decision.position_size)
+            try:
+                order = self._submit_order(
+                    symbol, side, decision.position_size, "market",
+                    {"clientOrderId": client_order_id},
+                )
+                fill_price = order.get("average") or order.get("price") or entry_price
+                filled_amount = order.get("filled", decision.position_size)
+            except Exception as e:
+                api_failure_tracker.record_failure(self.exchange_id, e, f"open_trade_{symbol}")
+                self.notifier.notify("trade_rejected", f"{symbol} order failed: {e}")
+                return None
 
-            stop_side = "sell" if side == "buy" else "buy"
-            self._submit_order(
-                symbol, stop_side, filled_amount, "stop_market",
-                {"stopPrice": stop_price, "clientOrderId": f"{client_order_id}-SL", "reduceOnly": True},
-            )
+            try:
+                stop_side = "sell" if side == "buy" else "buy"
+                self._submit_order(
+                    symbol, stop_side, filled_amount, "stop_market",
+                    {"stopPrice": stop_price, "clientOrderId": f"{client_order_id}-SL", "reduceOnly": True},
+                )
+            except Exception as e:
+                api_failure_tracker.record_failure(self.exchange_id, e, f"stop_loss_{symbol}")
 
         self.state.record_trade_open(
             client_order_id, self.exchange_id, symbol, side, filled_amount,
             fill_price, stop_price, target_price,
             strategies=strategies, score=score, regime=regime,
         )
+
+        # Track slippage (signal price vs actual fill)
+        slippage_tracker.record(
+            symbol=symbol, side=side,
+            signal_price=entry_price, fill_price=fill_price,
+            exchange=self.exchange_id,
+        )
+
+        # Structured log
+        log_trade_open(symbol, side, filled_amount, fill_price,
+                       self.exchange_id, strategies, score)
 
         # Rich notification
         self.notifier.notify_trade_opened(
@@ -95,11 +117,14 @@ class ExecutionManager:
             return
 
         if not self.dry_run:
-            close_side = "sell" if pos["side"] == "buy" else "buy"
-            self._submit_order(
-                pos["symbol"], close_side, pos["amount"], "market",
-                {"clientOrderId": f"{client_order_id}-CLOSE", "reduceOnly": True},
-            )
+            try:
+                close_side = "sell" if pos["side"] == "buy" else "buy"
+                self._submit_order(
+                    pos["symbol"], close_side, pos["amount"], "market",
+                    {"clientOrderId": f"{client_order_id}-CLOSE", "reduceOnly": True},
+                )
+            except Exception as e:
+                api_failure_tracker.record_failure(self.exchange_id, e, f"close_trade_{pos['symbol']}")
 
         direction = 1 if pos["side"] == "buy" else -1
         pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
@@ -124,6 +149,14 @@ class ExecutionManager:
 
         self.state.record_trade_close(client_order_id, exit_price, pnl, reason)
         self.risk.on_trade_closed(pnl)
+
+        # Structured logging
+        log_trade_close(pos["symbol"], pos["side"], pos["entry_price"],
+                        exit_price, pnl, reason, self.exchange_id)
+
+        # Track per-strategy performance
+        if strategies:
+            strategy_perf_tracker.record_trade(strategies, pnl, pos["symbol"])
 
         # Rich notification
         self.notifier.notify_trade_closed(
