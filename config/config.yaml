@@ -38,7 +38,7 @@ execution:
       enabled: true
       markets: []
     - name: mt5
-      enabled: false
+      enabled: true
       markets: []
   oanda_markets:
     - "XAU/USD"

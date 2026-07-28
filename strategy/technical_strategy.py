@@ -248,8 +248,16 @@ def _garch_lite(df: pd.DataFrame, period: int = 20, forecast_period: int = 10) -
     alpha = 0.06
     beta = 0.90
     var_series = squared.ewm(alpha=alpha).mean()
-    for _ in range(forecast_period):
-        var_series = alpha * squared + beta * var_series
+
+    # Project the last variance value forward for forecast_period steps
+    last_var = var_series.iloc[-1]
+    if not np.isnan(last_var):
+        prev_var = last_var
+        for _ in range(forecast_period):
+            prev_var = alpha * squared.iloc[-1] + beta * prev_var
+        # Replace the last value with the h-step ahead forecast
+        var_series.iloc[-1] = prev_var
+
     return np.sqrt(var_series) * 100
 
 
@@ -1444,13 +1452,12 @@ def generate_dca_signal(
         # Historical median ATR%
         atr_hist = df["vol_pct"].dropna().tail(100)
         if len(atr_hist) < 20:
-            median_vol = atr_hist.median()
+            vol_scale = 1.0
         else:
             median_vol = atr_hist.median()
-
-        vol_ratio = median_vol / atr_pct if atr_pct > 0 else 1.0
-        # Scale between 0.5x and 2x base amount
-        vol_scale = max(0.5, min(2.0, vol_ratio))
+            vol_ratio = median_vol / atr_pct if atr_pct > 0 else 1.0
+            # Scale between 0.5x and 2x base amount
+            vol_scale = max(0.5, min(2.0, vol_ratio))
     else:
         vol_scale = 1.0
 
