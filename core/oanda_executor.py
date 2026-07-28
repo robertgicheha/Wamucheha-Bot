@@ -78,7 +78,7 @@ class OandaExecutor:
         units = floor(notional_value / current_price)
         For forex, 1 unit of EUR/USD ≈ 1.10 USD (the quote price).
         """
-        decision = self.risk.pre_trade_check(proposed_amount)
+        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol)
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"{symbol} {side} rejected: {decision.reason}")
             return None

@@ -80,7 +80,7 @@ class AlpacaExecutor:
         proposed_amount is in USD (notional). Alpaca supports fractional shares.
         qty = notional / price for market buy.
         """
-        decision = self.risk.pre_trade_check(proposed_amount)
+        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol)
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"{symbol} {side} rejected: {decision.reason}")
             return None

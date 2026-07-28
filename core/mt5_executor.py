@@ -98,7 +98,7 @@ class MT5Executor:
     def open_trade(self, symbol: str, side: str, proposed_amount: float,
                     entry_price: float, stop_loss_pct: float, take_profit_pct: float,
                     strategies: list = None, score: float = 0, regime: str = ""):
-        decision = self.risk.pre_trade_check(proposed_amount)
+        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol)
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"MT5 {symbol} {side} rejected: {decision.reason}")
             return None

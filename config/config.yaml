@@ -18,6 +18,10 @@ risk:
   volatility_window_minutes: 5
   trailing_stop_activate_pct: 1.5    # start trailing once a position is up this much
   trailing_stop_distance_pct: 1.0    # trail this far behind the peak price once activated
+  max_open_positions: 12             # absolute cap on simultaneous open trades
+  max_asset_class_exposure_pct: 30   # max % of trading_balance exposed to any single asset class
+  max_correlated_positions: 3        # max positions in the same correlation group (e.g. BTC+ETH+...)
+  reconciliation_interval_seconds: 300  # how often to reconcile exchange balances with tracked state
 
 execution:
   exchanges:
@@ -34,7 +38,7 @@ execution:
       enabled: true
       markets: []
     - name: mt5
-      enabled: false
+      enabled: true
       markets: []
   oanda_markets:
     - "XAU/USD"
@@ -62,28 +66,78 @@ execution:
   idempotency: true              # attach client order IDs, dedupe on retry
 
 strategy:
+  # --- Indicator Parameters ---
   ema_fast: 9
   ema_slow: 21
   rsi_period: 14
   rsi_overbought: 70
   rsi_oversold: 30
   volume_spike_threshold: 1.5
-  min_signal_score: 3            # minimum ensemble score to trigger entry (out of 5 base strategies)
-  enable_shorts: true             # allow sell/short signals on exchanges that support it
+  min_signal_score: 3            # minimum ensemble score to trigger entry (out of 5)
+  enable_shorts: true
 
-  # Individual strategy weights in the 10-strategy ensemble (will be normalized)
-  # Weights are adapted automatically based on market regime (trending vs ranging)
+  # --- Trend-Following ---
+  donchian_period: 20            # Donchian channel lookback (turtle trading)
+  adx_threshold: 25              # ADX must exceed this for ADX-filtered entries
+
+  # --- Mean Reversion ---
+  zscore_period: 20              # Z-score rolling window
+  zscore_entry_threshold: 2.0    # z-score extreme to trigger entry
+  zscore_exit_threshold: 0.5     # z-score returning toward zero
+
+  # --- Breakout ---
+  opening_range_period: 20       # Number of bars for opening range definition
+  atr_expansion_threshold: 1.5   # ATR must be this ratio vs SMA(ATR) to signal expansion
+
+  # --- Market Making ---
+  spread_capture_bb_width_max: 0.03  # Bollinger width ceiling for spread capture mode
+  spread_capture_atr_pct_max: 2.0    # ATR% ceiling for low-vol detection
+
+  # --- Options ---
+  implied_vol_high_threshold: 0.30   # IV above this = covered call opportunity
+  implied_vol_low_threshold: 0.15    # IV below this = straddle opportunity
+
+  # --- Portfolio Strategies ---
+  dca_base_amount: 100.0             # Base DCA buy amount in USD
+  dca_volatility_sizing: true        # Scale DCA size inversely with volatility
+  safe_haven_drawdown_threshold: -5.0  # Equity drawdown % to trigger gold rotation
+  rebalance_lookback_period: 20      # Bars for portfolio rotation ranking
+  rebalance_sharpe_threshold: 0.6    # Minimum Sharpe for overweight candidates
+
+  # --- Arbitrage ---
+  cross_exchange_min_spread_pct: 0.3  # Min spread % for cross-exchange arb
+  triangular_min_profit_pct: 0.1      # Min profit % for triangular arb
+
+  # --- Individual strategy weights in the 20-strategy ensemble ---
+  # Weights are normalized and adapted automatically by market regime
   weights:
-    ema_crossover: 0.15
-    macd: 0.12
-    bollinger: 0.10
-    rsi_divergence: 0.10
-    momentum: 0.10
-    vwap_reversion: 0.10
-    keltner_breakout: 0.08
-    ichimoku: 0.08
-    supertrend: 0.10
-    scalping: 0.07
+    # Trend-Following (6 strategies)
+    ema_crossover: 0.08
+    macd: 0.07
+    ichimoku: 0.06
+    supertrend: 0.07
+    donchian: 0.04
+    adx_filtered: 0.03
+    # Mean Reversion (4 strategies)
+    bollinger: 0.05
+    rsi_divergence: 0.05
+    vwap_reversion: 0.04
+    zscore_reversion: 0.04
+    # Momentum (1 strategy)
+    momentum: 0.07
+    # Breakout (3 strategies)
+    keltner_breakout: 0.05
+    opening_range_breakout: 0.04
+    atr_volatility_breakout: 0.04
+    # Market Making (1 strategy)
+    spread_capture: 0.03
+    # Scalping (1 strategy)
+    scalping: 0.03
+    # News/Sentiment (1 strategy)
+    sentiment: 0.06
+    # ML/Statistical (2 strategies)
+    ml_prediction: 0.10
+    volatility_forecast: 0.05
 
 ml:
   use_lstm: true                 # enable/disable LSTM filter on signals
