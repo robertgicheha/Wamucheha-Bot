@@ -48,6 +48,18 @@ MT5_SYMBOLS = {
 class FeedRouter:
     def __init__(self, config: dict):
         self.feeds = {}
+        # Symbols the deployment has explicitly configured as OANDA
+        # instruments (config.yaml -> execution.oanda_markets), e.g.
+        # "BTC/USD" — OANDA offers it as a CFD, but it is NOT a real spot
+        # pair on Binance/OKX. Without this, a symbol like "BTC/USD" that
+        # isn't in the router's built-in OANDA_INSTRUMENTS/OANDA_COMMODITIES
+        # sets falls through to "default: crypto" and gets silently routed
+        # to whatever ccxt exchange is enabled, which has no such market —
+        # producing garbage/degenerate OHLCV instead of a clean "no feed"
+        # error the caller can handle.
+        self._configured_oanda_symbols = {
+            s.upper().replace("_", "/") for s in config.get("execution", {}).get("oanda_markets", [])
+        }
         self._init_feeds(config)
 
     def _init_feeds(self, config: dict):
@@ -101,8 +113,11 @@ class FeedRouter:
         if ticker in NSE_TICKERS:
             return "nse"
 
-        # OANDA forex/commodities
-        if clean in OANDA_INSTRUMENTS or clean in OANDA_COMMODITIES:
+        # OANDA forex/commodities — built-in list plus whatever this
+        # deployment explicitly configured under oanda_markets (e.g.
+        # "BTC/USD", which OANDA offers as a CFD but no crypto exchange
+        # lists as a real spot pair).
+        if clean in OANDA_INSTRUMENTS or clean in OANDA_COMMODITIES or clean in self._configured_oanda_symbols:
             return "oanda"
 
         # MT5 symbols (XAUUSD, EURUSD, BTCUSD, etc.)

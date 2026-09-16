@@ -10,6 +10,8 @@ data/state_snapshot.json
 data/events.log
 data/backups/
 data/nse_cache/
+data/intel_cache/
+data/long_term_state.json
 logs/
 ml/saved_models/*.pt
 ml/saved_models/*.keras

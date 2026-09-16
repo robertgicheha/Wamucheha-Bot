@@ -37,12 +37,12 @@ from core.structured_logger import (
 from alerts.notifier import Notifier
 from data_feeds.feed_router import FeedRouter
 from strategy.technical_strategy import (
-    generate_signal, generate_signal_with_ml,
     detect_cross_exchange_arbitrage, detect_triangular_arbitrage,
     generate_portfolio_rotation_signal, generate_dca_signal,
     generate_safe_haven_rotation_signal, generate_options_signal,
 )
 from strategy.signal_aggregator import SignalAggregator
+from strategy import decision
 from ml.lstm_predictor import LSTMPricePredictor
 from core.position_monitor import check_and_close_positions
 from reporting.hourly_report import HourlyReporter
@@ -151,12 +151,18 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
                          market_regime: dict = None,
                          news_sentiment=None,
                          strategy_cfg: dict = None,
-                         feature_store=None) -> dict | None:
-    """Strategy signal with FeatureStore caching, ML filter, sentiment, and regime adjustment."""
+                         feature_store=None,
+                         signal_aggregator: SignalAggregator = None) -> dict | None:
+    """Strategy signal with FeatureStore caching, ML filter, sentiment, regime
+    adjustment, and (if signal_aggregator is passed) a category-level
+    conflict veto. Routed through strategy.decision.evaluate() so this is
+    the exact same decision logic strategy/backtester.py exercises."""
     cfg = strategy_cfg or CONFIG.get("strategy", {})
     ml_confidence = CONFIG.get("ml", {}).get("lstm_min_confidence", 0.6)
+    min_aggregator_confidence = cfg.get("min_aggregator_confidence", 0.3)
 
     # Use feature store for cached indicators (avoids recomputing every tick)
+    has_indicators = feature_store is not None
     if feature_store:
         df = feature_store.get(symbol, "15m", 200)
     else:
@@ -181,12 +187,15 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
         except Exception:
             pass
 
-    signal = generate_signal_with_ml(
+    signal = decision.evaluate(
         df, risk_fraction, trading_balance,
-        lstm_predictor=predictor,
-        ml_min_confidence=ml_confidence,
         cfg=cfg,
         sentiment_score=sentiment_score,
+        lstm_predictor=predictor,
+        ml_min_confidence=ml_confidence,
+        aggregator=signal_aggregator,
+        min_aggregator_confidence=min_aggregator_confidence,
+        _df_has_indicators=has_indicators,
     )
 
     if signal is None:
@@ -456,6 +465,7 @@ def main():
                 news_sentiment=news,
                 strategy_cfg=CONFIG.get("strategy", {}),
                 feature_store=feature_store,
+                signal_aggregator=signal_aggregator,
             )
 
             if signal:
@@ -588,7 +598,7 @@ def main():
 
         # Portfolio position reconciliation (check exchange balances vs tracked state)
         try:
-            risk.maybe_reconcile_positions(state, executors)
+            risk.maybe_reconcile_positions(executors)
         except Exception as e:
             print(f"Position reconciliation error: {e}")
 

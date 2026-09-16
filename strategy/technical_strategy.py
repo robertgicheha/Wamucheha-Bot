@@ -341,12 +341,22 @@ def compute_indicators(df: pd.DataFrame, cfg: dict = None) -> pd.DataFrame:
     # Multi-timeframe helpers
     df["ema_200_slope"] = df["ema_200"].pct_change(5) * 100
 
-    # Detect market regime: trending vs ranging
-    adx_vals = df["adx"].iloc[-5:]
-    avg_adx = adx_vals.mean() if not adx_vals.isna().all() else 20
-    bb_width = (df["bb_upper"].iloc[-1] - df["bb_lower"].iloc[-1]) / df["bb_mid"].iloc[-1] if df["bb_mid"].iloc[-1] > 0 else 0
-    df.attrs["market_regime"] = "trending" if avg_adx > 25 else "ranging"
-    df.attrs["bb_width"] = bb_width
+    # Detect market regime PER BAR: trending vs ranging. This must be a
+    # rolling/causal column, not a single scalar derived from the tail of
+    # whatever df happens to be passed in — the backtester precomputes
+    # indicators once over an entire historical series (for speed), and a
+    # scalar regime would silently leak the *final* bar's regime into the
+    # scoring of every earlier bar (severe lookahead bias). A per-bar column
+    # only ever looks backward at each row, so it's identical whether
+    # computed on the full series or on a growing window ending at that row.
+    df["adx_avg5"] = df["adx"].rolling(5).mean()
+    df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"].replace(0, np.nan)
+    df["regime"] = np.where(df["adx_avg5"].fillna(20) > 25, "trending", "ranging")
+
+    # Kept for convenience/backward-compat: reflects the LAST row only, so
+    # only trust this when df ends at "now" (e.g. a live 200-bar window).
+    df.attrs["market_regime"] = df["regime"].iloc[-1] if len(df) else "trending"
+    df.attrs["bb_width"] = df["bb_width"].iloc[-1] if len(df) else 0
 
     return df
 
@@ -1031,11 +1041,22 @@ _REGIME_MULTIPLIERS = {
 }
 
 
+def _current_regime(df: pd.DataFrame, default: str = "trending") -> str:
+    """Regime as of the LAST row only — always read this off the per-bar
+    'regime' column (rolling/causal), never off df.attrs, which only holds
+    whatever the tail of the df was the last time compute_indicators() ran
+    and would be wrong for any row but the very last in a precomputed
+    multi-row df (see compute_indicators)."""
+    if "regime" in df.columns and len(df):
+        return df["regime"].iloc[-1]
+    return df.attrs.get("market_regime", default)
+
+
 def _compute_adaptive_weights(cfg: dict, df: pd.DataFrame) -> dict:
     """Compute regime-aware adaptive weights."""
     base_weights = cfg.get("weights", _DEFAULT_WEIGHTS)
 
-    regime = df.attrs.get("market_regime", "trending")
+    regime = _current_regime(df)
     multipliers = _REGIME_MULTIPLIERS.get(regime, {})
 
     adapted = {}
@@ -1055,35 +1076,8 @@ def _compute_adaptive_weights(cfg: dict, df: pd.DataFrame) -> dict:
 
 # --------------- Main ensemble (single-symbol) ---------------
 
-def generate_signal(df: pd.DataFrame, risk_fraction_of_balance: float,
-                     trading_balance: float, cfg: dict = None,
-                     sentiment_score: float = None,
-                     ml_probability: float = None) -> dict | None:
-    """
-    Full strategy ensemble with adaptive weighting.
-
-    Runs all single-symbol sub-strategies, applies regime-aware weights, and
-    produces a buy or sell signal if the weighted score exceeds the threshold.
-
-    Optional inputs:
-        sentiment_score: float (-1 to 1) from news/social NLP
-        ml_probability: float (0 to 1) from LSTM model
-    """
-    if len(df) < 50:
-        return None
-
-    cfg = cfg or {}
-    min_score = cfg.get("min_signal_score", 3) / 5.0
-    enable_shorts = cfg.get("enable_shorts", True)
-
-    df = compute_indicators(df, cfg)
-
-    if pd.isna(df.iloc[-1]["atr"]):
-        return None
-
-    weights = _compute_adaptive_weights(cfg, df)
-
-    scorers = [
+def _all_scorers(cfg: dict, sentiment_score: float = None, ml_probability: float = None):
+    return [
         ("ema_crossover", _score_ema_crossover),
         ("macd", _score_macd),
         ("ichimoku", _score_ichimoku),
@@ -1105,79 +1099,187 @@ def generate_signal(df: pd.DataFrame, risk_fraction_of_balance: float,
         ("volatility_forecast", _score_volatility_forecast),
     ]
 
-    buy_scores = []
-    sell_scores = []
+
+def compute_raw_scores(df: pd.DataFrame, cfg: dict = None, sentiment_score: float = None,
+                        ml_probability: float = None) -> tuple[dict[str, tuple[float, float]], str]:
+    """Run every sub-strategy scorer against an already-indicator-computed df.
+
+    Returns (raw_scores, regime) where raw_scores maps strategy name to
+    (buy_score, sell_score). This is the shared entry point used both by
+    generate_signal_ex() and by SignalAggregator callers, so the ensemble
+    score and the aggregator's conflict analysis are always looking at the
+    exact same per-strategy numbers.
+    """
+    cfg = cfg or {}
     raw_scores = {}
+    for name, scorer in _all_scorers(cfg, sentiment_score, ml_probability):
+        raw_scores[name] = scorer(df)
+    regime = _current_regime(df, default="unknown")
+    return raw_scores, regime
 
-    for name, scorer in scorers:
-        b, s = scorer(df)
-        w = weights.get(name, 0.05)
-        buy_scores.append(b * w)
-        sell_scores.append(s * w)
-        raw_scores[name] = (b, s)
 
-    total_buy = sum(buy_scores)
-    total_sell = sum(sell_scores)
+def generate_signal_ex(df: pd.DataFrame, risk_fraction_of_balance: float,
+                        trading_balance: float, cfg: dict = None,
+                        sentiment_score: float = None,
+                        ml_probability: float = None,
+                        _df_has_indicators: bool = False
+                        ) -> tuple[dict | None, dict[str, tuple[float, float]], str]:
+    """
+    Full strategy ensemble with adaptive weighting.
+
+    Runs all single-symbol sub-strategies, applies regime-aware weights, and
+    produces a buy or sell signal if the weighted score exceeds the threshold.
+
+    Returns (signal_or_None, raw_scores, regime). raw_scores/regime are
+    returned even when no signal fires, so callers such as SignalAggregator
+    can still see per-strategy disagreement.
+
+    Optional inputs:
+        sentiment_score: float (-1 to 1) from news/social NLP
+        ml_probability: float (0 to 1) from LSTM model
+        _df_has_indicators: set True when the caller already ran
+            compute_indicators() on this exact df (e.g. the backtester,
+            which precomputes once over the whole series instead of once
+            per bar) to avoid recomputing every indicator on every call.
+    """
+    if len(df) < 50:
+        return None, {}, "unknown"
+
+    cfg = cfg or {}
+    # NOTE: min_signal_score is a threshold on the SAME 0..1 scale as
+    # total_buy/total_sell below (per-strategy scores in [0,1] times weights
+    # that sum to 1.0). It used to default to 3/5.0 = 0.6 under a stale "out
+    # of 5" mental model, but because so many of the 18 sub-strategies rarely
+    # agree at once, the realized weighted sum on real market data almost
+    # never exceeds ~0.35 — that default threshold was unreachable, so the
+    # ensemble silently never produced a signal. 0.18 is calibrated against
+    # real BTC/ETH/SOL 15m score distributions (~95th percentile of observed
+    # scores) so genuinely high-conviction multi-strategy agreement can fire.
+    min_score = cfg.get("min_signal_score", 0.18)
+    enable_shorts = cfg.get("enable_shorts", True)
+
+    if not _df_has_indicators:
+        df = compute_indicators(df, cfg)
+
+    if pd.isna(df.iloc[-1]["atr"]):
+        return None, {}, _current_regime(df, default="unknown")
+
+    weights = _compute_adaptive_weights(cfg, df)
+    raw_scores, regime = compute_raw_scores(df, cfg, sentiment_score, ml_probability)
+
+    total_buy = sum(b * weights.get(name, 0.05) for name, (b, s) in raw_scores.items())
+    total_sell = sum(s * weights.get(name, 0.05) for name, (b, s) in raw_scores.items())
     last = df.iloc[-1]
 
     proposed_amount = trading_balance * risk_fraction_of_balance
 
     if total_buy >= min_score and total_buy > total_sell:
         active = [name for name, (b, _) in raw_scores.items() if b > 0.3]
-        return {
+        signal = {
             "side": "buy",
             "entry_price": float(last["close"]),
             "amount": proposed_amount,
             "atr": float(last["atr"]),
             "score": round(total_buy, 3),
             "strategies": active,
-            "regime": df.attrs.get("market_regime", "unknown"),
+            "regime": regime,
         }
+        return signal, raw_scores, regime
 
     if enable_shorts and total_sell >= min_score and total_sell > total_buy:
         active = [name for name, (_, s) in raw_scores.items() if s > 0.3]
-        return {
+        signal = {
             "side": "sell",
             "entry_price": float(last["close"]),
             "amount": proposed_amount,
             "atr": float(last["atr"]),
             "score": round(total_sell, 3),
             "strategies": active,
-            "regime": df.attrs.get("market_regime", "unknown"),
+            "regime": regime,
         }
+        return signal, raw_scores, regime
 
-    return None
+    return None, raw_scores, regime
+
+
+def generate_signal(df: pd.DataFrame, risk_fraction_of_balance: float,
+                     trading_balance: float, cfg: dict = None,
+                     sentiment_score: float = None,
+                     ml_probability: float = None) -> dict | None:
+    """Thin wrapper around generate_signal_ex() for callers that only need
+    the final signal, not the raw per-strategy scores."""
+    signal, _, _ = generate_signal_ex(
+        df, risk_fraction_of_balance, trading_balance, cfg=cfg,
+        sentiment_score=sentiment_score, ml_probability=ml_probability,
+    )
+    return signal
 
 
 def generate_exit_signal(df: pd.DataFrame, position: dict,
                           trailing_activate_pct: float = 1.5,
                           trailing_distance_pct: float = 1.0,
-                          cfg: dict = None) -> dict | None:
-    """Proactive exit signal using the full indicator set."""
+                          cfg: dict = None,
+                          _df_has_indicators: bool = False) -> dict | None:
+    """Proactive exit signal using the full indicator set.
+
+    _df_has_indicators: set True when the caller already ran
+        compute_indicators() on this exact df (the backtester precomputes
+        once over the whole series rather than once per bar per position).
+
+    position["bars_held"], if present, gates the proactive exits below
+    (trend reversal / RSI exhaustion / MACD cross / channel breaks /
+    trailing stop) behind a grace period (cfg min_bars_before_signal_exit,
+    default 2). Without this, a position entered on e.g. an EMA(9)/EMA(21)
+    crossover gets closed by generate_exit_signal's "trend_reversal_ema_cross"
+    the moment ordinary 1-bar noise flips the same crossover back — since
+    entry and exit are watching the same indicator, this was firing on
+    almost every trade within a couple of bars, at a small loss, before the
+    fixed stop-loss/take-profit ever got a chance to matter. The exchange-
+    side fixed stop-loss remains active immediately regardless of this gate
+    (it is checked by the caller before generate_exit_signal is even called)
+    — this only delays the noise-prone signal-based exits, not real
+    protection.
+    """
     if len(df) < 50:
         return None
 
     cfg = cfg or {}
-    df = compute_indicators(df, cfg)
+    min_bars = cfg.get("min_bars_before_signal_exit", 2)
+    if position.get("bars_held") is not None and position["bars_held"] < min_bars:
+        return None
+
+    if not _df_has_indicators:
+        df = compute_indicators(df, cfg)
     prev, last = df.iloc[-2], df.iloc[-1]
+    prev2 = df.iloc[-3] if len(df) > 2 else prev
     entry_price = position["entry_price"]
     side = position["side"]
     peak_price = position.get("peak_price", entry_price)
     last_price = float(last["close"])
 
+    # Crossover-based reversal exits (ema/macd/supertrend) require the cross
+    # to have happened on the PRIOR bar and still hold on this one — i.e. one
+    # bar of confirmation — rather than firing the instant a cross first
+    # appears. Measured on real data, un-confirmed crosses were closing
+    # nearly every trade within a couple of bars on ordinary noise, because
+    # entry and exit both watch the same fast-moving indicators.
+
     if side == "buy":
-        if prev["ema_fast"] >= prev["ema_slow"] and last["ema_fast"] < last["ema_slow"]:
+        if prev2["ema_fast"] >= prev2["ema_slow"] and prev["ema_fast"] < prev["ema_slow"] \
+                and last["ema_fast"] < last["ema_slow"]:
             return {"exit_price": last_price, "reason": "trend_reversal_ema_cross"}
 
         if not pd.isna(last["rsi"]) and last["rsi"] > 80:
             return {"exit_price": last_price, "reason": "rsi_overbought_exhaustion"}
 
-        if prev["macd"] >= prev["macd_signal"] and last["macd"] < last["macd_signal"]:
+        if prev2["macd"] >= prev2["macd_signal"] and prev["macd"] < prev["macd_signal"] \
+                and last["macd"] < last["macd_signal"]:
             if not pd.isna(last["adx"]) and last["adx"] > 20:
                 return {"exit_price": last_price, "reason": "macd_death_cross"}
 
-        if not pd.isna(last.get("supertrend_dir")) and not pd.isna(prev.get("supertrend_dir")):
-            if prev["supertrend_dir"] == 1 and last["supertrend_dir"] == -1:
+        if not pd.isna(last.get("supertrend_dir")) and not pd.isna(prev.get("supertrend_dir")) \
+                and not pd.isna(prev2.get("supertrend_dir")):
+            if prev2["supertrend_dir"] == 1 and prev["supertrend_dir"] == -1 and last["supertrend_dir"] == -1:
                 return {"exit_price": last_price, "reason": "supertrend_bearish_flip"}
 
         if not pd.isna(last.get("kc_lower")) and last_price < last["kc_lower"]:
@@ -1200,18 +1302,21 @@ def generate_exit_signal(df: pd.DataFrame, position: dict,
             return {"exit_price": last_price, "reason": "bollinger_lower_break"}
 
     else:  # short/sell
-        if prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]:
+        if prev2["ema_fast"] <= prev2["ema_slow"] and prev["ema_fast"] > prev["ema_slow"] \
+                and last["ema_fast"] > last["ema_slow"]:
             return {"exit_price": last_price, "reason": "trend_reversal_ema_cross"}
 
         if not pd.isna(last["rsi"]) and last["rsi"] < 20:
             return {"exit_price": last_price, "reason": "rsi_oversold_exhaustion"}
 
-        if prev["macd"] <= prev["macd_signal"] and last["macd"] > last["macd_signal"]:
+        if prev2["macd"] <= prev2["macd_signal"] and prev["macd"] > prev["macd_signal"] \
+                and last["macd"] > last["macd_signal"]:
             if not pd.isna(last["adx"]) and last["adx"] > 20:
                 return {"exit_price": last_price, "reason": "macd_golden_cross"}
 
-        if not pd.isna(last.get("supertrend_dir")) and not pd.isna(prev.get("supertrend_dir")):
-            if prev["supertrend_dir"] == -1 and last["supertrend_dir"] == 1:
+        if not pd.isna(last.get("supertrend_dir")) and not pd.isna(prev.get("supertrend_dir")) \
+                and not pd.isna(prev2.get("supertrend_dir")):
+            if prev2["supertrend_dir"] == -1 and prev["supertrend_dir"] == 1 and last["supertrend_dir"] == 1:
                 return {"exit_price": last_price, "reason": "supertrend_bullish_flip"}
 
         if not pd.isna(last.get("kc_upper")) and last_price > last["kc_upper"]:
@@ -1236,37 +1341,56 @@ def generate_exit_signal(df: pd.DataFrame, position: dict,
     return None
 
 
+def generate_signal_with_ml_ex(df: pd.DataFrame, risk_fraction_of_balance: float,
+                                trading_balance: float, lstm_predictor=None,
+                                ml_min_confidence: float = 0.6,
+                                cfg: dict = None,
+                                sentiment_score: float = None,
+                                _df_has_indicators: bool = False,
+                                **kwargs) -> tuple[dict | None, dict[str, tuple[float, float]], str]:
+    """Full ensemble with optional ML filter and sentiment. Also returns the
+    raw per-strategy scores and regime, e.g. for SignalAggregator conflict
+    analysis on the exact same scores that produced the base signal."""
+    ml_prob = None
+    if lstm_predictor is not None:
+        ml_prob = lstm_predictor.predict_proba(df)
+
+    base_signal, raw_scores, regime = generate_signal_ex(
+        df, risk_fraction_of_balance, trading_balance,
+        cfg=cfg, sentiment_score=sentiment_score,
+        ml_probability=ml_prob, _df_has_indicators=_df_has_indicators,
+    )
+
+    if base_signal is None:
+        return None, raw_scores, regime
+
+    if lstm_predictor is not None and ml_prob is not None:
+        if base_signal["side"] == "buy":
+            if ml_prob < ml_min_confidence:
+                return None, raw_scores, regime
+            base_signal["ml_confidence"] = round(ml_prob, 3)
+        else:
+            if (1 - ml_prob) < ml_min_confidence:
+                return None, raw_scores, regime
+            base_signal["ml_confidence"] = round(1 - ml_prob, 3)
+
+    return base_signal, raw_scores, regime
+
+
 def generate_signal_with_ml(df: pd.DataFrame, risk_fraction_of_balance: float,
                              trading_balance: float, lstm_predictor=None,
                              ml_min_confidence: float = 0.6,
                              cfg: dict = None,
                              sentiment_score: float = None,
                              **kwargs) -> dict | None:
-    """Full ensemble with optional ML filter and sentiment."""
-    ml_prob = None
-    if lstm_predictor is not None:
-        ml_prob = lstm_predictor.predict_proba(df)
-
-    base_signal = generate_signal(
+    """Thin wrapper around generate_signal_with_ml_ex() for callers that only
+    need the final signal, not the raw per-strategy scores."""
+    signal, _, _ = generate_signal_with_ml_ex(
         df, risk_fraction_of_balance, trading_balance,
+        lstm_predictor=lstm_predictor, ml_min_confidence=ml_min_confidence,
         cfg=cfg, sentiment_score=sentiment_score,
-        ml_probability=ml_prob,
     )
-
-    if base_signal is None:
-        return None
-
-    if lstm_predictor is not None and ml_prob is not None:
-        if base_signal["side"] == "buy":
-            if ml_prob < ml_min_confidence:
-                return None
-            base_signal["ml_confidence"] = round(ml_prob, 3)
-        else:
-            if (1 - ml_prob) < ml_min_confidence:
-                return None
-            base_signal["ml_confidence"] = round(1 - ml_prob, 3)
-
-    return base_signal
+    return signal
 
 
 # --------------- Portfolio-Level Strategies ---------------

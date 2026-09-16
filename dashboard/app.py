@@ -200,6 +200,20 @@ def hourly_logs(n: int = 24):
     return {"hourly_logs": read_hourly_log(n)}
 
 
+# ---------- Long-Term Investing ----------
+
+@app.get("/api/long-term/summary")
+def long_term_summary():
+    cache_file = Path(__file__).parent.parent / "data" / "intel_cache" / "long_term_dashboard.json"
+    if not cache_file.exists():
+        return {"buy_candidates": [], "sell_candidates": [], "movers": {}, "updated_at": None,
+                "note": "No data yet — long_term/scheduler.py hasn't run a refresh."}
+    try:
+        return json.loads(cache_file.read_text())
+    except Exception:
+        return {"buy_candidates": [], "sell_candidates": [], "movers": {}, "updated_at": None}
+
+
 @app.get("/api/open-positions")
 def open_positions():
     state = _get_state()
