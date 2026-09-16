@@ -1,0 +1,5 @@
+# Optional TensorFlow ML backend — see the note in requirements.txt.
+# Only install this if your Python version actually has a tensorflow wheel;
+# TensorFlow support for a new CPython release typically lags by months.
+# Usage: pip install -r requirements.txt -r requirements-tensorflow.txt
+tensorflow==2.16.1

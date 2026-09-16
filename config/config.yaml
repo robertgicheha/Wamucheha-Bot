@@ -1,7 +1,7 @@
 # All risk parameters live here so you never have to touch code to change them.
 
 account:
-  stake_amount: 100.0          # overridden by STAKE_AMOUNT env var if set
+  stake_amount: 10.0           # overridden by STAKE_AMOUNT env var if set
   currency: USD
   stake_wallet_address: ""     # cold wallet / separate account, bot has no access
 
@@ -73,7 +73,21 @@ strategy:
   rsi_overbought: 70
   rsi_oversold: 30
   volume_spike_threshold: 1.5
-  min_signal_score: 3            # minimum ensemble score to trigger entry (out of 5)
+  # Minimum weighted ensemble score (0..1 scale, NOT "out of 5") to trigger
+  # entry. Calibrated against real BTC/ETH/SOL 15m score distributions —
+  # the weighted sum of per-strategy scores rarely exceeds ~0.35 even when
+  # several strategies agree, so a naive "3 out of 5" (0.6) threshold is
+  # unreachable and silently produces zero trades. 0.18 sits near the 95th
+  # percentile of observed scores: selective, but not unreachable.
+  min_signal_score: 0.18
+  min_aggregator_confidence: 0.25   # SignalAggregator conflict-veto gate (0..1)
+  # Bars after entry before trend-reversal/MACD-cross/channel-break exits can
+  # fire. Without this, a position entered on e.g. an EMA crossover gets
+  # closed by the same crossover flipping back on ordinary 1-bar noise —
+  # measured on real data, this was closing nearly every trade within a few
+  # bars at a small loss before the fixed stop-loss/take-profit ever mattered.
+  # The fixed stop-loss stays active immediately regardless of this gate.
+  min_bars_before_signal_exit: 2
   enable_shorts: true
 
   # --- Trend-Following ---
@@ -153,18 +167,32 @@ intelligence:
   news_sentiment_enabled: true   # use news sentiment as additional filter
 
 long_term:
+  # Free by default: US/ETF data+fundamentals via yfinance (no key/signup),
+  # NSE data+fundamentals via afx.kwayisi.org (no key/signup). FMP/Alpha
+  # Vantage API keys in .env are optional richer fallbacks, not required.
   universe:
-    - source: sp500
-    - source: nse_kenya
+    us_stocks: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "JNJ", "KO",
+                "PG", "V", "JPM", "XOM", "WMT", "HD", "UNH", "PEP", "AVGO"]
+    etfs: ["SPY", "QQQ", "VOO", "VTI", "GLD", "SCHD", "VYM"]
+    # Verified against the live afx.kwayisi.org/nse/ listed-companies table.
+    nse_kenya: ["SCOM", "EQTY", "KCB", "EABL", "BAT", "COOP", "ABSA", "SCBK",
+                "NCBA", "DTK", "BAMB", "JUB", "KEGN", "KPLC", "BRIT", "SASN",
+                "CTUM", "NMG", "UMME", "IMH"]
   screens:
     min_dividend_years_growth: 5
     max_payout_ratio: 70
     min_market_cap_usd: 500000000
-  rebalance_alert_schedule: "0 8 * * MON"   # cron: Monday 8am
+  sell_review:
+    trend_drop_pct: 8          # flag "consider selling" if price fell at least this much...
+    lookback_days: 5           # ...over this many trading days
+  gainers_losers_top_n: 8
+  rebalance_alert_schedule: "0 8 * * MON"    # cron: weekly deep fundamentals screen, Monday 8am UTC
+  daily_digest_schedule: "30 5 * * *"        # cron: daily buy/sell/gainers/losers digest, 05:30 UTC (~08:30 EAT, before NSE's 09:30 EAT open)
+  dashboard_refresh_interval_minutes: 60     # how often the dashboard's long-term cache refreshes (price/gainers-losers only, no fundamentals calls)
 
 nse:
-  watchlist: ["SCOM", "EQTY", "KCB", "BAT", "EABL", "SAFARICOM", "DTK",
-              "COOP", "ABSA", "KNC", "NIC"]
+  watchlist: ["SCOM", "EQTY", "KCB", "BAT", "EABL", "DTK",
+              "COOP", "ABSA", "SCBK", "NCBA"]
   analysis_interval_minutes: 60   # how often to check NSE stocks for alerts
 
 alerts:
@@ -177,6 +205,7 @@ alerts:
     - profit_swept_to_stake
     - heartbeat_missed
     - long_term_signal
+    - long_term_daily_digest
     - nse_alert
     - market_regime_change
     - hourly_summary

@@ -1,6 +1,6 @@
 ccxt==4.3.60
-pandas==2.2.2
-numpy==1.26.4
+pandas==2.3.3
+numpy==2.5.3
 python-telegram-bot==21.4
 discord-webhook==1.3.1
 discord.py==2.4.0
@@ -11,12 +11,22 @@ jinja2==3.1.4
 apscheduler==3.10.4
 sqlalchemy==2.0.31
 python-dotenv==1.0.1
-pyyaml==6.0.1
+pyyaml==6.0.3
 tenacity==8.5.0
 alpaca-py==0.28.1
 alpha_vantage==2.3.1
 vaderSentiment==3.3.2
-torch==2.3.1
-tensorflow==2.16.1
+torch==2.9.0
+# tensorflow is an OPTIONAL alternative ML backend (config.yaml -> ml.lstm_model_type,
+# default "pytorch" — tensorflow is never imported unless you switch to it).
+# It's in requirements-tensorflow.txt instead of here because TensorFlow historically
+# lags far behind on new CPython support (e.g. as of Python 3.14, there is no
+# tensorflow wheel at all yet for any version) — pinning it here would make
+# `pip install -r requirements.txt` fail outright on any Python version it hasn't
+# caught up to yet, breaking the whole install over one optional feature.
+# Install it separately, only if your Python version has a wheel for it:
+#   pip install -r requirements-tensorflow.txt
 requests>=2.31.0
 beautifulsoup4>=4.12.0
+lxml>=5.2.0
+yfinance>=0.2.40

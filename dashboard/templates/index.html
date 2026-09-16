@@ -136,6 +136,7 @@
     <div class="nav-item" onclick="showTab('trades', this)" title="Trades">💹</div>
     <div class="nav-item" onclick="showTab('charts', this)" title="Charts">📈</div>
     <div class="nav-item" onclick="showTab('orderbook', this)" title="Order Book">📕</div>
+    <div class="nav-item" onclick="showTab('investing', this)" title="Long-Term Investing">🏦</div>
     <div class="nav-item" onclick="showTab('logs', this)" title="Logs">📋</div>
     <div class="nav-item" onclick="showTab('terminal', this)" title="Terminal">🖥️</div>
   </nav>
@@ -319,6 +320,62 @@
       </div>
     </div>
 
+    <!-- Investing Tab -->
+    <div id="tab-investing" style="display:none">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <span style="color:var(--text-muted);font-size:12px">Free sources: yfinance (US/ETF) + afx.kwayisi.org (NSE Kenya). No prediction — screen + trend context only.</span>
+        <span id="ltUpdated" style="color:var(--text-muted);font-size:12px">Loading...</span>
+      </div>
+      <div class="grid" style="grid-template-columns:1fr 1fr;margin-bottom:16px">
+        <div class="card">
+          <div class="card-title">🟢 Buy Candidates</div>
+          <div class="table-wrap" style="max-height:340px">
+            <table>
+              <thead><tr><th>Ticker</th><th>Market</th><th>Reason</th><th>Trend</th></tr></thead>
+              <tbody id="ltBuyTable"></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">🔴 Consider Selling / Reviewing</div>
+          <div class="table-wrap" style="max-height:340px">
+            <table>
+              <thead><tr><th>Ticker</th><th>Market</th><th>Reason</th></tr></thead>
+              <tbody id="ltSellTable"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="grid" style="grid-template-columns:1fr 1fr">
+        <div class="card">
+          <div class="card-title">📈 US / ETF Movers Today</div>
+          <div class="grid" style="grid-template-columns:1fr 1fr">
+            <div>
+              <div style="color:var(--green);font-size:12px;font-weight:600;margin-bottom:6px">GAINERS</div>
+              <div id="ltUsGainers" style="font-size:13px"></div>
+            </div>
+            <div>
+              <div style="color:var(--red);font-size:12px;font-weight:600;margin-bottom:6px">LOSERS</div>
+              <div id="ltUsLosers" style="font-size:13px"></div>
+            </div>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-title">📈 NSE Kenya Movers Today</div>
+          <div class="grid" style="grid-template-columns:1fr 1fr">
+            <div>
+              <div style="color:var(--green);font-size:12px;font-weight:600;margin-bottom:6px">GAINERS</div>
+              <div id="ltNseGainers" style="font-size:13px"></div>
+            </div>
+            <div>
+              <div style="color:var(--red);font-size:12px;font-weight:600;margin-bottom:6px">LOSERS</div>
+              <div id="ltNseLosers" style="font-size:13px"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Logs Tab -->
     <div id="tab-logs" style="display:none">
       <div class="grid" style="grid-template-columns:1fr 1fr">
@@ -419,6 +476,7 @@ function showTab(tab, el) {
   if (tab === 'trades') { loadHistory(); loadSymbolStats(); loadAllTimeStats(); }
   if (tab === 'logs') loadLogs();
   if (tab === 'orderbook') simulateOrderBook();
+  if (tab === 'investing') loadLongTerm();
 }
 
 // ==================== API Helpers ====================
@@ -816,6 +874,48 @@ async function loadLogs() {
       <td class="${(pnl||0)>=0?'trade-win':'trade-loss'}">${pnl != null ? `$${pnl.toFixed(2)}` : '--'}</td>
     </tr>`;
   }).join('');
+}
+
+// ==================== Long-Term Investing ====================
+async function loadLongTerm() {
+  const data = await api('/api/long-term/summary');
+
+  const updated = document.getElementById('ltUpdated');
+  if (data.updated_at) {
+    const kind = data.kind === 'hourly' ? '(price refresh)' : '(full daily digest)';
+    updated.textContent = `Updated ${new Date(data.updated_at).toLocaleString()} ${kind}`;
+  } else {
+    updated.textContent = data.note || 'No data yet';
+  }
+
+  const buy = data.buy_candidates || [];
+  const buyBody = document.getElementById('ltBuyTable');
+  buyBody.innerHTML = buy.length ? buy.map(c => `
+    <tr>
+      <td><b>${c.ticker}</b></td>
+      <td><span class="tag ${c.market === 'nse' ? 'neutral' : 'buy'}">${(c.market||'us').toUpperCase()}</span></td>
+      <td style="font-size:12px">${(c.reasons && c.reasons[0]) || ''}</td>
+      <td style="font-size:12px;color:var(--text-muted)">${c.trend || ''}</td>
+    </tr>`).join('') : '<tr><td colspan="4" style="color:var(--text-muted)">None passed today\'s screen</td></tr>';
+
+  const sell = data.sell_candidates || [];
+  const sellBody = document.getElementById('ltSellTable');
+  sellBody.innerHTML = sell.length ? sell.map(c => `
+    <tr>
+      <td><b>${c.ticker}</b></td>
+      <td><span class="tag ${c.market === 'nse' ? 'neutral' : 'sell'}">${(c.market||'us').toUpperCase()}</span></td>
+      <td style="font-size:12px">${(c.reasons && c.reasons[0]) || ''}</td>
+    </tr>`).join('') : '<tr><td colspan="3" style="color:var(--text-muted)">Nothing flagged today</td></tr>';
+
+  const movers = data.movers || {};
+  const moverList = (arr) => (arr && arr.length)
+    ? arr.map(m => `<div style="display:flex;justify-content:space-between;padding:3px 0"><span>${m.ticker}</span><span class="${m.change_pct>=0?'trade-win':'trade-loss'}">${m.change_pct>=0?'+':''}${m.change_pct.toFixed(2)}%</span></div>`).join('')
+    : '<span style="color:var(--text-muted)">--</span>';
+
+  document.getElementById('ltUsGainers').innerHTML = moverList(movers.us?.gainers);
+  document.getElementById('ltUsLosers').innerHTML = moverList(movers.us?.losers);
+  document.getElementById('ltNseGainers').innerHTML = moverList(movers.nse?.gainers);
+  document.getElementById('ltNseLosers').innerHTML = moverList(movers.nse?.losers);
 }
 
 // ==================== Terminal ====================

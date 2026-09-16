@@ -15,8 +15,8 @@ class EquityScreener:
         self.fundamentals = fundamentals
         self.market_data_fn = market_data_fn
 
-    def screen_one(self, ticker: str) -> dict | None:
-        profile = self.fundamentals.get_profile(ticker)
+    def screen_one(self, ticker: str, market: str = None) -> dict | None:
+        profile = self.fundamentals.get_profile(ticker, market=market)
         if not profile:
             return None
 
@@ -80,29 +80,65 @@ class EquityScreener:
         }
 
     def screen_universe(self, tickers: list) -> list:
-        results = [self.screen_one(t) for t in tickers]
+        """tickers: list of ticker strings, or (ticker, market) tuples when
+        the market needs to be explicit (e.g. NSE names alongside US ones)."""
+        results = []
+        for t in tickers:
+            if isinstance(t, tuple):
+                results.append(self.screen_one(t[0], market=t[1]))
+            else:
+                results.append(self.screen_one(t))
         return [r for r in results if r is not None]
 
     def trend_context(self, ticker: str) -> dict | None:
+        """Degrades gracefully with however much history is actually
+        available. Full MA50/MA200 golden-cross analysis needs 200 daily
+        bars — fine for US stocks/ETFs (yfinance has years of history), but
+        NSE Kenya has no free historical-series API (see data_feeds/nse_feed.py)
+        so its accumulated-from-scratch cache can take months to reach 200
+        rows. Rather than returning nothing until then, this falls back to
+        a shorter-window momentum read, and is explicit in the result about
+        which mode produced it and why — a lower-confidence signal that
+        exists today beats a perfect one that doesn't exist for months."""
         df = self.market_data_fn(ticker)
-        if df is None or len(df) < 200:
+        if df is None or len(df) < 5:
             return None
 
         df = df.copy()
-        df["ma50"] = df["close"].rolling(50).mean()
-        df["ma200"] = df["close"].rolling(200).mean()
         last = df.iloc[-1]
+        n = len(df)
 
-        above_200 = last["close"] > last["ma200"]
-        golden_cross = last["ma50"] > last["ma200"]
-        momentum_30d = (last["close"] / df["close"].iloc[-30] - 1) * 100 if len(df) >= 30 else None
+        if n >= 200:
+            df["ma50"] = df["close"].rolling(50).mean()
+            df["ma200"] = df["close"].rolling(200).mean()
+            last = df.iloc[-1]
+            momentum_30d = (last["close"] / df["close"].iloc[-30] - 1) * 100
+            return {
+                "ticker": ticker,
+                "mode": "full",
+                "last_price": float(last["close"]),
+                "above_200dma": bool(last["close"] > last["ma200"]),
+                "golden_cross": bool(last["ma50"] > last["ma200"]),
+                "momentum_30d_pct": round(momentum_30d, 2),
+                "note": "Trend context only — not a prediction.",
+            }
 
+        # Degraded mode: not enough history for a real 200DMA yet. Use
+        # whatever window fits (capped by what's available) as a momentum
+        # proxy instead of a moving-average cross.
+        window = min(20, n - 1)
+        momentum = (last["close"] / df["close"].iloc[-window - 1] - 1) * 100
         return {
             "ticker": ticker,
-            "above_200dma": bool(above_200),
-            "golden_cross": bool(golden_cross),
-            "momentum_30d_pct": round(momentum_30d, 2) if momentum_30d is not None else None,
-            "note": "Trend context only — not a prediction.",
+            "mode": "degraded",
+            "last_price": float(last["close"]),
+            "above_200dma": None,
+            "golden_cross": None,
+            "momentum_pct": round(momentum, 2),
+            "momentum_window_days": window,
+            "note": f"Only {n} days of history available (200 needed for a real "
+                    f"200DMA/golden-cross read) — showing {window}-day momentum "
+                    f"instead. Confidence: low.",
         }
 
     def format_alert(self, screen_result: dict, trend: dict | None = None,
@@ -112,10 +148,13 @@ class EquityScreener:
             lines.append(f"  + {r}")
         for r in screen_result["reasons_fail"]:
             lines.append(f"  - {r}")
-        if trend:
+        if trend and trend.get("mode") == "full":
             lines.append(f"  Trend: {'above' if trend['above_200dma'] else 'below'} 200DMA, "
                           f"{'golden cross' if trend['golden_cross'] else 'no golden cross'}, "
                           f"30d momentum {trend.get('momentum_30d_pct', 'N/A')}%")
+        elif trend and trend.get("mode") == "degraded":
+            lines.append(f"  Trend: {trend['momentum_window_days']}d momentum "
+                          f"{trend.get('momentum_pct', 'N/A')}% ({trend['note']})")
         if news and news.get("avg_sentiment") is not None:
             lines.append(f"  News: {news['label']} ({news['avg_sentiment']:+.2f})")
         return "\n".join(lines)

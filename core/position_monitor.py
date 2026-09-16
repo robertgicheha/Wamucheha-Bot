@@ -23,9 +23,29 @@ monitor is what lets you exit BETTER than the floor, and is what makes
 dry-run mode behave like a real backtest instead of positions that never close.
 """
 import logging
+from datetime import datetime, timezone
 from strategy.technical_strategy import generate_exit_signal
 
 logger = logging.getLogger("position_monitor")
+
+_TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+
+
+def _bars_held(opened_at: str, timeframe: str) -> int | None:
+    """Approximate bars elapsed since entry from the stored opened_at
+    timestamp, so generate_exit_signal's post-entry grace period (see its
+    docstring) also applies live, not just in the backtester."""
+    if not opened_at:
+        return None
+    try:
+        opened = datetime.fromisoformat(opened_at)
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        minutes = (datetime.now(timezone.utc) - opened).total_seconds() / 60
+        tf_minutes = _TIMEFRAME_MINUTES.get(timeframe, 15)
+        return max(0, int(minutes // tf_minutes))
+    except (ValueError, TypeError):
+        return None
 
 # In-memory peak-price tracking for trailing stops, keyed by client_order_id.
 # Resets on process restart — acceptable: worst case a trailing stop briefly
@@ -69,7 +89,11 @@ def check_and_close_positions(state_manager, executors: dict, feed_router,
         else:
             # For shorts, track the LOWEST price (best exit point for a short)
             _peak_prices[client_order_id] = min(_peak_prices.get(client_order_id, pos["entry_price"]), last_price)
-        pos_with_peak = {**pos, "peak_price": _peak_prices[client_order_id]}
+        pos_with_peak = {
+            **pos,
+            "peak_price": _peak_prices[client_order_id],
+            "bars_held": _bars_held(pos.get("opened_at"), "15m"),
+        }
 
         # 1. Fixed stop-loss / take-profit (the floor)
         if pos["side"] == "buy":
