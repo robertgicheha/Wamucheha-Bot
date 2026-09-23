@@ -25,9 +25,53 @@ class ExecutionManager:
             "enableRateLimit": True,
         })
         self.exchange_id = exchange_id
+        # client_order_id -> exchange order id of its resting stop-loss order.
+        # In-memory only: after a restart the bot's own position monitor still
+        # enforces the stop, and close_trade() sells whatever is actually free.
+        self._stop_orders = {}
 
     def _new_client_order_id(self, symbol: str) -> str:
-        return f"bot-{symbol.replace('/', '')}-{uuid.uuid4().hex[:12]}"
+        # Alphanumeric only: OKX rejects '-' in clOrdId (max 32 chars).
+        return f"bot{symbol.replace('/', '')}{uuid.uuid4().hex[:12]}"
+
+    def _base_amount(self, symbol: str, notional_usd: float, price: float) -> float:
+        """Convert a USD notional into the base-asset quantity the exchange expects."""
+        if price <= 0:
+            return 0.0
+        if self.dry_run:
+            return notional_usd / price
+        self.exchange.load_markets()
+        return float(self.exchange.amount_to_precision(symbol, notional_usd / price))
+
+    def _min_order_problem(self, symbol: str, amount: float, price: float):
+        """Return a reason string if the order is below the exchange minimums, else None."""
+        if self.dry_run:
+            return None
+        limits = self.exchange.market(symbol)["limits"]
+        min_amount = limits["amount"]["min"] or 0
+        min_cost = limits["cost"]["min"] or 0
+        if amount <= 0 or amount < min_amount:
+            return f"amount {amount} below exchange minimum {min_amount}"
+        if amount * price < min_cost:
+            return f"order value ${amount * price:.2f} below exchange minimum ${min_cost}"
+        return None
+
+    def _cancel_stop_order(self, client_order_id: str, symbol: str):
+        stop_id = self._stop_orders.pop(client_order_id, None)
+        if not stop_id:
+            return
+        try:
+            params = {"stop": True} if self.exchange_id == "okx" else {}
+            self.exchange.cancel_order(stop_id, symbol, params)
+        except Exception as e:
+            # Already triggered/cancelled — nothing left to cancel.
+            api_failure_tracker.record_failure(self.exchange_id, e, f"cancel_stop_{symbol}")
+
+    def _free_base(self, symbol: str, amount: float) -> float:
+        """Free base-asset balance capped at amount (fees paid in the base coin shrink holdings)."""
+        base = self.exchange.market(symbol)["base"]
+        free = float((self.exchange.fetch_balance().get(base) or {}).get("free") or 0)
+        return min(amount, free)
 
     @retry(
         stop=stop_after_attempt(4),
@@ -41,6 +85,10 @@ class ExecutionManager:
     def open_trade(self, symbol: str, side: str, proposed_amount: float,
                     entry_price: float, stop_loss_pct: float, take_profit_pct: float,
                     strategies: list = None, score: float = 0, regime: str = ""):
+        # Spot markets can't open shorts: a sell needs coins we don't hold.
+        if side != "buy":
+            return None
+
         # Portfolio-level risk check (correlation, asset-class caps, max positions)
         decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol)
         if not decision.allowed:
@@ -57,30 +105,45 @@ class ExecutionManager:
         target_price = entry_price * (1 + take_profit_pct / 100) if side == "buy" \
             else entry_price * (1 - take_profit_pct / 100)
 
+        # decision.position_size is a USD notional; exchanges want base-asset quantity.
+        try:
+            amount = self._base_amount(symbol, decision.position_size, entry_price)
+            problem = self._min_order_problem(symbol, amount, entry_price)
+        except Exception as e:
+            api_failure_tracker.record_failure(self.exchange_id, e, f"size_{symbol}")
+            self.notifier.notify("trade_rejected", f"{symbol} sizing failed: {e}")
+            return None
+        if problem:
+            self.notifier.notify("trade_rejected", f"{symbol} {side} rejected: {problem}")
+            return None
+
         if self.dry_run:
             fill_price = entry_price
-            filled_amount = decision.position_size
+            filled_amount = amount
         else:
             try:
                 order = self._submit_order(
-                    symbol, side, decision.position_size, "market",
+                    symbol, side, amount, "market",
                     {"clientOrderId": client_order_id},
                 )
                 fill_price = order.get("average") or order.get("price") or entry_price
-                filled_amount = order.get("filled", decision.position_size)
+                filled_amount = order.get("filled") or amount
             except Exception as e:
                 api_failure_tracker.record_failure(self.exchange_id, e, f"open_trade_{symbol}")
                 self.notifier.notify("trade_rejected", f"{symbol} order failed: {e}")
                 return None
 
             try:
-                stop_side = "sell" if side == "buy" else "buy"
-                self._submit_order(
-                    symbol, stop_side, filled_amount, "stop_market",
-                    {"stopPrice": stop_price, "clientOrderId": f"{client_order_id}-SL", "reduceOnly": True},
+                # Spot stop-loss: Binance STOP_LOSS / OKX conditional order, market on trigger.
+                sl_amount = float(self.exchange.amount_to_precision(symbol, self._free_base(symbol, filled_amount)))
+                sl_order = self._submit_order(
+                    symbol, "sell", sl_amount, "market", {"stopLossPrice": stop_price},
                 )
+                self._stop_orders[client_order_id] = sl_order["id"]
             except Exception as e:
                 api_failure_tracker.record_failure(self.exchange_id, e, f"stop_loss_{symbol}")
+                self.notifier.notify("trade_rejected",
+                    f"{symbol} stop-loss order failed ({e}) — bot-side stop still active")
 
         self.state.record_trade_open(
             client_order_id, self.exchange_id, symbol, side, filled_amount,
@@ -117,14 +180,26 @@ class ExecutionManager:
             return
 
         if not self.dry_run:
+            symbol = pos["symbol"]
             try:
-                close_side = "sell" if pos["side"] == "buy" else "buy"
-                self._submit_order(
-                    pos["symbol"], close_side, pos["amount"], "market",
-                    {"clientOrderId": f"{client_order_id}-CLOSE", "reduceOnly": True},
-                )
+                # Free the coins locked in the resting stop-loss before selling them.
+                self._cancel_stop_order(client_order_id, symbol)
+                sell_amount = float(self.exchange.amount_to_precision(
+                    symbol, self._free_base(symbol, pos["amount"])))
+                min_amount = self.exchange.market(symbol)["limits"]["amount"]["min"] or 0
+                if sell_amount > 0 and sell_amount >= min_amount:
+                    self._submit_order(symbol, "sell", sell_amount, "market",
+                                       {"clientOrderId": f"{client_order_id}CL"})
+                else:
+                    # Coins already gone (exchange stop-loss fired, or sold manually).
+                    self.notifier.notify("position_drift",
+                        f"{symbol}: nothing left to sell — exchange stop-loss likely fired; recording close")
             except Exception as e:
-                api_failure_tracker.record_failure(self.exchange_id, e, f"close_trade_{pos['symbol']}")
+                # Leave the position open so the monitor retries next tick
+                # instead of recording a close that never happened.
+                api_failure_tracker.record_failure(self.exchange_id, e, f"close_trade_{symbol}")
+                self.notifier.notify("trade_rejected", f"{symbol} close failed: {e}", priority="high")
+                return
 
         direction = 1 if pos["side"] == "buy" else -1
         pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]

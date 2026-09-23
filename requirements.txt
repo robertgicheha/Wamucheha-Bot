@@ -30,3 +30,5 @@ requests>=2.31.0
 beautifulsoup4>=4.12.0
 lxml>=5.2.0
 yfinance>=0.2.40
+# MT5 on Linux: RPyC client for the mt5 container (lprett/mt5linux:1.1.1 runs rpyc 6.x)
+rpyc>=6.0.0,<7

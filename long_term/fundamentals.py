@@ -12,6 +12,7 @@ Source priority per ticker:
     yfinance didn't return usable data.
 """
 import os
+import time
 import logging
 import requests
 
@@ -29,6 +30,25 @@ class FundamentalsFetcher:
         self.fmp_key = fmp_api_key or os.environ.get("FMP_API_KEY")
         self.av_key = alpha_vantage_key or os.environ.get("ALPHA_VANTAGE_KEY")
         self._nse_feed = nse_feed
+        self._cache = {}          # (ticker, market) -> (fetched_at, profile)
+        self._cache_ttl = 6 * 3600
+        self._kes_rate = (0.0, None)
+
+    def kes_per_usd(self) -> float:
+        """Live USD/KES rate (yfinance KES=X), cached 6h; falls back to ~129."""
+        fetched_at, rate = self._kes_rate
+        if rate and time.time() - fetched_at < self._cache_ttl:
+            return rate
+        rate = None
+        if _has_yfinance:
+            try:
+                closes = yf.Ticker("KES=X").history(period="5d")["Close"].dropna()
+                rate = float(closes.iloc[-1]) if len(closes) else None
+            except Exception as e:
+                logger.warning(f"KES rate fetch failed: {e}")
+        rate = rate or 129.0
+        self._kes_rate = (time.time(), rate)
+        return rate
 
     @property
     def nse_feed(self):
@@ -43,7 +63,19 @@ class FundamentalsFetcher:
         debt_to_equity, sector. Any field this source can't supply is None —
         long_term/screener.py already skips checks where the field is None,
         so a thinner NSE profile still screens on whatever it does have."""
-        if market == "nse" or self._is_nse_ticker(ticker):
+        key = (ticker.upper(), market)
+        cached = self._cache.get(key)
+        if cached and time.time() - cached[0] < self._cache_ttl:
+            return cached[1]
+        profile = self._fetch_profile(ticker, market)
+        if profile:
+            self._cache[key] = (time.time(), profile)
+        return profile
+
+    def _fetch_profile(self, ticker: str, market: str = None) -> dict | None:
+        # market=None keeps the old auto-detect; callers pass "us" explicitly
+        # because some symbols (e.g. GLD) exist on both the NSE and NYSE.
+        if market == "nse" or (market is None and self._is_nse_ticker(ticker)):
             return self._from_nse(ticker)
 
         if _has_yfinance:
@@ -73,10 +105,25 @@ class FundamentalsFetcher:
         if eps and eps > 0 and dps is not None:
             payout_ratio = dps / eps * 100
 
+        kes = self.kes_per_usd()
+        market_cap = quote.get("market_cap")
+        eps = quote.get("eps")
         return {
             "ticker": ticker,
-            "market_cap": quote.get("market_cap"),
+            "name": quote.get("name"),
+            "market": "nse",
+            "quote_type": "ETF" if ticker.upper() in ("GLD", "SMWF") else "EQUITY",
+            "currency": "KES",
+            "price": quote.get("price"),
+            "price_usd": quote["price"] / kes if quote.get("price") else None,
+            "market_cap": market_cap,                       # KES
+            "market_cap_usd": market_cap / kes if market_cap else None,
+            "kes_per_usd": kes,
             "pe_ratio": quote.get("pe_ratio"),
+            "earnings_yield_pct": (eps / quote["price"] * 100) if eps and quote.get("price") else None,
+            "eps": eps,
+            "dividend_per_share": quote.get("dividend_per_share"),
+            "shares_outstanding": quote.get("shares_outstanding"),
             "peg_ratio": None,  # not available from this free source
             "revenue_growth_pct": None,
             "dividend_yield": quote.get("dividend_yield"),
@@ -84,6 +131,13 @@ class FundamentalsFetcher:
             "dividend_growth_years": None,  # afx.kwayisi.org has no dividend history series
             "debt_to_equity": None,
             "sector": None,
+            # Price momentum straight from the quote page (no history needed)
+            "return_1w": quote.get("return_1w"),
+            "return_3m": quote.get("return_3m"),
+            "return_6m": quote.get("return_6m"),
+            "return_1y": quote.get("return_1y"),
+            "return_ytd": quote.get("return_ytd"),
+            "day_change_pct": quote.get("change_pct"),
             "source": "afx.kwayisi.org",
         }
 
@@ -101,20 +155,69 @@ class FundamentalsFetcher:
 
         payout = info.get("payoutRatio")
         rev_growth = info.get("revenueGrowth")
+        pct = lambda v: v * 100 if v is not None else None  # yfinance fractions -> %
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        target = info.get("targetMeanPrice")
+        quote_type = info.get("quoteType", "EQUITY")
 
-        return {
+        profile = {
             "ticker": ticker,
+            "name": info.get("longName") or info.get("shortName"),
+            "market": "us",
+            "quote_type": quote_type,
+            "currency": info.get("currency", "USD"),
+            "price": price,
+            "price_usd": price,
             "market_cap": info.get("marketCap"),
+            "market_cap_usd": info.get("marketCap"),
+            "enterprise_value": info.get("enterpriseValue"),
             "pe_ratio": info.get("trailingPE") or info.get("forwardPE"),
+            "forward_pe": info.get("forwardPE"),
+            "pb_ratio": info.get("priceToBook"),
+            "ps_ratio": info.get("priceToSalesTrailing12Months"),
+            "ev_to_ebitda": info.get("enterpriseToEbitda"),
             "peg_ratio": info.get("pegRatio") or info.get("trailingPegRatio"),
-            "revenue_growth_pct": rev_growth * 100 if rev_growth is not None else None,
-            "dividend_yield": info.get("dividendYield"),
+            "eps": info.get("trailingEps"),
+            "book_value_per_share": info.get("bookValue"),
+            "roe_pct": pct(info.get("returnOnEquity")),
+            "roa_pct": pct(info.get("returnOnAssets")),
+            "profit_margin_pct": pct(info.get("profitMargins")),
+            "operating_margin_pct": pct(info.get("operatingMargins")),
+            "gross_margin_pct": pct(info.get("grossMargins")),
+            "revenue": info.get("totalRevenue"),
+            "net_income": info.get("netIncomeToCommon"),
+            "free_cash_flow": info.get("freeCashflow"),
+            "revenue_growth_pct": pct(rev_growth),
+            "earnings_growth_pct": pct(info.get("earningsGrowth")),
+            # yfinance already reports dividendYield in percent (1.99 == 1.99%)
+            "dividend_yield": info.get("dividendYield") or (info.get("yield") or 0) * 100 or None,
+            "dividend_per_share": info.get("dividendRate"),
+            "five_year_avg_dividend_yield": info.get("fiveYearAvgDividendYield"),
             "payout_ratio": payout * 100 if payout is not None else None,
-            "dividend_growth_years": self._dividend_growth_years_yfinance(ticker),
+            "dividend_growth_years": (self._dividend_growth_years_yfinance(ticker)
+                                      if quote_type == "EQUITY" else None),
             "debt_to_equity": info.get("debtToEquity"),
+            "current_ratio": info.get("currentRatio"),
+            "beta": info.get("beta"),
+            "week52_high": info.get("fiftyTwoWeekHigh"),
+            "week52_low": info.get("fiftyTwoWeekLow"),
+            "analyst_target": target,
+            "analyst_upside_pct": (target / price - 1) * 100 if target and price else None,
+            "analyst_rating": info.get("recommendationKey"),
+            "analyst_count": info.get("numberOfAnalystOpinions"),
             "sector": info.get("sector"),
+            "industry": info.get("industry"),
             "source": "yfinance",
         }
+        if quote_type == "ETF":
+            profile.update({
+                "total_assets": info.get("totalAssets"),
+                "expense_ratio_pct": info.get("netExpenseRatio"),
+                "return_ytd": info.get("ytdReturn"),
+                "return_3y_avg": pct(info.get("threeYearAverageReturn")),
+                "return_5y_avg": pct(info.get("fiveYearAverageReturn")),
+            })
+        return profile
 
     def _dividend_growth_years_yfinance(self, ticker: str) -> int | None:
         """Count consecutive trailing years of higher annual dividends, from

@@ -45,6 +45,7 @@ from strategy.signal_aggregator import SignalAggregator
 from strategy import decision
 from ml.lstm_predictor import LSTMPricePredictor
 from core.position_monitor import check_and_close_positions
+from core.market_hours import market_is_open
 from reporting.hourly_report import HourlyReporter
 from long_term.market_intelligence import MarketIntelligence
 from control.telegram_bot import TelegramControlBot
@@ -64,6 +65,13 @@ if _env_stake is not None:
         print(f"Stake amount overridden by .env: ${float(_env_stake):.2f}")
     except ValueError:
         print(f"WARNING: Invalid STAKE_AMOUNT '{_env_stake}' in .env — using config.yaml default")
+
+_env_balance = os.environ.get("TRADING_BALANCE")
+if _env_balance is not None:
+    try:
+        CONFIG["account"]["trading_balance"] = float(_env_balance)
+    except ValueError:
+        print(f"WARNING: Invalid TRADING_BALANCE '{_env_balance}' in .env — using config.yaml default")
 
 
 def build_notifier():
@@ -220,6 +228,15 @@ def main():
     state = StateManager(stake_amount=CONFIG["account"]["stake_amount"])
     risk = RiskManager(state, CONFIG, notifier)
 
+    # A fresh state DB starts at trading_balance=0, and the risk manager
+    # rejects every trade at 0. Fund it once (peak_balance 0 = never funded);
+    # an existing balance — including one drawn down by losses — is left alone.
+    risk_state = state.get_risk_state()
+    initial_balance = float(CONFIG["account"].get("trading_balance") or 0)
+    if risk_state["peak_balance"] <= 0 and initial_balance > 0:
+        state.update_risk_state(trading_balance=initial_balance, peak_balance=initial_balance)
+        print(f"Fresh state DB — trading balance set to ${initial_balance:.2f}")
+
     risk_state = state.get_risk_state()
     notifier.update_start_balance(risk_state.get("trading_balance", 0))
 
@@ -309,6 +326,7 @@ def main():
             password=mt5_password,
             server=mt5_server,
             dry_run=not LIVE_TRADING,
+            allow_min_lot=CONFIG["execution"].get("mt5_allow_min_lot", False),
         )
         if mt5_exec.connect():
             executors["mt5"] = mt5_exec
@@ -448,6 +466,9 @@ def main():
             print(f"Position monitor error: {e}")
 
         # Look for new entries (single-symbol ensemble)
+        # One position per symbol per broker — the loop runs every 15s, so a
+        # signal that persists would otherwise re-open the same trade each tick.
+        open_keys = {(p["exchange"], p["symbol"]) for p in state.get_open_positions()}
         for exchange_name, symbol in all_markets:
             if exchange_name == "nse":
                 continue
@@ -455,31 +476,40 @@ def main():
             executor = executors.get(exchange_name)
             if executor is None:
                 continue
+            if (exchange_name, symbol) in open_keys:
+                continue
+            if not market_is_open(exchange_name, symbol, executor):
+                continue
 
-            signal = get_strategy_signal(
-                feed_router, symbol,
-                trading_balance=risk_state["trading_balance"],
-                risk_fraction=CONFIG["risk"]["max_position_pct"] / 100,
-                ml_models=ml_models,
-                market_regime=market_regime,
-                news_sentiment=news,
-                strategy_cfg=CONFIG.get("strategy", {}),
-                feature_store=feature_store,
-                signal_aggregator=signal_aggregator,
-            )
-
-            if signal:
-                executor.open_trade(
-                    symbol=symbol,
-                    side=signal["side"],
-                    proposed_amount=signal["amount"],
-                    entry_price=signal["entry_price"],
-                    stop_loss_pct=CONFIG["risk"]["stop_loss_pct"],
-                    take_profit_pct=CONFIG["risk"]["take_profit_pct"],
-                    strategies=signal.get("strategies", []),
-                    score=signal.get("score", 0),
-                    regime=signal.get("regime", ""),
+            # One broker/feed error must not take down the whole loop.
+            try:
+                signal = get_strategy_signal(
+                    feed_router, symbol,
+                    trading_balance=risk_state["trading_balance"],
+                    risk_fraction=CONFIG["risk"]["max_position_pct"] / 100,
+                    ml_models=ml_models,
+                    market_regime=market_regime,
+                    news_sentiment=news,
+                    strategy_cfg=CONFIG.get("strategy", {}),
+                    feature_store=feature_store,
+                    signal_aggregator=signal_aggregator,
                 )
+
+                if signal:
+                    executor.open_trade(
+                        symbol=symbol,
+                        side=signal["side"],
+                        proposed_amount=signal["amount"],
+                        entry_price=signal["entry_price"],
+                        stop_loss_pct=CONFIG["risk"]["stop_loss_pct"],
+                        take_profit_pct=CONFIG["risk"]["take_profit_pct"],
+                        strategies=signal.get("strategies", []),
+                        score=signal.get("score", 0),
+                        regime=signal.get("regime", ""),
+                    )
+            except Exception as e:
+                print(f"Entry error {exchange_name} {symbol}: {e}")
+                api_failure_tracker.record_failure(exchange_name, e, f"entry_{symbol}")
 
         # --- Portfolio-Level Strategies ---
 

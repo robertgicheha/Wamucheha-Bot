@@ -25,6 +25,7 @@ dry-run mode behave like a real backtest instead of positions that never close.
 import logging
 from datetime import datetime, timezone
 from strategy.technical_strategy import generate_exit_signal
+from core.market_hours import market_is_open
 
 logger = logging.getLogger("position_monitor")
 
@@ -72,6 +73,10 @@ def check_and_close_positions(state_manager, executors: dict, feed_router,
 
         executor = executors.get(exchange_name)
         if executor is None:
+            continue
+        # Closed market: the chart is frozen and close orders would fail/queue.
+        # Broker-side SL/TP orders still protect the position meanwhile.
+        if not market_is_open(exchange_name, symbol, executor):
             continue
 
         try:

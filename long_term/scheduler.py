@@ -20,7 +20,9 @@ Run as its own process:
 """
 import os
 import sys
+import threading
 import yaml
+from datetime import datetime, timezone
 from pathlib import Path
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -62,7 +64,7 @@ def run_weekly_screen(fundamentals, nse_feed, notifier):
     screener = EquityScreener(CONFIG, fundamentals, market_data_fn)
     news = NewsSentiment()
 
-    tickers = [(t, None) for t in watchlist["us_stocks"]] + \
+    tickers = [(t, "us") for t in watchlist["us_stocks"]] + \
               [(t, "nse") for t in watchlist["nse_kenya"]]
     results = screener.screen_universe(tickers)
 
@@ -74,10 +76,11 @@ def run_weekly_screen(fundamentals, nse_feed, notifier):
     message_lines = [f"Weekly screen: {len(passed)}/{len(results)} names passed."]
     for r in passed:
         sentiment = news.get_sentiment(r["ticker"])
-        trend = screener.trend_context(r["ticker"])
+        trend = screener.trend_context(r["ticker"], market=r["profile"].get("market"))
         message_lines.append(screener.format_alert(r, trend=trend, news=sentiment))
 
-    notifier.notify("long_term_signal", "\n".join(message_lines))
+    notifier.notify_report("long_term_signal", "\n".join(message_lines),
+                           subject="📊 Weekly stock screen")
 
 
 def main():
@@ -107,6 +110,18 @@ def main():
         daily_digest.refresh_dashboard_cache(CONFIG, nse_feed)
     except Exception as e:
         print(f"Initial dashboard cache refresh failed (will retry hourly): {e}")
+
+    # The full stock analysis normally runs with the daily digest; if the
+    # dashboard has none (first deploy) or it's stale, build it now in the
+    # background (~3 min) rather than waiting for tomorrow's digest.
+    cached = daily_digest.read_cache().get("analysis", {}).get("updated_at")
+    age_h = ((datetime.now(timezone.utc) - datetime.fromisoformat(cached)).total_seconds() / 3600
+             if cached else None)
+    if age_h is None or age_h > 20:
+        threading.Thread(
+            target=lambda: daily_digest.refresh_analysis(CONFIG, fundamentals, nse_feed),
+            daemon=True,
+        ).start()
 
     print("Long-term scheduler started: weekly screen, daily digest, hourly dashboard refresh.")
     scheduler.start()
