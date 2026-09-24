@@ -13,6 +13,8 @@ IMPORTANT: Alpaca paper trading uses the same API endpoints but different keys
 (PK- prefix for paper, AK- prefix for live). This is the primary safety net —
 you can test with real market data and fake money.
 """
+import math
+import time
 import uuid
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -29,6 +31,31 @@ class AlpacaExecutor:
         self.api_secret = api_secret
         self.base_url = ("https://paper-api.alpaca.markets" if paper
                          else "https://api.alpaca.markets")
+        self._clock = (0.0, True)  # (checked_at, is_open)
+
+    def is_market_open(self) -> bool:
+        """Broker clock (handles holidays/half-days), cached for a minute."""
+        checked_at, is_open = self._clock
+        if time.time() - checked_at < 60:
+            return is_open
+        try:
+            resp = requests.get(f"{self.base_url}/v2/clock", headers=self._headers(), timeout=10)
+            resp.raise_for_status()
+            is_open = bool(resp.json().get("is_open"))
+        except Exception:
+            is_open = False  # can't confirm -> don't trade
+        self._clock = (time.time(), is_open)
+        return is_open
+
+    def _cancel_open_orders(self, symbol: str):
+        """Cancel resting orders (the stop-loss) — they hold the shares, so a
+        close order for the same qty is rejected while they exist."""
+        resp = requests.get(f"{self.base_url}/v2/orders", headers=self._headers(),
+                            params={"status": "open", "symbols": symbol}, timeout=10)
+        resp.raise_for_status()
+        for order in resp.json():  # this endpoint returns a list
+            requests.delete(f"{self.base_url}/v2/orders/{order['id']}",
+                            headers=self._headers(), timeout=10)
 
     def _headers(self) -> dict:
         return {
@@ -50,7 +77,7 @@ class AlpacaExecutor:
                       order_type: str = "market", **kwargs) -> dict:
         body = {
             "symbol": symbol,
-            "qty": str(qty) if qty == int(qty) else str(qty),
+            "qty": f"{qty:.6f}".rstrip("0").rstrip("."),  # Alpaca allows <= 9 decimals
             "side": side,
             "type": order_type,
             "time_in_force": kwargs.get("time_in_force", "day"),
@@ -64,6 +91,9 @@ class AlpacaExecutor:
 
         url = f"{self.base_url}/v2/orders"
         resp = requests.post(url, headers=self._headers(), json=body, timeout=15)
+        if resp.status_code in (403, 422):
+            # Rejected by Alpaca (not retryable) — surface its reason.
+            raise ValueError(f"Alpaca rejected order: {resp.text[:200]}")
         resp.raise_for_status()
         return resp.json()
 
@@ -87,11 +117,18 @@ class AlpacaExecutor:
 
         # Calculate quantity from notional
         if entry_price > 0:
-            qty = decision.position_size / entry_price
+            qty = round(decision.position_size / entry_price, 6)
         else:
             return None
 
-        if qty <= 0:
+        # Alpaca: fractional orders need >= $1 notional; shorts can't be
+        # fractional, so a short is rounded down to whole shares.
+        if side != "buy":
+            qty = math.floor(qty)
+        if qty <= 0 or qty * entry_price < 1:
+            self.notifier.notify("trade_rejected",
+                f"{symbol} {side} skipped: ${decision.position_size:.2f} is below Alpaca's minimum "
+                f"({'1 whole share for shorts' if side != 'buy' else '$1 fractional'})")
             return None
 
         client_order_id = self._new_client_order_id(symbol)
@@ -102,13 +139,16 @@ class AlpacaExecutor:
             order_id = client_order_id
         else:
             order_side = "buy" if side in ("buy",) else "sell"
-            result = self._submit_order(
-                symbol, qty, order_side,
-                order_type="market",
-                time_in_force="day",
-            )
+            try:
+                result = self._submit_order(
+                    symbol, qty, order_side,
+                    order_type="market",
+                    time_in_force="day",
+                )
+            except Exception as e:
+                self.notifier.notify("trade_rejected", f"Alpaca {symbol} order failed: {e}")
+                return None
             order_id = result.get("id", client_order_id)
-            import time
             for _ in range(10):
                 time.sleep(0.5)
                 filled = self._get_order(order_id)
@@ -117,24 +157,33 @@ class AlpacaExecutor:
                     filled_qty = float(filled.get("filled_qty", qty))
                     break
             else:
-                fill_price = entry_price
-                filled_qty = qty
+                # Not filled in 5s (halted / queued) — cancel rather than record
+                # a position that may never exist.
+                try:
+                    requests.delete(f"{self.base_url}/v2/orders/{order_id}",
+                                    headers=self._headers(), timeout=10)
+                except Exception:
+                    pass
+                self.notifier.notify("trade_rejected", f"Alpaca {symbol} order not filled in 5s — cancelled")
+                return None
 
             sl_price = entry_price * (1 - stop_loss_pct / 100) if side == "buy" \
                 else entry_price * (1 + stop_loss_pct / 100)
             sl_side = "sell" if side == "buy" else "buy"
             try:
+                # Fractional-share stop orders must be DAY orders on Alpaca;
+                # the bot-side stop in position_monitor covers overnight.
                 self._submit_order(
                     symbol, filled_qty, sl_side,
                     order_type="stop",
-                    stop_price=sl_price,
-                    time_in_force="gtc",
+                    stop_price=round(sl_price, 2),
+                    time_in_force="gtc" if filled_qty == int(filled_qty) else "day",
                 )
-            except Exception:
+            except Exception as e:
                 self.notifier.notify(
                     "warning",
-                    f"Stop-loss order failed for {symbol} — position unprotected on exchange. "
-                    f"Bot-side trailing stop is active as backup.",
+                    f"Stop-loss order failed for {symbol} ({e}) — position unprotected on exchange. "
+                    f"Bot-side stop is active as backup.",
                     priority="high",
                 )
 
@@ -164,32 +213,27 @@ class AlpacaExecutor:
             return
 
         if not self.dry_run:
-            close_side = "sell" if pos["side"] == "buy" else "buy"
             try:
-                self._submit_order(
-                    pos["symbol"], pos["amount"], close_side,
-                    order_type="market",
-                    time_in_force="day",
-                )
+                self._cancel_open_orders(pos["symbol"])
+                # Closes via the position endpoint (handles fractional + short cover).
+                resp = requests.delete(f"{self.base_url}/v2/positions/{pos['symbol']}",
+                                       headers=self._headers(),
+                                       params={"qty": f"{pos['amount']:.6f}".rstrip("0").rstrip(".")},
+                                       timeout=15)
+                if resp.status_code == 404:
+                    # No position at the broker: the stop-loss already filled.
+                    self.notifier.notify("position_drift",
+                        f"Alpaca {pos['symbol']}: position already closed at broker (stop-loss filled?)")
+                elif resp.status_code >= 400:
+                    raise ValueError(resp.text[:200])
             except Exception as e:
+                # Leave the position open so the monitor retries next tick.
                 self.notifier.notify(
                     "warning",
                     f"Failed to close {pos['symbol']} on Alpaca: {e}",
                     priority="high",
                 )
                 return
-
-            try:
-                url = f"{self.base_url}/v2/orders"
-                resp = requests.get(url, headers=self._headers(),
-                                   params={"status": "open", "symbols": pos["symbol"]},
-                                   timeout=10)
-                open_orders = resp.json().get("orders", [])
-                for order in open_orders:
-                    cancel_url = f"{self.base_url}/v2/orders/{order['id']}"
-                    requests.delete(cancel_url, headers=self._headers(), timeout=5)
-            except Exception:
-                pass
 
         direction = 1 if pos["side"] == "buy" else -1
         pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]

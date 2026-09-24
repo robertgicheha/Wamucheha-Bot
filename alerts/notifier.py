@@ -12,6 +12,8 @@ running totals, and session statistics.
 """
 import smtplib
 import json
+import re
+import html as html_lib
 import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -370,6 +372,69 @@ class Notifier:
                 send_fn(event_type, message, priority, trade_data)
             except Exception as e:
                 logger.error(f"Notifier channel failed ({send_fn.__name__}): {e}")
+
+    # ── Long reports (daily digest, stock recommendations) ────────────────
+
+    def notify_report(self, event_type: str, telegram_html: str, subject: str = None,
+                      email_html: str = None):
+        """Multi-section report to every channel. notify() sends one message,
+        which Telegram (4096 chars) and Discord (2000 chars) reject when a
+        digest is longer — here it's split on line boundaries, and Discord
+        gets markdown instead of raw HTML tags."""
+        self._log({"type": event_type, "message": telegram_html, "priority": "normal",
+                   "ts": datetime.now(timezone.utc).isoformat()})
+
+        def chunks(text: str, limit: int):
+            part = ""
+            for line in text.split("\n"):
+                if part and len(part) + len(line) + 1 > limit:
+                    yield part
+                    part = ""
+                part += line[:limit] + "\n"
+            if part.strip():
+                yield part
+
+        if self.telegram_token and self.telegram_chat_id:
+            for part in chunks(telegram_html, 3900):
+                try:
+                    resp = requests.post(
+                        f"https://api.telegram.org/bot{self.telegram_token}/sendMessage",
+                        json={"chat_id": self.telegram_chat_id, "text": part,
+                              "parse_mode": "HTML", "disable_web_page_preview": True},
+                        timeout=15)
+                    if not resp.ok:
+                        logger.error(f"Telegram report chunk failed: {resp.text[:200]}")
+                except Exception as e:
+                    logger.error(f"Telegram report failed: {e}")
+
+        if self.discord_webhook_url:
+            md = re.sub(r"</?b>", "**", telegram_html)
+            md = re.sub(r"</?i>", "*", md)
+            md = re.sub(r"</?code>", "`", md)
+            md = html_lib.unescape(re.sub(r"<[^>]+>", "", md))
+            for part in chunks(md, 1900):
+                try:
+                    requests.post(self.discord_webhook_url, json={"content": part}, timeout=15)
+                except Exception as e:
+                    logger.error(f"Discord report failed: {e}")
+
+        cfg = self.email_cfg
+        if cfg.get("address") and cfg.get("to"):
+            try:
+                body = email_html or _build_alert_email(event_type, telegram_html, "normal")
+                msg = MIMEMultipart("alternative")
+                msg["Subject"] = subject or _email_subject(event_type)
+                msg["From"] = f"Wamucheha Bot <{cfg['address']}>"
+                msg["To"] = cfg["to"]
+                msg.attach(MIMEText(body, "html"))
+                with smtplib.SMTP(cfg["smtp_host"], cfg["smtp_port"]) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                    server.login(cfg["address"], cfg["app_password"])
+                    server.send_message(msg)
+            except Exception as e:
+                logger.error(f"Email report failed: {e}")
 
     # ── Trade open ────────────────────────────────────────────────────────
 

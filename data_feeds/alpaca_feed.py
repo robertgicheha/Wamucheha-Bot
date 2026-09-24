@@ -57,11 +57,16 @@ class AlpacaFeed:
 
         alpaca_tf = CCXT_TO_ALPACA.get(timeframe, "15Min")
 
-        # Alpaca v2 bars endpoint
+        # Alpaca v2 bars endpoint. Without `start` Alpaca returns only today's
+        # bars (~26 x 15m), below the 50 the strategy needs — so look back far
+        # enough to cover nights/weekends and take the newest `limit` bars.
+        lookback_days = {"1Day": 400, "1Week": 2000, "1Month": 6000}.get(alpaca_tf, 60)
         url = f"{self.data_url}/v2/stocks/{symbol}/bars"
         params = {
             "timeframe": alpaca_tf,
+            "start": (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat(),
             "limit": min(limit, 10000),
+            "sort": "desc",
             "adjustment": "split",  # adjusted for splits
             "feed": "iex",  # IEX feed — free; use "sip" for paid real-time
         }

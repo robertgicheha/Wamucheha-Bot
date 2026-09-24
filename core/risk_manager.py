@@ -29,6 +29,10 @@ ASSET_CLASS_MAP = {
     # Commodities / Gold
     "XAU/USD": "commodities", "XAG/USD": "commodities",
     "XAUUSD": "commodities", "XAGUSD": "commodities",
+    # MT5 forex / crypto CFDs
+    "EURUSD": "forex", "GBPUSD": "forex", "AUDUSD": "forex", "USDCAD": "forex",
+    "EURJPY": "forex", "EURGBP": "forex", "USDJPY": "forex", "GBPJPY": "forex",
+    "BTCUSD": "crypto", "ETHUSD": "crypto",
     # US Stocks / ETFs
     "AAPL": "equities", "MSFT": "equities", "SPY": "equities",
     "QQQ": "equities", "GLD": "commodities", "TLT": "fixed_income",
@@ -37,6 +41,32 @@ ASSET_CLASS_MAP = {
     "EABL": "nse", "SAFARICOM": "nse", "DTK": "nse",
     "COOP": "nse", "ABSA": "nse", "KNC": "nse", "NIC": "nse",
 }
+
+# MT5 contract sizes (units per lot) by symbol prefix; forex default 100,000.
+MT5_CONTRACT_SIZE = {"XAU": 100, "XAG": 5000, "BTC": 1, "ETH": 1}
+
+
+def position_notional_usd(pos: dict) -> float:
+    """Approximate USD notional of an open position. `amount` means different
+    things per broker: coins/shares (ccxt, Alpaca), base-currency units
+    (OANDA), or lots (MT5) — amount * price is only right for the first."""
+    symbol, amount, price = pos["symbol"].upper(), pos["amount"], pos["entry_price"]
+    if pos.get("exchange") == "mt5":
+        size = next((v for k, v in MT5_CONTRACT_SIZE.items() if symbol.startswith(k)), 100000)
+        units = amount * size
+        if symbol.startswith("USD"):
+            return units                   # USDJPY: base is USD
+        if symbol.endswith("USD"):
+            return units * price           # EURUSD, XAUUSD, BTCUSD
+        return units                       # crosses: ~1 USD per base unit
+    if pos.get("exchange") == "oanda":
+        if symbol.startswith("USD/"):
+            return amount                  # base is USD
+        if symbol.endswith("/USD"):
+            return amount * price
+        return amount                      # crosses: ~1 USD per base unit
+    return amount * price
+
 
 # Known correlated crypto pairs (move together ~70-90% of the time)
 CRYPTO_CORRELATION_GROUPS = [
@@ -139,7 +169,7 @@ class RiskManager:
         for pos in open_positions:
             pos_class = ASSET_CLASS_MAP.get(pos["symbol"], "other")
             if pos_class == asset_class:
-                class_exposure += pos["amount"] * pos["entry_price"]
+                class_exposure += position_notional_usd(pos)
 
         return (class_exposure / trading_balance) * 100
 

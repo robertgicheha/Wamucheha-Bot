@@ -7,10 +7,14 @@ on the connected broker (forex, metals, crypto, indices, etc.).
 import pandas as pd
 from datetime import datetime, timezone
 
+from core.mt5_client import get_mt5
 
+
+# Names of the MetaTrader5 TIMEFRAME_* constants (copy_rates_* needs the constant, not a string).
 TIMEFRAME_MAP = {
-    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
-    "1h": "1h", "4h": "4h", "1d": "1d", "1w": "1w", "1M": "1M",
+    "1m": "TIMEFRAME_M1", "5m": "TIMEFRAME_M5", "15m": "TIMEFRAME_M15", "30m": "TIMEFRAME_M30",
+    "1h": "TIMEFRAME_H1", "4h": "TIMEFRAME_H4", "1d": "TIMEFRAME_D1", "1w": "TIMEFRAME_W1",
+    "1M": "TIMEFRAME_MN1",
 }
 
 
@@ -23,11 +27,10 @@ class MT5Feed:
 
     def connect(self) -> bool:
         try:
-            import MetaTrader5 as mt5
-        except ImportError:
-            return False
-
-        if not mt5.initialize():
+            mt5 = get_mt5()
+            if not mt5.initialize():
+                return False
+        except Exception:  # ImportError on non-Windows, or MT5 bridge unreachable
             return False
 
         if self.login:
@@ -41,15 +44,16 @@ class MT5Feed:
 
     def get_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 200) -> pd.DataFrame:
         try:
-            import MetaTrader5 as mt5
+            mt5 = get_mt5()
         except ImportError:
             raise ImportError("MetaTrader5 package not installed. Run: pip install MetaTrader5")
 
         if not self._connected:
             self.connect()
 
-        mt5_tf = TIMEFRAME_MAP.get(timeframe, "15m")
+        mt5_tf = getattr(mt5, TIMEFRAME_MAP.get(timeframe, "TIMEFRAME_M15"))
 
+        mt5.symbol_select(symbol, True)  # symbol must be in Market Watch
         rates = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, limit)
         if rates is None or len(rates) == 0:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
@@ -70,13 +74,14 @@ class MT5Feed:
 
     def latest_price(self, symbol: str) -> float:
         try:
-            import MetaTrader5 as mt5
+            mt5 = get_mt5()
         except ImportError:
             raise ImportError("MetaTrader5 package not installed")
 
         if not self._connected:
             self.connect()
 
+        mt5.symbol_select(symbol, True)
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise ValueError(f"No price data for {symbol}")

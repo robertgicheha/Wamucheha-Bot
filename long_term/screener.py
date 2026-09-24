@@ -23,7 +23,8 @@ class EquityScreener:
         reasons_pass = []
         reasons_fail = []
 
-        mc = profile.get("market_cap")
+        # USD-normalised: NSE caps come in KES (SCOM's 1.45T is ~$11B, not $1,450B)
+        mc = profile.get("market_cap_usd") or profile.get("market_cap")
         if mc is not None:
             if mc >= self.cfg["min_market_cap_usd"]:
                 reasons_pass.append(f"Market cap ${mc/1e9:.1f}B clears the "
@@ -90,7 +91,7 @@ class EquityScreener:
                 results.append(self.screen_one(t))
         return [r for r in results if r is not None]
 
-    def trend_context(self, ticker: str) -> dict | None:
+    def trend_context(self, ticker: str, market: str = None) -> dict | None:
         """Degrades gracefully with however much history is actually
         available. Full MA50/MA200 golden-cross analysis needs 200 daily
         bars — fine for US stocks/ETFs (yfinance has years of history), but
@@ -100,7 +101,7 @@ class EquityScreener:
         a shorter-window momentum read, and is explicit in the result about
         which mode produced it and why — a lower-confidence signal that
         exists today beats a perfect one that doesn't exist for months."""
-        df = self.market_data_fn(ticker)
+        df = self.market_data_fn(ticker, market)
         if df is None or len(df) < 5:
             return None
 
@@ -119,7 +120,7 @@ class EquityScreener:
                 "last_price": float(last["close"]),
                 "above_200dma": bool(last["close"] > last["ma200"]),
                 "golden_cross": bool(last["ma50"] > last["ma200"]),
-                "momentum_30d_pct": round(momentum_30d, 2),
+                "momentum_30d_pct": round(float(momentum_30d), 2),
                 "note": "Trend context only — not a prediction.",
             }
 
@@ -134,7 +135,7 @@ class EquityScreener:
             "last_price": float(last["close"]),
             "above_200dma": None,
             "golden_cross": None,
-            "momentum_pct": round(momentum, 2),
+            "momentum_pct": round(float(momentum), 2),
             "momentum_window_days": window,
             "note": f"Only {n} days of history available (200 needed for a real "
                     f"200DMA/golden-cross read) — showing {window}-day momentum "

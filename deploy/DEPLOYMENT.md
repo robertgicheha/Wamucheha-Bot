@@ -36,6 +36,41 @@ sudo ufw allow from YOUR_HOME_IP to any port 8000
 sudo ufw enable
 ```
 
+## Part 1a — MetaTrader 5 on the Linux VPS
+
+MT5 and its `MetaTrader5` Python package are Windows-only. On the VPS the
+terminal runs under Wine in the `mt5` Docker container (`lprett/mt5linux`,
+x86_64 only), which logs in from `MT5_LOGIN`/`MT5_PASSWORD`/`MT5_SERVER`,
+restarts the terminal if it crashes, and serves the MetaTrader5 module over
+RPyC on `127.0.0.1:18812`. The bot talks to it via `core/mt5_client.py` when
+`MT5_RPC_HOST` is set.
+
+```bash
+# Once: install Docker
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker tradingbot    # log out/in afterwards
+
+# In /opt/trading_bot, with .env filled in (MT5_* and MT5_RPC_HOST=127.0.0.1)
+docker compose up -d mt5              # only the MT5 container; the bot stays on systemd
+docker logs -f trading-mt5            # first start takes a few minutes
+pip install -r requirements.txt       # adds rpyc
+python scripts/check_connections.py   # the MT5 line should show your account + a XAUUSD price
+sudo systemctl restart tradingbot
+```
+
+**Look at the terminal once** through an SSH tunnel (the ports are bound to
+localhost only, never expose them publicly):
+```bash
+ssh -L 8080:localhost:8080 -L 5901:localhost:5901 tradingbot@YOUR_VPS_IP
+# then open http://localhost:8080 (password = MT5_VNC_PASSWORD)
+```
+Make sure the **Algo Trading** button in the toolbar is green — with it off, MT5
+rejects every order from Python (retcode 10027). `MT5_SERVER` must match the
+server name shown in the terminal's login dialog exactly (e.g. `MetaQuotes-Demo`).
+
+If you run the whole stack with `docker compose up -d` instead of systemd, the
+engine reaches the terminal at `mt5:18812` automatically.
+
 ## Part 1b — Interactive Telegram/Discord control bots
 
 These are separate long-running processes from the alert channels — the alerts

@@ -107,6 +107,25 @@ def _parse_pct(s: str | None) -> float | None:
         return None
 
 
+_PERF_KEYS = {"1WK": "return_1w", "4WK": "return_4w", "3MO": "return_3m",
+              "6MO": "return_6m", "1YR": "return_1y", "YTD": "return_ytd"}
+
+
+def _parse_performance(soup: Any) -> dict[str, float | None]:
+    """<div data-perf> holds two small tables: 1WK/4WK/3MO and 6MO/1YR/YTD."""
+    out: dict[str, float | None] = {v: None for v in _PERF_KEYS.values()}
+    block = soup.find("div", attrs={"data-perf": True})
+    if not block:
+        return out
+    for table in block.find_all("table"):
+        heads = [th.get_text(strip=True) for th in table.find_all("th")]
+        cells = [td.get_text(strip=True) for td in table.find_all("td")]
+        for head, cell in zip(heads, cells):
+            if head in _PERF_KEYS:
+                out[_PERF_KEYS[head]] = _parse_pct(cell)
+    return out
+
+
 def _kv_table(table: Any) -> dict[str, str]:
     out: dict[str, str] = {}
     for tr in table.find_all("tr"):
@@ -263,6 +282,9 @@ class NSEFeed:
             "dividend_yield": _parse_pct(valuation.get("Dividend Yield")),
             "shares_outstanding": _parse_number_suffix(valuation.get("Shares Outstanding")),
             "market_cap": _parse_number_suffix(valuation.get("Market Capitalization")),
+            # Price returns from the page's performance block (1WK..YTD) —
+            # real multi-month momentum without needing our own history.
+            **_parse_performance(soup),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "source": "afx.kwayisi.org",
         }

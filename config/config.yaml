@@ -2,6 +2,8 @@
 
 account:
   stake_amount: 10.0           # overridden by STAKE_AMOUNT env var if set
+  trading_balance: 100.0       # capital the bot may trade; seeds a fresh state DB only
+                               # (overridden by TRADING_BALANCE env var)
   currency: USD
   stake_wallet_address: ""     # cold wallet / separate account, bot has no access
 
@@ -40,9 +42,9 @@ execution:
     - name: mt5
       enabled: true
       markets: []
+  # This OANDA account offers currency pairs only (no XAU/USD, BTC/USD CFDs) —
+  # gold trades through MT5 (XAUUSD) and Alpaca (GLD ETF) instead.
   oanda_markets:
-    - "XAU/USD"
-    - "BTC/USD"
     - "GBP/USD"
     - "EUR/USD"
     - "AUD/USD"
@@ -61,6 +63,10 @@ execution:
     - "EURGBP"
     - "USDCAD"
   alpaca_markets: ["AAPL", "MSFT", "SPY", "QQQ", "GLD", "TLT"]
+  # MT5's minimum order is 0.01 lot (~$1,000 EURUSD, ~$4,000 gold) — far above
+  # max_position_pct of a small trading balance. false: skip such trades.
+  # true: trade the minimum lot anyway (only sensible on a demo account).
+  mt5_allow_min_lot: false
   order_type: market            # market | limit
   max_slippage_pct: 0.5
   idempotency: true              # attach client order IDs, dedupe on retry

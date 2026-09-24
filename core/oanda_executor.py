@@ -26,6 +26,54 @@ class OandaExecutor:
         self.account_id = account_id
         self.base_url = ("https://api-fxpractice.oanda.com" if practice
                          else "https://api-fxtrade.oanda.com")
+        self._instrument_info = None
+
+    def _precision(self, instrument: str) -> int:
+        """Price decimals OANDA accepts for this instrument (JPY pairs: 3,
+        most majors: 5). Sending more is rejected as PRICE_PRECISION_EXCEEDED."""
+        if self._instrument_info is None:
+            try:
+                resp = requests.get(f"{self.base_url}/v3/accounts/{self.account_id}/instruments",
+                                    headers=self._headers(), timeout=15)
+                resp.raise_for_status()
+                self._instrument_info = {i["name"]: i for i in resp.json()["instruments"]}
+            except Exception:
+                return 3 if "JPY" in instrument else 5
+        info = self._instrument_info.get(instrument)
+        return int(info["displayPrecision"]) if info else 5
+
+    def _mid(self, instrument: str) -> float | None:
+        try:
+            resp = requests.get(f"{self.base_url}/v3/accounts/{self.account_id}/pricing",
+                                headers=self._headers(), params={"instruments": instrument}, timeout=10)
+            resp.raise_for_status()
+            p = resp.json()["prices"][0]
+            return (float(p["bids"][0]["price"]) + float(p["asks"][0]["price"])) / 2
+        except Exception:
+            return None
+
+    def _usd_per_base(self, instrument: str, price: float) -> float | None:
+        """USD value of one unit (one unit = one unit of the base currency)."""
+        base, quote = instrument.split("_")
+        if base == "USD":
+            return 1.0
+        if quote == "USD":
+            return price
+        direct = self._mid(f"{base}_USD")
+        if direct:
+            return direct
+        inverse = self._mid(f"USD_{base}")
+        return 1 / inverse if inverse else None
+
+    def _quote_to_usd(self, instrument: str, amount_in_quote: float, price: float) -> float:
+        """Convert a P&L in the quote currency to USD (used for dry-run estimates)."""
+        base, quote = instrument.split("_")
+        if quote == "USD":
+            return amount_in_quote
+        if base == "USD":
+            return amount_in_quote / price
+        usd_per_base = self._usd_per_base(instrument, price)
+        return amount_in_quote * usd_per_base / price if usd_per_base else amount_in_quote
 
     def _headers(self) -> dict:
         return {
@@ -47,6 +95,7 @@ class OandaExecutor:
     )
     def _submit_order(self, instrument: str, units: int, stop_loss: float = None,
                       take_profit: float = None) -> dict:
+        digits = self._precision(instrument)
         order_body = {
             "type": "MARKET",
             "instrument": instrument,
@@ -56,17 +105,19 @@ class OandaExecutor:
 
         if stop_loss:
             order_body["stopLossOnFill"] = {
-                "price": f"{stop_loss:.5f}",
+                "price": f"{stop_loss:.{digits}f}",
                 "timeInForce": "GTC",
             }
         if take_profit:
             order_body["takeProfitOnFill"] = {
-                "price": f"{take_profit:.5f}",
+                "price": f"{take_profit:.{digits}f}",
             }
 
         url = f"{self.base_url}/v3/accounts/{self.account_id}/orders"
         resp = requests.post(url, headers=self._headers(),
                             json={"order": order_body}, timeout=15)
+        if resp.status_code == 400:
+            raise ValueError(f"OANDA rejected order: {resp.text[:200]}")
         resp.raise_for_status()
         return resp.json()
 
@@ -85,13 +136,16 @@ class OandaExecutor:
 
         instrument = self._normalize_instrument(symbol)
 
-        # Convert USD notional to units
-        if entry_price > 0:
-            units = int(decision.position_size / entry_price)
-        else:
+        # Convert USD notional to units of the base currency (USD/JPY: 1 unit
+        # = $1; EUR/USD: 1 unit = price USD; crosses via the base's USD rate).
+        usd_per_unit = self._usd_per_base(instrument, entry_price) if entry_price > 0 else None
+        if not usd_per_unit:
             return None
+        units = int(decision.position_size / usd_per_unit)
 
         if units == 0:
+            self.notifier.notify("trade_rejected",
+                f"{symbol} {side} skipped: ${decision.position_size:.2f} is less than 1 unit (${usd_per_unit:.2f})")
             return None
 
         # For sell/short, units must be negative
@@ -111,11 +165,21 @@ class OandaExecutor:
             fill_price = entry_price
             filled_units = abs(units)
         else:
-            result = self._submit_order(instrument, units, sl_price, tp_price)
-            fill_str = result.get("orderFillTransaction", {})
-            order_id = fill_str.get("id", self._new_client_order_id(symbol))
+            try:
+                result = self._submit_order(instrument, units, sl_price, tp_price)
+            except Exception as e:
+                self.notifier.notify("trade_rejected", f"OANDA {symbol} order failed: {e}")
+                return None
+            fill_str = result.get("orderFillTransaction")
+            if not fill_str:
+                # 201 but cancelled (market closed, FOK not filled, margin, ...)
+                reason = (result.get("orderCancelTransaction") or {}).get("reason", "no fill")
+                self.notifier.notify("trade_rejected", f"OANDA {symbol} order cancelled: {reason}")
+                return None
+            # The trade ID is what trades/{id}/close needs.
+            order_id = (fill_str.get("tradeOpened") or {}).get("tradeID") or fill_str["id"]
             fill_price = float(fill_str.get("price", entry_price))
-            filled_units = abs(int(fill_str.get("units", units)))
+            filled_units = abs(int(float(fill_str.get("units", units))))
 
         self.state.record_trade_open(
             order_id, "oanda", symbol, side, filled_units,
@@ -137,22 +201,37 @@ class OandaExecutor:
         if not pos:
             return
 
-        if not self.dry_run:
-            instrument = self._normalize_instrument(pos["symbol"])
-            close_units = -int(pos["amount"]) if pos["side"] == "buy" else int(pos["amount"])
-            url = f"{self.base_url}/v3/accounts/{self.account_id}/orders"
-            resp = requests.post(url, headers=self._headers(), json={
-                "order": {
-                    "type": "MARKET",
-                    "instrument": instrument,
-                    "units": str(close_units),
-                    "timeInForce": "FOK",
-                }
-            }, timeout=15)
-            resp.raise_for_status()
-
+        instrument = self._normalize_instrument(pos["symbol"])
         direction = 1 if pos["side"] == "buy" else -1
-        pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
+        pnl = self._quote_to_usd(instrument, direction * (exit_price - pos["entry_price"]) * pos["amount"],
+                                 exit_price)
+
+        if not self.dry_run:
+            try:
+                # Closing the trade also cancels its attached SL/TP orders.
+                url = f"{self.base_url}/v3/accounts/{self.account_id}/trades/{client_order_id}/close"
+                resp = requests.put(url, headers=self._headers(), timeout=15)
+                if resp.status_code >= 400:
+                    # Already closed at the broker by its SL/TP? Then use OANDA's realized P&L.
+                    trade = requests.get(f"{self.base_url}/v3/accounts/{self.account_id}/trades/{client_order_id}",
+                                         headers=self._headers(), timeout=15).json().get("trade", {})
+                    if trade.get("state") != "CLOSED":
+                        raise ValueError(resp.text[:200])
+                    pnl = float(trade.get("realizedPL", pnl))
+                    exit_price = float(trade.get("averageClosePrice", exit_price))
+                else:
+                    resp.raise_for_status()
+                    fill = resp.json().get("orderFillTransaction")
+                    if not fill:
+                        reason = (resp.json().get("orderCancelTransaction") or {}).get("reason", "no fill")
+                        raise ValueError(f"close cancelled: {reason}")
+                    pnl = float(fill.get("pl", pnl))  # account currency (USD)
+                    exit_price = float(fill.get("price", exit_price))
+            except Exception as e:
+                # Leave the position open so the monitor retries next tick.
+                self.notifier.notify("warning", f"Failed to close {pos['symbol']} on OANDA: {e}",
+                                     priority="high")
+                return
 
         # Get trade metadata
         from sqlalchemy.orm import Session

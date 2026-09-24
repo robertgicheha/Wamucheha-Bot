@@ -21,10 +21,13 @@ services:
       - ./config:/app/config:ro
       - engine-data:/app/data
       - ml-models:/app/ml/saved_models
+    environment:
+      MT5_RPC_HOST: mt5          # compose service name (systemd deploy uses 127.0.0.1 from .env)
     networks:
       - trading-net
     depends_on:
       - dashboard
+      - mt5
     healthcheck:
       test: ["CMD", "python", "-c", "import requests; requests.get('http://dashboard:8000/health', timeout=5)"]
       interval: 60s
@@ -79,6 +82,30 @@ services:
     restart: unless-stopped
     env_file: .env
     entrypoint: ["python", "scripts/heartbeat_monitor.py"]
+    networks:
+      - trading-net
+
+  # Service 5: MetaTrader 5 terminal (Windows app, runs under Wine) + RPyC
+  # bridge serving the MetaTrader5 Python module. Logs in automatically from
+  # MT5_LOGIN/MT5_PASSWORD/MT5_SERVER and restarts the terminal if it crashes.
+  # The engine reaches it via MT5_RPC_HOST (see core/mt5_client.py).
+  # Ports are bound to localhost only: 18812 serves the bot (systemd deploy
+  # connects to 127.0.0.1), 8080/5901 are the noVNC screen — open it through an
+  # SSH tunnel: ssh -L 8080:localhost:8080 -L 5901:localhost:5901 user@vps
+  mt5:
+    image: lprett/mt5linux:1.1.1
+    container_name: trading-mt5
+    restart: unless-stopped
+    environment:
+      MT5_HOST: 0.0.0.0
+      MT5_LOGIN: ${MT5_LOGIN}
+      MT5_PASSWORD: ${MT5_PASSWORD}
+      MT5_SERVER: ${MT5_SERVER}
+      VNC_PASSWORD: ${MT5_VNC_PASSWORD:-change_me}
+    ports:
+      - "127.0.0.1:18812:18812"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:5901:5901"
     networks:
       - trading-net
 
