@@ -187,6 +187,18 @@
           <div class="card-value" id="netPnl">$0.00</div>
           <div class="card-sub" id="profitFactor">PF: 0.00</div>
         </div>
+        <div class="card stat-card">
+          <div class="icon" style="background:rgba(16,185,129,.2)">🏦</div>
+          <div class="card-title">Total Account Value</div>
+          <div class="card-value" id="totalAccountValue">$0.00</div>
+          <div class="card-sub" id="stakeAmount">Stake (protected): $0.00</div>
+        </div>
+        <div class="card stat-card">
+          <div class="icon" style="background:rgba(99,102,241,.2)">🎯</div>
+          <div class="card-title">Return on Trading Capital</div>
+          <div class="card-value" id="roiPct">0.00%</div>
+          <div class="card-sub" id="initialFunding">Funded: $0.00</div>
+        </div>
       </div>
 
       <!-- Main area: Chart + Sidebar -->
@@ -203,9 +215,16 @@
               <span style="color:var(--text-muted)">Loading...</span>
             </div>
           </div>
+          <!-- Exchange / API Health -->
+          <div class="card" style="margin-bottom:16px">
+            <div class="card-title">Exchange API Health</div>
+            <div id="exchangeHealthCard" style="padding:8px 0;font-size:13px">
+              <span style="color:var(--text-muted)">Loading...</span>
+            </div>
+          </div>
           <!-- Open Positions -->
           <div class="card">
-            <div class="card-title">Open Positions</div>
+            <div class="card-title">Open Positions / Orders</div>
             <div id="openPositions" style="max-height:250px;overflow-y:auto">
               <span style="color:var(--text-muted)">No open positions</span>
             </div>
@@ -260,6 +279,15 @@
           <div class="card" style="margin-bottom:16px">
             <div class="card-title">Performance by Symbol</div>
             <div id="symbolStatsCard" style="max-height:300px;overflow-y:auto"></div>
+          </div>
+          <div class="card" style="margin-bottom:16px">
+            <div class="card-title">Strategy Accuracy <span style="color:var(--text-muted);font-weight:400;text-transform:none">— win rate per sub-strategy</span></div>
+            <div class="table-wrap" style="max-height:280px">
+              <table>
+                <thead><tr><th>Strategy</th><th>Trades</th><th>Win Rate</th><th>Avg PnL</th></tr></thead>
+                <tbody id="strategyStatsTable"></tbody>
+              </table>
+            </div>
           </div>
           <div class="card">
             <div class="card-title">All-Time Stats</div>
@@ -473,7 +501,7 @@ function showTab(tab, el) {
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   if (el) el.classList.add('active');
   if (tab === 'charts') loadChartData();
-  if (tab === 'trades') { loadHistory(); loadSymbolStats(); loadAllTimeStats(); }
+  if (tab === 'trades') { loadHistory(); loadSymbolStats(); loadAllTimeStats(); loadStrategyStats(); }
   if (tab === 'logs') loadLogs();
   if (tab === 'orderbook') simulateOrderBook();
   if (tab === 'investing') loadLongTerm();
@@ -550,6 +578,34 @@ function updateDashboard(data) {
   // Load async data
   loadRecentTrades();
   loadHourlyReports();
+  loadAccount();
+  loadExchangeHealth();
+}
+
+async function loadAccount() {
+  const a = await api('/api/account');
+  document.getElementById('totalAccountValue').textContent = `$${(a.total_account_value||0).toFixed(2)}`;
+  document.getElementById('stakeAmount').textContent = `Stake (protected): $${(a.stake_amount||0).toFixed(2)}`;
+  const roi = a.roi_pct||0;
+  const roiEl = document.getElementById('roiPct');
+  roiEl.textContent = `${roi>=0?'+':''}${roi.toFixed(2)}%`;
+  roiEl.className = 'card-value ' + (roi >= 0 ? 'green' : 'red');
+  document.getElementById('initialFunding').textContent = `Funded: $${(a.initial_funding||0).toFixed(2)}`;
+}
+
+async function loadExchangeHealth() {
+  const health = await api('/api/exchange-health');
+  const el = document.getElementById('exchangeHealthCard');
+  const entries = Object.entries(health);
+  if (entries.length === 0) {
+    el.innerHTML = '<span class="tag risk-on">All exchanges healthy</span>';
+    return;
+  }
+  el.innerHTML = entries.map(([ex, h]) => `
+    <span class="tag ${h.healthy ? 'risk-on' : 'risk-off'}" style="margin:2px" title="${h.last_error||''}">
+      ${ex}: ${h.healthy ? 'healthy' : h.failures_last_5m + ' failures/5m'}
+    </span>
+  `).join('');
 }
 
 // ==================== Recent Trades ====================
@@ -795,6 +851,27 @@ async function loadAllTimeStats() {
   `;
 }
 
+async function loadStrategyStats() {
+  const data = await api('/api/strategy-stats');
+  const tbody = document.getElementById('strategyStatsTable');
+  const strategies = data.strategies || {};
+  const underperforming = new Set(data.underperforming || []);
+  const rows = Object.entries(strategies).sort((a, b) => b[1].win_rate - a[1].win_rate);
+  if (rows.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" style="color:var(--text-muted)">No closed trades yet</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(([name, s]) => {
+    const flagged = underperforming.has(name);
+    return `<tr>
+      <td><b>${name}</b>${flagged ? ' <span class="tag sell" style="font-size:9px">underperforming</span>' : ''}</td>
+      <td>${s.trades}</td>
+      <td class="${s.win_rate>=50?'trade-win':'trade-loss'}">${s.win_rate.toFixed(1)}%</td>
+      <td class="${s.avg_pnl>=0?'trade-win':'trade-loss'}">$${s.avg_pnl.toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+}
+
 // ==================== Order Book (Simulated) ====================
 async function simulateOrderBook() {
   try {
@@ -988,10 +1065,14 @@ async function resumeTrading() {
 loadEquityChart();
 loadRecentTrades();
 loadHourlyReports();
+loadAccount();
+loadExchangeHealth();
 
 // Refresh periodically
 setInterval(loadRecentTrades, 15000);
 setInterval(loadHourlyReports, 60000);
+setInterval(loadAccount, 15000);
+setInterval(loadExchangeHealth, 30000);
 </script>
 </body>
 </html>

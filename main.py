@@ -66,12 +66,26 @@ if _env_stake is not None:
     except ValueError:
         print(f"WARNING: Invalid STAKE_AMOUNT '{_env_stake}' in .env — using config.yaml default")
 
+<<<<<<< HEAD
+# Separate from the stake: how much capital you're actually choosing to
+# trade with. Only takes effect on true first run (see StateManager) — on
+# every later start this is a no-op and the persisted, accumulated balance
+# is what's used, same as before this existed.
+_env_initial_balance = os.environ.get("INITIAL_TRADING_BALANCE")
+INITIAL_TRADING_BALANCE = 0.0
+if _env_initial_balance is not None:
+    try:
+        INITIAL_TRADING_BALANCE = float(_env_initial_balance)
+    except ValueError:
+        print(f"WARNING: Invalid INITIAL_TRADING_BALANCE '{_env_initial_balance}' in .env — treating as unset")
+=======
 _env_balance = os.environ.get("TRADING_BALANCE")
 if _env_balance is not None:
     try:
         CONFIG["account"]["trading_balance"] = float(_env_balance)
     except ValueError:
         print(f"WARNING: Invalid TRADING_BALANCE '{_env_balance}' in .env — using config.yaml default")
+>>>>>>> 2135efce8ad13ff0406f6b4e9e4c74f672e7604d
 
 
 def build_notifier():
@@ -225,7 +239,10 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
 
 def main():
     notifier = build_notifier()
-    state = StateManager(stake_amount=CONFIG["account"]["stake_amount"])
+    state = StateManager(
+        stake_amount=CONFIG["account"]["stake_amount"],
+        initial_trading_balance=INITIAL_TRADING_BALANCE,
+    )
     risk = RiskManager(state, CONFIG, notifier)
 
     # A fresh state DB starts at trading_balance=0, and the risk manager
@@ -239,6 +256,17 @@ def main():
 
     risk_state = state.get_risk_state()
     notifier.update_start_balance(risk_state.get("trading_balance", 0))
+
+    if risk_state.get("trading_balance", 0) <= 0:
+        print(
+            "\n*** WARNING: trading_balance is $0 — every trade will be blocked by the "
+            "risk manager (RiskManager.pre_trade_check refuses to size a position against "
+            "a zero-or-negative balance) until you fund it. This is separate from "
+            "STAKE_AMOUNT (which stays protected and is never traded). Set "
+            "INITIAL_TRADING_BALANCE in .env and restart to seed it on first run — this "
+            "only takes effect once, on true first run; it will NOT touch an existing, "
+            "already-funded balance. ***\n"
+        )
 
     feed_router = FeedRouter(CONFIG)
     log_system_event("startup", f"Active feeds: {list(feed_router.get_available_feeds().keys())}")

@@ -10,6 +10,11 @@ Endpoints:
   GET  /api/equity            -> equity curve data
   GET  /api/symbol-stats      -> per-symbol performance
   GET  /api/hourly-logs       -> hourly report history
+  GET  /api/account           -> stake + trading balance + ROI%
+  GET  /api/strategy-stats    -> per-strategy accuracy/win-rate
+  GET  /api/exchange-health   -> per-exchange API failure rate
+  GET  /api/slippage          -> signal-vs-fill execution quality
+  GET  /api/long-term/summary -> long-term buy/sell candidates + movers
   GET  /api/open-positions    -> current open positions
   POST /api/kill-switch       -> emergency halt (auth required)
   POST /api/resume            -> resume trading (auth required)
@@ -23,6 +28,7 @@ import sys
 import asyncio
 import subprocess
 import time
+import yaml
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -36,6 +42,17 @@ sys.path.append(str(Path(__file__).parent.parent))
 from core.state_manager import StateManager, SNAPSHOT_PATH
 from alerts.notifier import Notifier, EVENT_LOG, TRADE_LOG
 from reporting.hourly_report import read_hourly_log
+from core.structured_logger import slippage_tracker, api_failure_tracker, strategy_perf_tracker
+
+_CONFIG_PATH = Path(__file__).parent.parent / "config" / "config.yaml"
+with open(_CONFIG_PATH) as _f:
+    CONFIG = yaml.safe_load(_f)
+_env_stake = os.environ.get("STAKE_AMOUNT")
+if _env_stake is not None:
+    try:
+        CONFIG["account"]["stake_amount"] = float(_env_stake)
+    except ValueError:
+        pass
 
 app = FastAPI(title="Wamucheha Trading Bot Dashboard")
 app.add_middleware(
@@ -159,7 +176,7 @@ def trades(n: int = 20):
 
 
 @app.get("/api/trades/history")
-def trade_history(symbol: str = None, hours: int = None, n: int = 50):
+def trade_history(symbol: str | None = None, hours: int | None = None, n: int = 50):
     state = _get_state()
     if hours:
         trades = state.get_trades_by_timeframe(hours)
@@ -198,6 +215,64 @@ def symbol_stats():
 @app.get("/api/hourly-logs")
 def hourly_logs(n: int = 24):
     return {"hourly_logs": read_hourly_log(n)}
+
+
+@app.get("/api/account")
+def account():
+    """Full account picture: protected stake (never traded) + trading
+    balance (at risk) + ROI, so 'my balance' means something complete
+    rather than just the at-risk figure."""
+    state = _get_state()
+    risk_state = state.get_risk_state()
+    stats = state.get_all_time_stats()
+
+    stake_amount = CONFIG.get("account", {}).get("stake_amount", 0.0)
+    trading_balance = risk_state.get("trading_balance", 0.0)
+    net_pnl = stats.get("net_pnl", 0.0)
+    # trading_balance = initial_funding + net_pnl, so initial_funding is
+    # recoverable without a separate persisted field.
+    initial_funding = trading_balance - net_pnl
+    roi_pct = (net_pnl / initial_funding * 100) if initial_funding > 0 else 0.0
+
+    return {
+        "stake_amount": stake_amount,
+        "trading_balance": trading_balance,
+        "peak_balance": risk_state.get("peak_balance", 0.0),
+        "total_account_value": stake_amount + trading_balance,
+        "initial_funding": round(initial_funding, 2),
+        "net_pnl": net_pnl,
+        "roi_pct": round(roi_pct, 2),
+        "daily_pnl": risk_state.get("daily_pnl", 0.0),
+        "consecutive_losses": risk_state.get("consecutive_losses", 0),
+        "trading_halted": bool(risk_state.get("trading_halted", 0)),
+        "halt_reason": risk_state.get("halt_reason"),
+    }
+
+
+@app.get("/api/strategy-stats")
+def strategy_stats():
+    """Per-strategy accuracy: win rate, trade count, and PnL for each of the
+    20 sub-strategies, computed from actual closed-trade outcomes (see
+    core/structured_logger.StrategyPerformanceTracker) — this is the
+    'which strategies are actually right' view, distinct from overall
+    win rate."""
+    return {
+        "strategies": strategy_perf_tracker.get_strategy_stats(),
+        "underperforming": strategy_perf_tracker.get_underperforming(),
+    }
+
+
+@app.get("/api/exchange-health")
+def exchange_health():
+    """Per-exchange API failure rate over the last 5 minutes — a more
+    specific health signal than the overall /health check."""
+    return api_failure_tracker.get_health()
+
+
+@app.get("/api/slippage")
+def slippage():
+    """Execution quality: signal price vs actual fill price."""
+    return slippage_tracker.get_stats()
 
 
 # ---------- Long-Term Investing ----------

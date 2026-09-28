@@ -150,20 +150,30 @@ def _safe_migrate():
 
 
 class StateManager:
-    def __init__(self, stake_amount: float):
+    def __init__(self, stake_amount: float, initial_trading_balance: float = 0):
+        """stake_amount is accepted for API-compat with existing callers but
+        intentionally NEVER used to seed trading_balance — the stake is
+        protected principal that must stay structurally excluded from
+        anything the risk manager sizes positions against (see
+        docs/COMMON_MISTAKES.md #12). initial_trading_balance is the
+        separate, explicit amount of capital you're choosing to actively
+        trade with; it only seeds the row on true first run (never
+        overwrites accumulated balance on restart) — see main.py's
+        INITIAL_TRADING_BALANCE env var."""
         DB_PATH.parent.mkdir(parents=True, exist_ok=True)
         BACKUP_DIR.mkdir(parents=True, exist_ok=True)
         _safe_migrate()
         Base.metadata.create_all(engine)
-        self._init_row(stake_amount)
+        self._init_row(initial_trading_balance)
 
-    def _init_row(self, stake_amount: float):
+    def _init_row(self, initial_trading_balance: float):
         with Session(engine) as session:
             row = session.get(RiskStateRow, 1)
             if row is None:
                 session.add(RiskStateRow(
                     id=1,
-                    trading_balance=0,
+                    trading_balance=max(initial_trading_balance, 0),
+                    peak_balance=max(initial_trading_balance, 0),
                     daily_reset_at=self._today(),
                     updated_at=self._now(),
                 ))
