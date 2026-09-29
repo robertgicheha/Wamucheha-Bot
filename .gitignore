@@ -21,3 +21,4 @@ ml/saved_models/*.npz
 *.egg-info/
 dist/
 build/
+.env
