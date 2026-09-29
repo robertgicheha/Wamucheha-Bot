@@ -62,7 +62,7 @@ class DiscordControlBot:
 
         intents = discord.Intents.default()
         intents.message_content = True
-        self._bot = commands.Bot(command_prefix="!", intents=intents)
+        self._bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
         @self._bot.event
         async def on_ready():
