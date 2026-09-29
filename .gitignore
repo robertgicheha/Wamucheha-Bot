@@ -24,3 +24,4 @@ ml/saved_models/*.npz
 dist/
 build/
 .env
+*.bak
