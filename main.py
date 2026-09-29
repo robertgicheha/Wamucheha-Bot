@@ -73,13 +73,13 @@ if _env_stake is not None:
 # trade with. Only takes effect on true first run (see StateManager) — on
 # every later start this is a no-op and the persisted, accumulated balance
 # is what's used, same as before this existed.
-_env_initial_balance = os.environ.get("INITIAL_TRADING_BALANCE")
+_env_initial_balance = os.environ.get("TRADING_BALANCE")
 INITIAL_TRADING_BALANCE = 0.0
 if _env_initial_balance is not None:
     try:
         INITIAL_TRADING_BALANCE = float(_env_initial_balance)
     except ValueError:
-        print(f"WARNING: Invalid INITIAL_TRADING_BALANCE '{_env_initial_balance}' in .env — treating as unset")
+        print(f"WARNING: Invalid TRADING_BALANCE '{_env_initial_balance}' in .env — treating as unset")
 
 # Fallback seed for a fresh state DB, applied in main() once peak_balance
 # is still 0. Independent of INITIAL_TRADING_BALANCE, which StateManager
