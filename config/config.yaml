@@ -306,12 +306,16 @@ alerts:
     - window_report
     - daily_report
 
-# Two scheduled reports, both deliberately infrequent. Individual trades are
-# announced the moment they close, so a periodic report has no job restating
-# them — its only job is to aggregate. Hourly (the old behaviour) meant 24
-# messages a day that mostly read "0 trades, unchanged", which is how the two
-# messages a week that actually need a human get swiped past.
+# Three scheduled reports. The digest is the one you will read most, and the
+# only one that is allowed to be silent: a 5-minute window with no closed
+# trade sends nothing at all. That silence is deliberate — a message with no
+# trade in it can only say "still nothing", and hearing that twelve times an
+# hour is how a channel gets trained into being ignored.
+#
+# The window reports are deliberately infrequent. Hourly (the old behaviour)
+# meant 24 messages a day that mostly read "0 trades, unchanged".
 reporting:
+  digest_interval_seconds: 300   # trade digest window; empty windows send nothing
   window_report_hours: 6         # "is this working right now?" — net of costs
   day_report_hours: 24           # "was the bot on, and what did the day cost?"
   # The 24h report leads with uptime and restart count, because a P&L figure

@@ -13,9 +13,11 @@ Two scheduled reports, and only two.
 Why not hourly: the old hourly summary fired 24 times a day, most of them
 saying "0 trades, 0.00, unchanged". That trains a reader to swipe past the
 channel, and the two alerts a week that actually need a human get swiped
-along with them. Every individual trade is messaged the instant it closes,
-so a periodic report has no job restating them. A periodic report's only
-reason to exist is to aggregate and conclude.
+along with them. Individual trades are reported in the 5-minute digest, which
+covers the detail; a periodic report's only reason to exist is to aggregate
+across a period too long to hold in your head and conclude. If these two
+reports also restated trades, the reader would be told the same fill three
+times at three different scales and would reasonably stop reading all three.
 
 Why the 24-hour report runs even with no trades: "the bot has been on, it
 placed nothing, and here is why that is the right outcome" is a real and

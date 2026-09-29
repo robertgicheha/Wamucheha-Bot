@@ -20,6 +20,104 @@ FLAT = "▬"     # ▬ nothing moved
 ARROW_RIGHT = "➜"   # from -> to
 ARROW_UP = "↗"
 ARROW_DOWN = "↘"
+BULLET = "•"
+
+# ── Asset class ──────────────────────────────────────────────────────────
+# Every log line says what KIND of market produced the result. "ETH/USDT made
+# 4.10" and "XAUUSD made 4.10" are not the same fact, and a reader cannot
+# tell from a symbol alone which rules, which session hours and which margin
+# regime applied. Naming the class is what makes a P&L line interpretable.
+E_CRYPTO = "🪙"
+E_FOREX = "💱"
+E_METAL = "🥇"
+E_EQUITY = "🏛"
+E_BOND = "📜"
+E_NSE = "🇰🇪"
+E_OTHER = "🧩"
+
+ASSET_CLASS_META = {
+    "crypto":         (E_CRYPTO, "CRYPTO",      "spot crypto, 24/7"),
+    "forex":          (E_FOREX, "FOREX",       "currency pairs"),
+    "commodities":    (E_METAL, "GOLD/METALS", "precious metals"),
+    "equities":       (E_EQUITY, "EQUITIES",   "US stocks & ETFs"),
+    "fixed_income":   (E_BOND,  "BONDS",       "treasuries & ETFs"),
+    "nse":            (E_NSE,   "NSE",         "Kenyan equities"),
+}
+UNKNOWN_CLASS = (E_OTHER, "OTHER", "")
+
+# How many trades in one window get the full multi-line treatment. Past this,
+# the rest collapse to a single attributed line each. Sized so a full digest
+# stays inside Telegram's 4096-character message limit with the rollup
+# sections below it, which is what fails first when a window is busy. The
+# sender splits anything longer as a backstop, but a split digest arrives as
+# two notifications to dismiss, so the renderer is kept short on purpose.
+MAX_DETAILED_TRADES = 3
+
+# ── Venue ────────────────────────────────────────────────────────────────
+# A number is only attributable to a venue if the venue is named. "Profitable
+# on 6 venues" and "profitable because one venue paid out" are the same log
+# line until the venue is attached to it.
+VENUE_META = {
+    "binance": "Binance",
+    "okx":     "OKX",
+    "bybit":   "Bybit",
+    "kraken":  "Kraken",
+    "oanda":   "OANDA",
+    "alpaca":  "Alpaca",
+    "mt5":     "MetaTrader 5",
+    "paper":   "Paper",
+}
+# Venues whose balances are not USDT in a hot wallet — the operator funds
+# these through a broker dashboard, not a chain transfer. Worth saying in a
+# log line so nobody waits for an on-chain deposit that was never coming.
+BROKER_VENUES = {"mt5", "oanda", "alpaca"}
+
+
+def venue_name(venue: str) -> str:
+    v = (venue or "").strip().lower()
+    if not v:
+        return "Unknown venue"
+    return VENUE_META.get(v, v.upper())
+
+
+def asset_class(symbol: str) -> str:
+    """Classify a symbol. Prefers the risk manager's canonical map so a log
+    line and a risk cap can never disagree about what a market is."""
+    from core.risk_manager import ASSET_CLASS_MAP
+    sym = (symbol or "").strip()
+    if not sym:
+        return "other"
+    if sym in ASSET_CLASS_MAP:
+        return ASSET_CLASS_MAP[sym]
+    upper = sym.upper()
+    for candidate, cls in ASSET_CLASS_MAP.items():
+        if candidate.upper() == upper:
+            return cls
+    # Not in the configured map. Fall back on shape so an unlisted market is
+    # still described honestly rather than silently bucketed as crypto.
+    if "XAU" in upper or "XAG" in upper or "GLD" in upper:
+        return "commodities"
+    if "/" in sym:
+        base, _, quote = sym.partition("/")
+        if quote.upper() in {"USDT", "USDC", "BUSD", "FDUSD", "USD", "EUR", "GBP"}:
+            # USDT/USDC/BUSD quote a coin; USD/EUR/GBP quote a currency.
+            if quote.upper() in {"USDT", "USDC", "BUSD", "FDUSD"}:
+                return "crypto"
+            return "forex" if len(base) <= 4 else "crypto"
+    return "other"
+
+
+def market_tag(symbol: str, venue: str = "") -> str:
+    """'🪙 CRYPTO · Binance' — the what-and-where prefix every trade line
+    carries. Class first, because that is what shapes the trade; venue second,
+    because that is what tells you who held the money."""
+    icon, label, _ = ASSET_CLASS_META.get(asset_class(symbol), UNKNOWN_CLASS)
+    who = venue_name(venue)
+    return f"{icon} {label} {BULLET} {who}"
+
+
+def class_label(symbol: str) -> str:
+    return ASSET_CLASS_META.get(asset_class(symbol), UNKNOWN_CLASS)[1]
 
 
 def arrow(value: float, flat_eps: float = 1e-9) -> str:
@@ -173,3 +271,50 @@ def daily_block(daily: dict, balance: float = None, net_after_costs: bool = True
     if balance is not None:
         lines.append(f"{E_BALANCE} <b>BALANCE</b>  <code>{money(balance)} USD</code>")
     return "\n".join(lines)
+
+
+# ── Derived quality metrics ──────────────────────────────────────────────
+# These are the numbers that decide whether to keep running the bot, and they
+# are defined here — once — so the digest, the 6-hour report, the dashboard
+# and the control bots cannot each mean something different by "efficiency".
+
+def accuracy_pct(wins: int, total: int) -> float:
+    """Share of closed trades that made money, after costs."""
+    return (wins / total * 100) if total else 0.0
+
+
+def efficiency_pct(net_pnl: float, gross_pnl: float) -> float:
+    """What fraction of the price move survived execution costs.
+
+    This is the metric that catches a strategy which is right and still losing
+    money. A 70%-win-rate system paying 10bps a side on 3% targets keeps ~93%
+    of its gross; one paying 30bps keeps ~80%, and the difference is invisible
+    in a win rate. Above 100% means fees were refunded or the gross figure is
+    understated; below 60% means costs are eating the edge, not the entries.
+    """
+    if gross_pnl <= 0:
+        return 0.0
+    return net_pnl / gross_pnl * 100
+
+
+def capital_efficiency_pct(net_pnl: float, balance: float) -> float:
+    """Return on capital actually at risk, per the period."""
+    return (net_pnl / balance * 100) if balance else 0.0
+
+
+def expectancy_pct(net_pnl: float, trades: int, balance: float) -> float:
+    """Average net result per trade, as a percentage of the balance at risk.
+    The single number that says whether repeating this is worth it."""
+    if not trades or not balance:
+        return 0.0
+    return (net_pnl / trades / balance) * 100
+
+
+def avg_win_loss(pnls: list) -> tuple:
+    """(mean win, mean loss) in currency. Both are positive magnitudes; the
+    loss is what was given up, not a negative to be summed."""
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    avg_win = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0.0
+    return avg_win, abs(avg_loss)

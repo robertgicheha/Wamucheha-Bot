@@ -12,6 +12,10 @@ real-time control and monitoring via Telegram commands with HTML formatting:
 /performance - Per-symbol performance breakdown
 /equity    - Equity curve data
 /hourly    - Recent hourly reports
+/digest    - Last 5-minute trade digests
+/cash      - Funded vs returned vs profit, kept separate
+/deposit   - Log capital moved into a venue
+/withdraw  - Log capital taken out of a venue
 /kill      - Emergency halt all trading
 /resume    - Resume trading after review
 /venues    - Per-venue exposure and kill-switch state
@@ -24,6 +28,8 @@ import json
 import html
 import logging
 import threading
+
+from alerts import formatting as f
 
 try:
     from telegram import Update
@@ -51,6 +57,24 @@ def _esc_html(value) -> str:
     """Telegram sends these as parse_mode=HTML, so operator-supplied arguments
     (venue names, reasons) must be escaped before they are interpolated."""
     return html.escape(str(value), quote=False)
+
+
+def _parse_amount(args) -> tuple:
+    """('/deposit', '250', 'binance') -> (250.0, 'binance').
+
+    Returns (0.0, '') on anything unusable, including a negative amount: this
+    writes to a ledger, and a mistyped sign there is a lie that outlives the
+    command."""
+    if not args:
+        return 0.0, ""
+    try:
+        amount = float(str(args[0]).replace(",", "").replace("$", ""))
+    except (ValueError, TypeError):
+        return 0.0, ""
+    if amount <= 0:
+        return 0.0, ""
+    venue = _esc_html(args[1]).lower() if len(args) > 1 else ""
+    return amount, venue
 
 
 def _pnl_color(pnl: float) -> str:
@@ -83,6 +107,10 @@ class TelegramControlBot:
         self._app.add_handler(CommandHandler("performance", self._cmd_performance))
         self._app.add_handler(CommandHandler("equity", self._cmd_equity))
         self._app.add_handler(CommandHandler("hourly", self._cmd_hourly))
+        self._app.add_handler(CommandHandler("deposit", self._cmd_deposit))
+        self._app.add_handler(CommandHandler("withdraw", self._cmd_withdraw))
+        self._app.add_handler(CommandHandler("cash", self._cmd_cash))
+        self._app.add_handler(CommandHandler("digest", self._cmd_digest))
         self._app.add_handler(CommandHandler("kill", self._cmd_kill))
         self._app.add_handler(CommandHandler("resume", self._cmd_resume))
         self._app.add_handler(CommandHandler("venues", self._cmd_venues))
@@ -185,7 +213,11 @@ class TelegramControlBot:
         state = self._get_state()
         stats = state.get_all_time_stats()
 
-        pf = stats.get('profit_factor', 0)
+        # Net of execution costs, because that is the number that decides
+        # whether to keep running. The gross ratio is shown beside it so the
+        # gap between them is visible — that gap is what the fees cost.
+        pf = stats.get('profit_factor_net', 0)
+        pf_gross = stats.get('profit_factor', 0)
         pf_emoji = "🟢" if pf >= 1.5 else "🟡" if pf >= 1 else "🔴"
 
         msg = (
@@ -203,7 +235,8 @@ class TelegramControlBot:
             f"<b>⚡ Extremes</b>\n"
             f"  Best Trade:  <code>🟢 {stats.get('best_trade', 0):+.2f}</code>\n"
             f"  Worst Trade:  <code>🔴 {stats.get('worst_trade', 0):+.2f}</code>\n"
-            f"  {pf_emoji} Profit Factor:  <code>{pf:.2f}</code>"
+            f"  {pf_emoji} Profit Factor:  <code>{pf:.2f}</code> <i>net of costs</i>"
+            f"\n  <i>before costs: {pf_gross:.2f} — the gap is what fees cost</i>"
         )
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -357,6 +390,138 @@ class TelegramControlBot:
 
         await update.message.reply_text(msg, parse_mode="HTML")
 
+    # ---------- capital in / out ----------
+    # The bot never moves money, so these commands are how the ledger learns
+    # that it did. Without them a deposit is indistinguishable from a run of
+    # winning trades in every balance-based number the bot reports.
+
+    async def _cmd_deposit(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        parsed = _parse_amount(context.args)
+        if not parsed:
+            await update.message.reply_text(
+                "Usage: <code>/deposit 250</code> or <code>/deposit 250 binance</code>")
+            return
+        amount, venue = parsed
+        state = self._get_state()
+        state.record_cash_flow("deposit", amount, venue=venue,
+                               note=f"declared via Telegram by {update.effective_user.id}")
+        await update.message.reply_text(
+            f"📥 <b>DEPOSIT LOGGED</b>\n\n"
+            f"<code>+{amount:,.2f} USD</code> ➜ {venue or 'the account'}\n\n"
+            f"<i>Counted as capital in, not profit. Use /cash to see the split.</i>",
+            parse_mode="HTML")
+
+    async def _cmd_withdraw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        parsed = _parse_amount(context.args)
+        if not parsed:
+            await update.message.reply_text(
+                "Usage: <code>/withdraw 250</code> or <code>/withdraw 250 binance</code>")
+            return
+        amount, venue = parsed
+        state = self._get_state()
+        state.record_cash_flow("withdrawal", amount, venue=venue,
+                               note=f"declared via Telegram by {update.effective_user.id}")
+        await update.message.reply_text(
+            f"📤 <b>WITHDRAWAL LOGGED</b>\n\n"
+            f"<code>−{amount:,.2f} USD</code> ➜ {venue or 'from the account'}\n\n"
+            f"<i>Your capital leaving, not a loss. The bot does not move funds — "
+            f"this records what you did.</i>",
+            parse_mode="HTML")
+
+    async def _cmd_digest(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """The 5-minute digests, most recent first. The same message the channel
+        received, so asking the bot what it said and trusting what it said are
+        the same thing."""
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        from reporting.trade_digest import read_digests
+        digests = read_digests(6)
+
+        if not digests:
+            await update.message.reply_text(
+                "🕐 <b>No digests yet.</b>\n\n"
+                "<i>A digest is only written when a trade closes. Silence here "
+                "means no trades have closed yet — check /status for the bot's "
+                "health.</i>", parse_mode="HTML")
+            return
+
+        for d in digests:
+            net = float(d.get("net_pnl", 0.0))
+            # Absent means the digest could not reconstruct the window start,
+            # which is different from a start of zero.
+            bal_before = d.get("balance_before")
+            bal_before = float(bal_before) if bal_before is not None else None
+            bal_now = float(d.get("balance_now", 0.0))
+            icon = "🟢" if net > 0 else ("🔴" if net < 0 else "⚪")
+            classes = sorted({f.asset_class(t["symbol"])
+                              for t in (d.get("trades") or [])})
+            balance_text = (f"   💼 {bal_before:,.2f} ➜ {bal_now:,.2f} USD"
+                            if bal_before is not None else
+                            f"   💼 {bal_now:,.2f} USD"
+                            f"  <i>(window start not derivable)</i>")
+            lines = [
+                f"{icon} <b>{d.get('ts', '')[:16].replace('T', ' ')}Z</b>  "
+                f"<code>{d.get('trade_count', 0)}</code> trade(s)  "
+                f"net <code>{net:+.2f} USD</code>",
+                balance_text +
+                f"  ·  ⛽ {float(d.get('fees', 0)):4f} cost",
+            ]
+            for t in (d.get("trades") or []):
+                lines.append(
+                    f"   {'🟢' if t['pnl'] > 0 else '🔴'} {t['symbol']} "
+                    f"{'LONG' if t['side'] == 'buy' else 'SHORT'} · "
+                    f"{f.venue_name(t['exchange'])} · "
+                    f"{t['entry_price']} ➜ {t['exit_price']} · "
+                    f"<code>{t['pnl']:+.2f}</code>")
+            if classes:
+                lines.append(f"   <i>classes: {', '.join(classes)}</i>")
+            lines.append("")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+    async def _cmd_cash(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """The three numbers that must never be added together: what you put
+        in, what the bot earned, and what you took back out."""
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        state = self._get_state()
+        cash = state.get_cash_flow_totals()
+        risk_state = state.get_risk_state()
+        stats = state.get_all_time_stats()
+
+        arrow = lambda v: "🟢" if v > 0 else ("🔴" if v < 0 else "⚪")
+        msg = [
+            "<b>🏦 CAPITAL vs PROFIT</b>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"📥 <b>Funded</b>      <code>{cash['deposited']:,.2f} USD</code>",
+            f"📤 <b>Returned</b>    <code>{cash['returned']:,.2f} USD</code>"
+            f"  <i>your capital, not profit</i>",
+            f"🏦 <b>Profit swept</b>  <code>{cash['swept']:,.2f} USD</code>"
+            f"  <i>earned, moved to safety</i>",
+            f"{arrow(cash['profit'])} <b>Profit earned</b> <code>{cash['profit']:+,.2f} USD</code>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            f"💼 <b>Trading balance now</b>  <code>{risk_state.get('trading_balance', 0):,.2f} USD</code>",
+            f"💎 <b>All-time net</b>        <code>{stats.get('net_pnl', 0):+,.2f} USD</code>"
+            f"  <i>· {stats.get('total', 0)} trades · {stats.get('win_rate', 0):.0f}% WR</i>",
+        ]
+        if cash["by_venue"]:
+            msg.append("━━━━━━━━━━━━━━━━━━━━━━")
+            msg.append("🏦 <b>Per venue</b>")
+            for venue, amounts in cash["by_venue"].items():
+                if not any(amounts.values()):
+                    continue
+                msg.append(
+                    f"   <code>{venue}</code>  in <code>{amounts['deposit']:,.2f}</code> · "
+                    f"out <code>{amounts['withdrawal'] + amounts['sweep']:,.2f}</code>")
+        await update.message.reply_text("\n".join(msg), parse_mode="HTML")
+
     async def _cmd_kill(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _is_authorized(update.effective_user.id):
             await update.message.reply_text("Unauthorized.")
@@ -482,12 +647,16 @@ class TelegramControlBot:
             "  /performance — Per-symbol breakdown\n"
             "  /equity — Equity curve\n"
             "  /hourly — Hourly reports\n"
+            "  /digest — Last 5-minute trade digests\n"
+            "  /cash — Funded vs returned vs profit\n"
             "  /venues — Per-venue exposure & kill switch state\n\n"
             "<b>Control:</b>\n"
             "  /kill — Emergency halt trading\n"
             "  /resume — Resume trading\n"
             "  /disable_venue [venue] [reason] — block new entries on one venue\n"
-            "  /enable_venue [venue] — allow entries again\n\n"
+            "  /enable_venue [venue] — allow entries again\n"
+            "  /deposit [amount] [venue] — log capital you moved in\n"
+            "  /withdraw [amount] [venue] — log capital you took out\n\n"
             "  /help — This message"
         )
         await update.message.reply_text(msg, parse_mode="HTML")

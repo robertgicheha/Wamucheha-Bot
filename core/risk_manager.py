@@ -322,12 +322,25 @@ class RiskManager:
         if risk_state["trading_balance"] >= threshold:
             swept = risk_state["trading_balance"] - keep
             self.state.update_risk_state(trading_balance=keep)
+            # Record the movement before announcing it. Without this row the
+            # balance drops by `swept` and every later report reads that drop
+            # as trading losses, which is the single most misleading thing this
+            # system could print. The ledger is what lets the digest say
+            # "profit returned to your stake wallet" instead of "-280.00".
+            try:
+                self.state.record_cash_flow(
+                    "sweep", swept,
+                    note=(f"auto-sweep at {threshold:.0f} USD threshold, "
+                          f"kept {keep:.0f} USD trading"),
+                )
+            except Exception:
+                pass
             self.notifier.notify(
                 "profit_swept_to_stake",
-                f"Trading balance hit {risk_state['trading_balance']:.2f}. "
-                f"Swept {swept:.2f} USD to stake wallet (manual transfer required — "
-                f"the bot does NOT have withdrawal permissions by design). "
-                f"Trading continues with {keep:.2f} USD.",
+                f"Trading balance reached {risk_state['trading_balance']:.2f} USD. "
+                f"{swept:.2f} USD of profit moved out to your stake wallet "
+                f"(manual transfer required — the bot has no withdrawal permissions "
+                f"by design). Trading continues with {keep:.2f} USD.",
             )
 
     # ---------- circuit breakers ----------
