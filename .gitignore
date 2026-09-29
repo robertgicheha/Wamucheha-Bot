@@ -14,6 +14,8 @@ data/backups/
 data/nse_cache/
 data/intel_cache/
 data/long_term_state.json
+data/trade_digests.jsonl
+data/digest_watermark.json
 logs/
 ml/saved_models/*.pt
 ml/saved_models/*.keras
