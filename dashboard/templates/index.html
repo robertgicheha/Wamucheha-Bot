@@ -402,6 +402,64 @@
           </div>
         </div>
       </div>
+
+      <!-- ===== NSE Kenya — whole exchange ===== -->
+      <div class="card" style="margin-top:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <div class="card-title" style="margin-bottom:0">🇰🇪 NSE Kenya — All Listed Securities</div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input id="nseSearch" placeholder="Search ticker, name or sector..." style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:6px 12px;border-radius:6px;font-size:12px;width:220px">
+            <select id="nseSort" style="background:var(--bg-secondary);border:1px solid var(--border);color:var(--text-primary);padding:6px 8px;border-radius:6px;font-size:12px">
+              <option value="change_pct">Sort: Day change</option>
+              <option value="pe_ratio">Sort: P/E (low first)</option>
+              <option value="score">Sort: Score</option>
+              <option value="volume">Sort: Volume</option>
+              <option value="ticker">Sort: Ticker</option>
+              <option value="name">Sort: Name</option>
+            </select>
+            <button class="btn btn-primary" onclick="loadNse()">Refresh</button>
+          </div>
+        </div>
+        <div id="nseMeta" style="font-size:11px;color:var(--text-muted);margin:8px 0 4px"></div>
+        <div id="nseNotes"></div>
+        <div class="table-wrap" style="max-height:460px;margin-top:8px">
+          <table>
+            <thead><tr>
+              <th>Ticker</th><th>Name</th><th>Sector</th><th>Price (KES)</th>
+              <th>Day</th><th>Volume</th><th>P/E</th><th>Div yield</th>
+              <th>Score</th><th>View</th>
+            </tr></thead>
+            <tbody id="nseTable"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- NSE detail: charts + projections -->
+      <div class="card" id="nseDetailCard" style="margin-top:16px;display:none">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <div class="card-title" style="margin-bottom:0" id="nseDetailTitle">Security</div>
+          <button class="btn" style="background:var(--bg-secondary);color:var(--text-secondary)" onclick="closeNseDetail()">Close</button>
+        </div>
+        <div id="nseDetailMeta" style="font-size:12px;color:var(--text-secondary);margin:8px 0"></div>
+        <div class="grid" style="grid-template-columns:1fr 1fr;margin-top:8px">
+          <div>
+            <div class="card-title">Closing price (accumulated daily closes)</div>
+            <div class="chart-container"><canvas id="nsePriceChart"></canvas></div>
+          </div>
+          <div>
+            <div class="card-title">Price projection — 95% band</div>
+            <div class="chart-container"><canvas id="nseForecastChart"></canvas></div>
+          </div>
+        </div>
+        <div id="nseForecastNote" style="font-size:11px;color:var(--text-muted);margin-top:10px"></div>
+        <div class="table-wrap" style="max-height:none;margin-top:8px">
+          <table>
+            <thead><tr><th>Horizon</th><th>Expected</th><th>Change</th><th>80% band</th><th>95% band</th></tr></thead>
+            <tbody id="nseForecastTable"></tbody>
+          </table>
+        </div>
+        <div id="nseDetailFoot" style="font-size:10px;color:var(--text-muted);margin-top:10px;line-height:1.5"></div>
+      </div>
     </div>
 
     <!-- Logs Tab -->
@@ -504,7 +562,7 @@ function showTab(tab, el) {
   if (tab === 'trades') { loadHistory(); loadSymbolStats(); loadAllTimeStats(); loadStrategyStats(); }
   if (tab === 'logs') loadLogs();
   if (tab === 'orderbook') simulateOrderBook();
-  if (tab === 'investing') loadLongTerm();
+  if (tab === 'investing') { loadLongTerm(); loadNse(); }
 }
 
 // ==================== API Helpers ====================
@@ -994,6 +1052,172 @@ async function loadLongTerm() {
   document.getElementById('ltNseGainers').innerHTML = moverList(movers.nse?.gainers);
   document.getElementById('ltNseLosers').innerHTML = moverList(movers.nse?.losers);
 }
+
+// ==================== NSE Kenya (whole exchange) ====================
+let nsePriceChart = null, nseForecastChart = null, nseSummaryCache = null;
+
+const nseFmt = (v, d = 2) => (v === null || v === undefined || Number.isNaN(v)) ? '--' : Number(v).toFixed(d);
+const nseInt = (v) => (v === null || v === undefined) ? '--' : Number(v).toLocaleString();
+const nseEsc = (s) => String(s === null || s === undefined ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+function recTag(rec) {
+  const cls = rec === 'Strong Buy' ? 'buy' : (rec === 'Avoid' ? 'sell' : 'neutral');
+  return rec ? `<span class="tag ${cls}">${nseEsc(rec)}</span>` : '<span style="color:var(--text-muted)">--</span>';
+}
+
+// Shared Chart.js config for the NSE charts, so the price and projection
+// charts can't drift apart visually.
+function nseChartOptions(maxXTicks, showKES) {
+  const grid = { color: 'rgba(42,49,66,.4)' };
+  const yTicks = { color: '#6b7280', grid: grid };
+  if (showKES) yTicks.callback = v => 'KES ' + v;
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: { legend: { labels: { color: '#9ca3af', boxWidth: 12 } } },
+    scales: {
+      x: { ticks: { color: '#6b7280', maxTicksLimit: maxXTicks }, grid: grid },
+      y: yTicks,
+    },
+  };
+}
+
+async function loadNse() {
+  const meta = document.getElementById('nseMeta');
+  const q = encodeURIComponent(document.getElementById('nseSearch').value.trim());
+  const sort = document.getElementById('nseSort').value;
+  const data = await api(`/api/nse/stocks?q=${q}&sort=${sort}`);
+  nseSummaryCache = await api('/api/nse/summary');
+
+  const counts = data.counts || nseSummaryCache.counts || {};
+  const stamp = nseSummaryCache.trading_date ? `Trading date ${nseSummaryCache.trading_date}` : 'No trading date';
+  meta.innerHTML = `${counts.total ?? 0} securities &middot; ${stamp} &middot; `
+    + `source ${nseEsc(nseSummaryCache.source || 'unknown')} &middot; `
+    + `${counts.with_fundamentals ?? 0} with fundamentals &middot; `
+    + `${counts.with_forecasts ?? 0} with projections`
+    + (nseSummaryCache.updated_at ? ` &middot; updated ${new Date(nseSummaryCache.updated_at).toLocaleString()}` : '');
+
+  const notes = [...(nseSummaryCache.notes || [])];
+  if (nseSummaryCache.stale) notes.push('Snapshot is stale (>36h old) — weekend or public holiday.');
+  document.getElementById('nseNotes').innerHTML = notes.length
+    ? notes.map(n => `<div style="font-size:11px;color:var(--orange);margin-top:4px">⚠ ${nseEsc(n)}</div>`).join('')
+    : '';
+
+  const rows = data.stocks || [];
+  document.getElementById('nseTable').innerHTML = rows.length ? rows.map(s => `
+    <tr style="${s.stale ? 'opacity:.5' : ''}">
+      <td><b>${nseEsc(s.ticker)}</b>${s.stale ? ' <span style="font-size:9px;color:var(--text-muted)">no trade</span>' : ''}</td>
+      <td style="max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${nseEsc(s.name)}</td>
+      <td style="font-size:11px;color:var(--text-secondary)">${nseEsc(s.sector)}</td>
+      <td>${nseFmt(s.price)}</td>
+      <td class="${(s.change_pct ?? 0) >= 0 ? 'trade-win' : 'trade-loss'}">${s.change_pct == null ? '--' : (s.change_pct >= 0 ? '+' : '') + nseFmt(s.change_pct) + '%'}</td>
+      <td style="font-size:11px;color:var(--text-secondary)">${nseInt(s.volume)}</td>
+      <td>${nseFmt(s.pe_ratio, 1)}</td>
+      <td>${nseFmt(s.dividend_yield, 1)}%</td>
+      <td>${s.score == null ? '<span style="color:var(--text-muted)">--</span>' : nseFmt(s.score, 1)}</td>
+      <td><a href="#" onclick="openNseDetail('${nseEsc(s.ticker)}');return false" style="color:var(--accent);font-size:11px">View</a></td>
+    </tr>`).join('')
+    : '<tr><td colspan="10" style="color:var(--text-muted);padding:20px">No NSE data yet. The 16:00 EAT snapshot job populates this panel.</td></tr>';
+}
+
+function closeNseDetail() {
+  document.getElementById('nseDetailCard').style.display = 'none';
+  if (nsePriceChart) { nsePriceChart.destroy(); nsePriceChart = null; }
+  if (nseForecastChart) { nseForecastChart.destroy(); nseForecastChart = null; }
+}
+
+async function openNseDetail(ticker) {
+  const res = await fetch(`/api/nse/stock/${encodeURIComponent(ticker)}`);
+  if (!res.ok) { alert(`Could not load ${ticker}`); return; }
+  const s = await res.json();
+  const f = s.forecast || {};
+  const card = document.getElementById('nseDetailCard');
+  card.style.display = 'block';
+
+  document.getElementById('nseDetailTitle').innerHTML =
+    `${nseEsc(s.ticker)} — ${nseEsc(s.name)} ${recTag(s.recommendation)}`;
+  document.getElementById('nseDetailMeta').innerHTML =
+    `${nseEsc(s.sector || 'Unclassified')} &middot; ${nseFmt(s.price)} KES `
+    + `<span class="${(s.change_pct ?? 0) >= 0 ? 'trade-win' : 'trade-loss'}">(${s.change_pct == null ? '--' : (s.change_pct >= 0 ? '+' : '') + nseFmt(s.change_pct) + '%'})</span>`
+    + ` &middot; P/E ${nseFmt(s.pe_ratio, 1)} &middot; EPS ${nseFmt(s.eps, 2)}`
+    + ` &middot; yield ${nseFmt(s.dividend_yield, 1)}% &middot; score ${nseFmt(s.score, 1)}`
+    + ` &middot; ISIN ${nseEsc(s.isin)}`;
+
+  // --- price chart ---
+  const chart = s.chart || { dates: [], closes: [] };
+  if (nsePriceChart) nsePriceChart.destroy();
+  const priceDs = {
+    label: 'Close (KES)',
+    data: chart.closes,
+    borderColor: '#3b82f6',
+    backgroundColor: 'rgba(59,130,246,.12)',
+    fill: true, tension: 0.25, pointRadius: 2, borderWidth: 2,
+  };
+  nsePriceChart = new Chart(document.getElementById('nsePriceChart'), {
+    type: 'line',
+    data: { labels: chart.dates, datasets: [priceDs] },
+    options: nseChartOptions(8, false),
+  });
+
+  // --- forecast chart + table ---
+  const body = document.getElementById('nseForecastTable');
+  if (nseForecastChart) { nseForecastChart.destroy(); nseForecastChart = null; }
+
+  if (!f.available) {
+    document.getElementById('nseForecastNote').innerHTML =
+      '<span style="color:var(--orange)">No projection available.</span> ' + nseEsc(f.reason || '');
+    body.innerHTML = '<tr><td colspan="5" style="color:var(--text-muted)">Not enough accumulated history yet.</td></tr>';
+    nseForecastChart = new Chart(document.getElementById('nseForecastChart'), {
+      type: 'line',
+      data: { labels: [], datasets: [] },
+      options: nseChartOptions(6, false),
+    });
+  } else {
+    const labels = ['Now'].concat(f.horizons.map(h => h.label));
+    const mid = [f.last_price].concat(f.horizons.map(h => h.expected));
+    const lo95 = [f.last_price].concat(f.horizons.map(h => h.band_95[0]));
+    const hi95 = [f.last_price].concat(f.horizons.map(h => h.band_95[1]));
+    const grey = 'rgba(148,163,184,.6)';
+    const forecastDs = [
+      { label: '95% low', data: lo95, borderColor: grey, borderDash: [4, 4], pointRadius: 0, fill: false },
+      { label: 'Expected', data: mid, borderColor: '#8b5cf6', backgroundColor: 'rgba(139,92,246,.15)', borderWidth: 2, pointRadius: 3, fill: '+1', tension: 0.2 },
+      { label: '95% high', data: hi95, borderColor: grey, borderDash: [4, 4], pointRadius: 0, fill: false },
+    ];
+    nseForecastChart = new Chart(document.getElementById('nseForecastChart'), {
+      type: 'line',
+      data: { labels: labels, datasets: forecastDs },
+      options: nseChartOptions(6, true),
+    });
+
+    document.getElementById('nseForecastNote').innerHTML =
+      `Based on <b>${f.observations}</b> accumulated daily closes through ${nseEsc(f.as_of || 'n/a')}. `
+      + `Daily volatility ${nseFmt(f.daily_vol_pct, 2)}% (annualised ${nseFmt(f.annualized_vol_pct, 1)}%). `
+      + `Confidence: <b>${nseEsc(f.confidence)}</b> — ${nseEsc(f.confidence_note)} `
+      + `Read: <b>${nseEsc(f.label)}</b>.`;
+
+    body.innerHTML = f.horizons.map(h => `
+      <tr>
+        <td>${nseEsc(h.label)} <span style="color:var(--text-muted);font-size:10px">(${h.calendar_days}d)</span></td>
+        <td>KES ${nseFmt(h.expected)}</td>
+        <td class="${h.expected_pct >= 0 ? 'trade-win' : 'trade-loss'}">${h.expected_pct >= 0 ? '+' : ''}${nseFmt(h.expected_pct, 1)}%</td>
+        <td style="font-size:11px;color:var(--text-secondary)">${nseFmt(h.band_80[0])} – ${nseFmt(h.band_80[1])}</td>
+        <td style="font-size:11px;color:var(--text-secondary)">${nseFmt(h.band_95[0])} – ${nseFmt(h.band_95[1])}</td>
+      </tr>`).join('');
+  }
+
+  const trend = f.trend || {};
+  document.getElementById('nseDetailFoot').innerHTML =
+    `${nseEsc(f.disclaimer || '')}<br>`
+    + `Trend: SMA20 ${nseFmt(trend.sma20)} &middot; SMA50 ${nseFmt(trend.sma50)} &middot; SMA200 ${nseFmt(trend.sma200)}`
+    + ` &middot; 30d momentum ${nseFmt(trend.momentum_30d_pct, 1)}%`
+    + ` &middot; NSE Kenya is analysis-only — there is no automated execution.`;
+
+  card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+document.getElementById('nseSearch').addEventListener('keydown', (e) => { if (e.key === 'Enter') loadNse(); });
+document.getElementById('nseSort').addEventListener('change', loadNse);
 
 // ==================== Terminal ====================
 const termInput = document.getElementById('terminalInput');

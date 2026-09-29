@@ -258,8 +258,13 @@ DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123456789/abc...
 
 ## Link Email alerts
 
-Email alerts only fire for HIGH-priority events (circuit breakers, heartbeat
-misses) to avoid inbox fatigue. For Gmail:
+Email is reserved for the **Daily Investing & Markets Digest** only — it is the one
+report meant to be read once and kept. Everything else (startup, every trade open
+and close, hourly summaries, risk events, signals) goes to Telegram and Discord
+only, so the inbox stays signal rather than a firehose. The allowlist lives in
+`alerts/notifier.py` as `EMAIL_ALLOWED_EVENTS`; add an event type there to change it.
+
+For Gmail:
 1. Enable 2FA on your Google account
 2. Go to https://myaccount.google.com/apppasswords
 3. Generate an app password for "Mail"

@@ -22,8 +22,19 @@ logger = logging.getLogger("mt5_executor")
 class MT5Executor:
     def __init__(self, state_manager, risk_manager, notifier,
                  login: int = 0, password: str = "", server: str = "",
-                 dry_run: bool = True, allow_min_lot: bool = False):
+                 dry_run: bool = True, allow_min_lot: bool = False,
+                 max_lot: float = 0, max_open_trades: int = 0,
+                 max_daily_loss_pct: float = 0):
         self.state = state_manager
+        # Bridge-side hard guards. The engine already runs a risk manager, but
+        # it lives on the Ubuntu host — if that host is compromised, misbehaves,
+        # or the RPC link is replayed, these are the last thing standing
+        # between a bad order and a filled one. The Windows side enforces them
+        # independently.
+        self.max_lot = max_lot
+        self.max_open_trades = max_open_trades
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self._bridge_rejected_today = 0
         # MT5's smallest order (0.01 lot) is ~$1,000 of EURUSD / ~$4,000 of gold.
         # When the risk-sized position is smaller, skip the trade unless the
         # oversized minimum lot is explicitly allowed (e.g. on a demo account).
@@ -131,10 +142,44 @@ class MT5Executor:
             logger.error(f"Failed to calculate lot size: {e}")
             return 0.0
 
+    def _bridge_guard(self, symbol: str, lots: float) -> str:
+        """Hard limits enforced independently of the engine's risk manager.
+        Returns a reason string if the order must be refused, else ''. These
+        caps are deliberately redundant: the bridge must not trust the caller,
+        because the caller's host is the thing that might be compromised."""
+        if self.max_lot and lots > self.max_lot:
+            return f"lot {lots} exceeds bridge max_lot {self.max_lot}"
+        if self.max_open_trades:
+            open_n = len([p for p in self.state.get_open_positions()
+                          if (p.get("exchange") or "").lower() == "mt5"])
+            if open_n >= self.max_open_trades:
+                return f"bridge max_open_trades {self.max_open_trades} reached ({open_n} open)"
+        if self.max_daily_loss_pct:
+            rs = self.state.get_risk_state()
+            balance = rs.get("trading_balance", 0) or 0
+            daily_pnl = rs.get("daily_pnl", 0) or 0
+            limit = -abs(balance * self.max_daily_loss_pct / 100)
+            if daily_pnl <= limit:
+                return f"daily PnL {daily_pnl:.2f} breached bridge limit {limit:.2f}"
+        return ""
+
+    def _alert_bridge_reject(self, reason: str):
+        """One alert per rejection burst. The 15s loop would otherwise emit the
+        same message thousands of times a day and bury everything else."""
+        today = datetime.now(timezone.utc).date()
+        if self._bridge_rejected_today == today:
+            return
+        self._bridge_rejected_today = today
+        logger.error(f"MT5 bridge guard rejected: {reason}")
+        self.notifier.notify("trade_rejected",
+                             f"MT5 BRIDGE GUARD refused an order: {reason}. The bridge is "
+                             f"enforcing its own limits and is not trusting the engine.",
+                             priority="high")
+
     def open_trade(self, symbol: str, side: str, proposed_amount: float,
                     entry_price: float, stop_loss_pct: float, take_profit_pct: float,
                     strategies: list = None, score: float = 0, regime: str = ""):
-        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol)
+        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol, venue="mt5")
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"MT5 {symbol} {side} rejected: {decision.reason}")
             return None
@@ -164,6 +209,13 @@ class MT5Executor:
                 mt5.symbol_select(symbol, True)  # must be in Market Watch to trade/quote
                 lots = self._get_lot_size(symbol, decision.position_size, entry_price)
                 if lots <= 0:
+                    return None
+
+                # Re-check the bridge guards against the lot size that was
+                # actually resolved, immediately before sending.
+                blocked = self._bridge_guard(symbol, lots)
+                if blocked:
+                    self._alert_bridge_reject(blocked)
                     return None
 
                 info = mt5.symbol_info(symbol)

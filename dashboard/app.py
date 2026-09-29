@@ -15,6 +15,10 @@ Endpoints:
   GET  /api/exchange-health   -> per-exchange API failure rate
   GET  /api/slippage          -> signal-vs-fill execution quality
   GET  /api/long-term/summary -> long-term buy/sell candidates + movers
+  GET  /api/nse/summary       -> NSE Kenya exchange-wide counts, sectors, movers
+  GET  /api/nse/stocks        -> every listed NSE security (filter/sort/paginate)
+  GET  /api/nse/stock/{tkr}   -> one security: fundamentals, P/E, chart series
+  GET  /api/nse/forecast/{tkr}-> 1w/1m/3m/6m price projections for one security
   GET  /api/open-positions    -> current open positions
   POST /api/kill-switch       -> emergency halt (auth required)
   POST /api/resume            -> resume trading (auth required)
@@ -24,6 +28,7 @@ Endpoints:
 """
 import json
 import os
+import re
 import sys
 import asyncio
 import subprocess
@@ -143,6 +148,28 @@ def _load_market_regime():
         except Exception:
             pass
     return {}
+
+
+# The long-term and NSE caches are written by long_term/daily_digest.py, which
+# owns their paths. Importing it here rather than re-hardcoding the strings
+# keeps the writer and the reader from drifting apart; its own imports are
+# cheap because the heavy ones live inside its functions.
+from long_term import daily_digest as _daily_digest  # noqa: E402
+
+_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,11}$")
+
+
+def _normalise_ticker(ticker: str) -> str:
+    """Uppercase an NSE ticker and reject anything that isn't one.
+
+    NSE tickers are alphanumeric with an optional dash (KPLC-P4), so anything
+    outside that shape is a bad request rather than something to pass on."""
+    key = (ticker or "").strip().upper()
+    return key if _TICKER_RE.match(key) else ""
+
+
+def _read_nse_cache() -> dict:
+    return _daily_digest.read_nse_cache()
 
 
 # ---------- Health & Status ----------
@@ -279,20 +306,127 @@ def slippage():
 
 @app.get("/api/long-term/summary")
 def long_term_summary():
-    cache_file = Path(__file__).parent.parent / "data" / "intel_cache" / "long_term_dashboard.json"
-    if not cache_file.exists():
-        return {"buy_candidates": [], "sell_candidates": [], "movers": {}, "updated_at": None,
+    cache = _daily_digest.read_cache()
+    if not cache:
+        return {"buy_candidates": [], "sell_candidates": [], "movers": {},
+                "updated_at": None, "analysis": None, "market_outlook": None,
                 "note": "No data yet — long_term/scheduler.py hasn't run a refresh."}
-    try:
-        return json.loads(cache_file.read_text())
-    except Exception:
-        return {"buy_candidates": [], "sell_candidates": [], "movers": {}, "updated_at": None}
+    return cache
 
 
 @app.get("/api/open-positions")
 def open_positions():
     state = _get_state()
     return {"positions": state.get_open_positions()}
+
+
+# ---------- NSE Kenya (whole exchange) ----------
+
+@app.get("/api/nse/summary")
+def nse_summary():
+    """Exchange-wide metadata: counts, sector breakdown, movers and any
+    caveats. Cheap enough to poll."""
+    cache = _read_nse_cache()
+    return {
+        "updated_at": cache.get("updated_at"),
+        "trading_date": cache.get("trading_date"),
+        "fetched_at": cache.get("fetched_at"),
+        "source": cache.get("source"),
+        "stale": cache.get("stale", False),
+        "counts": cache.get("counts", {}),
+        "sectors": cache.get("sectors", []),
+        "gainers": cache.get("gainers", []),
+        "losers": cache.get("losers", []),
+        "notes": cache.get("notes", []),
+        "disclaimer": cache.get("disclaimer"),
+    }
+
+
+@app.get("/api/nse/stocks")
+def nse_stocks(q: str = "", sector: str = "", sort: str = "change_pct",
+               limit: int = 0):
+    """Every listed NSE security, filtered and sorted server-side so the
+    browser is not handed 70 rows of chart series it does not need.
+
+    sort accepts: change_pct, ticker, name, price, pe_ratio, volume, score.
+    `limit=0` returns everything. Note that the per-ticker `chart` series is
+    stripped from list responses — use /api/nse/stock/{ticker} for one."""
+    cache = _read_nse_cache()
+    rows = cache.get("stocks", [])
+    if not rows:
+        return {"stocks": [], "total": 0, "note": cache.get("notes") or
+                "No NSE data yet — the 16:00 EAT snapshot job has not run."}
+
+    if q:
+        needle = q.strip().lower()
+        rows = [r for r in rows
+                if needle in (r.get("ticker") or "").lower()
+                or needle in (r.get("name") or "").lower()
+                or needle in (r.get("sector") or "").lower()]
+    if sector:
+        rows = [r for r in rows if (r.get("sector") or "") == sector]
+
+    # None must sort last in BOTH directions. A single sorted() call with
+    # reverse=True would flip the (is_none, value) tuple and float every
+    # unrated security to the top of a descending sort, so the missing values
+    # are partitioned off and appended after the ordered ones instead.
+    descending = sort not in ("ticker", "name")
+    present, missing = [], []
+    for r in rows:
+        (missing if r.get(sort) is None else present).append(r)
+    try:
+        present.sort(key=lambda r: r.get(sort), reverse=descending)
+    except TypeError:
+        present.sort(key=lambda r: str(r.get(sort)), reverse=descending)
+    rows = present + missing
+
+    total = len(rows)
+    if limit and limit > 0:
+        rows = rows[:limit]
+    return {
+        "stocks": [{k: v for k, v in r.items() if k != "chart"} for r in rows],
+        "total": total,
+        "counts": cache.get("counts", {}),
+        "updated_at": cache.get("updated_at"),
+    }
+
+
+@app.get("/api/nse/stock/{ticker}")
+def nse_stock(ticker: str):
+    """One security in full: fundamentals, score, trend, chart series and
+    price projections."""
+    key = _normalise_ticker(ticker)
+    if not key:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    cache = _read_nse_cache()
+    for row in cache.get("stocks", []):
+        if row.get("ticker") == key:
+            return row
+    raise HTTPException(status_code=404, detail=f"{key} not found in the NSE snapshot")
+
+
+@app.get("/api/nse/forecast/{ticker}")
+def nse_forecast(ticker: str):
+    """Just the projections for one security — the chart tab polls this."""
+    key = _normalise_ticker(ticker)
+    if not key:
+        raise HTTPException(status_code=400, detail="Invalid ticker")
+    cache = _read_nse_cache()
+    for row in cache.get("stocks", []):
+        if row.get("ticker") == key:
+            forecast = row.get("forecast") or {}
+            return {"ticker": key, "last_price": row.get("price"),
+                    "as_of": forecast.get("as_of"),
+                    "observations": forecast.get("observations", 0),
+                    "available": forecast.get("available", False),
+                    "reason": forecast.get("reason"),
+                    "confidence": forecast.get("confidence"),
+                    "confidence_note": forecast.get("confidence_note"),
+                    "label": forecast.get("label"),
+                    "trend": forecast.get("trend"),
+                    "horizons": forecast.get("horizons", []),
+                    "disclaimer": forecast.get("disclaimer")}
+    raise HTTPException(status_code=404, detail=f"{key} not found in the NSE snapshot")
 
 
 # ---------- Control ----------

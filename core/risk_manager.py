@@ -18,10 +18,11 @@ from datetime import datetime, timezone
 
 # Asset class mapping for portfolio-level caps
 ASSET_CLASS_MAP = {
-    # Crypto
+    # Crypto (USDT-quoted spot)
     "BTC/USDT": "crypto", "ETH/USDT": "crypto", "SOL/USDT": "crypto",
     "BNB/USDT": "crypto", "XRP/USDT": "crypto", "DOGE/USDT": "crypto",
-    "ADA/USDT": "crypto",
+    "ADA/USDT": "crypto", "LINK/USDT": "crypto", "AVAX/USDT": "crypto",
+    "QNT/USDT": "crypto",
     # Forex
     "EUR/USD": "forex", "GBP/USD": "forex", "USD/JPY": "forex",
     "AUD/USD": "forex", "EUR/GBP": "forex", "EUR/JPY": "forex",
@@ -68,9 +69,13 @@ def position_notional_usd(pos: dict) -> float:
     return amount * price
 
 
-# Known correlated crypto pairs (move together ~70-90% of the time)
+# Known correlated crypto pairs (move together ~70-90% of the time).
+# Broad majors and alts alike tend to move as one risk-on/risk-off bloc, so
+# they are all capped together: five open crypto longs is one large position,
+# not five independent ones.
 CRYPTO_CORRELATION_GROUPS = [
-    {"BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT"},
+    {"BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "DOGE/USDT",
+     "ADA/USDT", "LINK/USDT", "AVAX/USDT", "QNT/USDT"},
 ]
 
 
@@ -93,15 +98,26 @@ class RiskManager:
         self.max_open_positions = risk_cfg.get("max_open_positions", 10)
         self.max_asset_class_exposure_pct = risk_cfg.get("max_asset_class_exposure_pct", 60)
         self.max_correlated_positions = risk_cfg.get("max_correlated_positions", 3)
+        self.max_venue_exposure_pct = risk_cfg.get("max_venue_exposure_pct", 40)
         self.reconciliation_interval = risk_cfg.get("reconciliation_interval_seconds", 3600)
         self._last_reconciliation = 0
+        # Venues the operator has switched off, checked on every order. A venue
+        # that gets disabled here stops opening new positions without needing
+        # a config edit + restart, which is the difference between a kill
+        # switch and a suggestion.
+        self.disabled_venues = set()
 
     # ---------- core gate every order must pass ----------
-    def pre_trade_check(self, proposed_amount: float, symbol: str = None) -> RiskDecision:
+    def pre_trade_check(self, proposed_amount: float, symbol: str = None,
+                        venue: str = None) -> RiskDecision:
         risk_state = self.state.get_risk_state()
 
         if risk_state["trading_halted"]:
             return RiskDecision(False, f"Trading halted: {risk_state['halt_reason']}")
+
+        # Venue kill switch, ahead of every other check.
+        if venue and venue.lower() in self.disabled_venues:
+            return RiskDecision(False, f"Venue '{venue}' is disabled")
 
         self._maybe_reset_daily(risk_state)
         risk_state = self.state.get_risk_state()
@@ -134,6 +150,18 @@ class RiskManager:
             # Max open positions
             if len(open_positions) >= self.max_open_positions:
                 return RiskDecision(False, f"Max open positions ({self.max_open_positions}) reached")
+
+            # Per-venue exposure cap: a single exchange freezing, freezing
+            # withdrawals, or being compromised must not be able to take the
+            # whole account, so venue notional is capped independently of the
+            # asset-class cap. Checked first so that when both limits are
+            # breached the rejection names the venue, rather than reporting a
+            # generic asset-class breach that hides where the exposure sits.
+            if venue:
+                venue_check = self._check_venue_exposure(
+                    venue, open_positions, risk_state["trading_balance"])
+                if not venue_check.allowed:
+                    return venue_check
 
             # Per-asset-class exposure cap
             asset_class = ASSET_CLASS_MAP.get(symbol, "other")
@@ -172,6 +200,24 @@ class RiskManager:
                 class_exposure += position_notional_usd(pos)
 
         return (class_exposure / trading_balance) * 100
+
+    def _check_venue_exposure(self, venue: str, open_positions: list,
+                              trading_balance: float) -> RiskDecision:
+        """Cap total open notional on one venue. Counted on positions whose
+        recorded exchange matches, so the same pair held on two venues counts
+        against each one separately."""
+        if trading_balance <= 0:
+            return RiskDecision(False, "No trading balance")
+
+        venue = venue.lower()
+        exposure = sum(position_notional_usd(p) for p in open_positions
+                       if (p.get("exchange") or "").lower() == venue)
+        exposure_pct = exposure / trading_balance * 100
+        if exposure_pct >= self.max_venue_exposure_pct:
+            return RiskDecision(False,
+                f"Venue '{venue}' exposure ({exposure_pct:.1f}%) "
+                f"exceeds cap ({self.max_venue_exposure_pct}%)")
+        return RiskDecision(True, "OK")
 
     def _check_correlation(self, symbol: str, open_positions: list) -> RiskDecision:
         """Check if adding this symbol would over-concentrate in correlated assets."""
@@ -293,6 +339,32 @@ class RiskManager:
     def resume_trading(self, actor: str):
         self.state.update_risk_state(trading_halted=0, halt_reason=None, consecutive_losses=0)
         self.notifier.notify("circuit_breaker_reset", f"Trading resumed by {actor}.")
+
+    # ---------- per-venue kill switch ----------
+
+    def disable_venue(self, venue: str, reason: str = "", actor: str = "operator"):
+        """Stop opening new positions on one venue. Existing positions are left
+        alone deliberately: the position monitor still needs to reach the venue
+        to place stops and close out, and a forced unwind is a trading decision,
+        not a safety one. Global circuit breakers are unaffected."""
+        venue = venue.lower()
+        self.disabled_venues.add(venue)
+        self.notifier.notify(
+            "venue_disabled",
+            f"New entries on '{venue}' are BLOCKED ({reason or 'no reason given'}). "
+            f"Open positions on {venue} are still managed and closed normally. "
+            f"Disabled by {actor}.",
+            priority="high",
+        )
+
+    def enable_venue(self, venue: str, actor: str = "operator"):
+        venue = venue.lower()
+        self.disabled_venues.discard(venue)
+        self.notifier.notify("venue_enabled",
+                             f"New entries on '{venue}' re-enabled by {actor}.")
+
+    def get_disabled_venues(self) -> list:
+        return sorted(self.disabled_venues)
 
     def _maybe_reset_daily(self, risk_state):
         today = datetime.now(timezone.utc).date().isoformat()

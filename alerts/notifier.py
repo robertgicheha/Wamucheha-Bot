@@ -28,6 +28,18 @@ TRADE_LOG = Path(__file__).parent.parent / "data" / "trade_log.jsonl"
 
 HIGH_PRIORITY_EVENTS = {"circuit_breaker_triggered", "daily_loss_limit_hit", "heartbeat_missed"}
 
+# ── Channel routing ──────────────────────────────────────────────────────
+# Email is a scarce, slow-reading channel: it is for the one report that
+# stands alone and stays useful after you close it. Everything else is
+# real-time chatter that belongs on Telegram/Discord, where it is already
+# formatted better and costs nothing. Anything not listed here never
+# reaches SMTP — add an event type here if you ever want it emailed.
+EMAIL_ALLOWED_EVENTS = {"long_term_daily_digest"}
+
+# Process-wide notifier, so modules that have no access to the instance
+# (structured_loggers) can still raise alerts. Set by Notifier.__init__.
+_global_notifier = None
+
 # Color codes for Discord embeds
 COLOR_GREEN = 0x4CAF50
 COLOR_RED = 0xF44336
@@ -45,6 +57,7 @@ EMAIL_COLORS = {
     "bg_card":      "#1a1d2e",
     "bg_header":    "#6c5ce7",
     "bg_footer":    "#12141f",
+    "bg_tile":      "#22263a",
     "text_primary": "#ffffff",
     "text_secondary":"#a0a0b0",
     "accent_green": "#00d68f",
@@ -52,33 +65,65 @@ EMAIL_COLORS = {
     "accent_blue":  "#3b82f6",
     "accent_orange":"#ff9f43",
     "accent_purple":"#a855f7",
+    "accent_cyan":  "#22d3ee",
     "border":       "#2d2f3e",
 }
+
+BRAND = "Wamucheha"
+
+
+def _esc(value) -> str:
+    """HTML-escape any interpolated value. Every piece of data reaching a
+    template is untrusted — symbols, broker error strings, sentiment labels —
+    so escaping happens once here rather than being remembered per template."""
+    return html_lib.escape(str(value), quote=True)
 
 
 # ── HTML email builder ───────────────────────────────────────────────────
 
-def _email_header(title: str, subtitle: str = "", color: str = None) -> str:
+def _preheader(text: str) -> str:
+    """Preview text shown next to the subject in the inbox. Hidden in the body
+    via zero-size + clipped divs; Gmail/Outlook fall back to it when no real
+    content precedes it, so the digest's first visible line is never the
+    greeting boilerplate."""
+    filler = "&nbsp;" * 12
+    return (f'<div style="display:none;font-size:1px;line-height:1px;max-height:0;'
+            f'max-width:0;opacity:0;overflow:hidden;mso-hide:all;">{_esc(text)}</div>'
+            f'<div style="display:none;max-height:0;overflow:hidden;">{filler}</div>')
+
+
+def _email_header(title: str, subtitle: str = "", color: str = None,
+                  badge: str = "") -> str:
     color = color or EMAIL_COLORS["bg_header"]
-    subtitle_html = f'<p style="margin:4px 0 0;color:#a0a0b0;font-size:13px;">{subtitle}</p>' if subtitle else ""
+    subtitle_html = (f'<p style="margin:6px 0 0;color:#c9c9d6;font-size:14px;line-height:1.5;">{subtitle}</p>'
+                     if subtitle else "")
+    badge_html = (
+        f'<div style="display:inline-block;margin-bottom:10px;padding:4px 12px;'
+        f'background:rgba(255,255,255,0.18);border-radius:20px;color:#ffffff;'
+        f'font-size:11px;font-weight:700;letter-spacing:1.2px;">{_esc(badge.upper())}</div>'
+        if badge else "")
     return f"""
-    <div style="background:{color};padding:28px 32px;border-radius:12px 12px 0 0;text-align:center;">
-      <img src="https://img.icons8.com/fluency/48/chart-upward.png" width="40" height="40"
-           style="margin-bottom:8px;filter:brightness(0) invert(1);" alt="logo"/>
-      <h1 style="margin:0;color:#ffffff;font-size:22px;font-weight:700;letter-spacing:0.5px;">{title}</h1>
+    <div style="background:{color};padding:30px 32px 26px;border-radius:14px 14px 0 0;text-align:center;">
+      <img src="https://img.icons8.com/fluency/48/chart-upward.png" width="42" height="42"
+           style="margin-bottom:10px;filter:brightness(0) invert(1);" alt="{_esc(BRAND)} logo"/>
+      {badge_html}
+      <h1 style="margin:0;color:#ffffff;font-size:23px;font-weight:800;letter-spacing:0.3px;line-height:1.3;">{_esc(title)}</h1>
       {subtitle_html}
     </div>"""
 
 
-def _email_footer() -> str:
+def _email_footer(note: str = "") -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    note_html = (f'<p style="margin:8px 0 0;color:#4b5563;font-size:11px;line-height:1.6;">{note}</p>'
+                 if note else "")
     return f"""
-    <div style="background:{EMAIL_COLORS['bg_footer']};padding:18px 32px;border-radius:0 0 12px 12px;text-align:center;border-top:1px solid {EMAIL_COLORS['border']};">
+    <div style="background:{EMAIL_COLORS['bg_footer']};padding:20px 32px;border-radius:0 0 14px 14px;text-align:center;border-top:1px solid {EMAIL_COLORS['border']};">
       <img src="https://img.icons8.com/fluency/20/chart-upward.png" width="18" height="18"
            style="vertical-align:middle;margin-right:6px;filter:brightness(0) invert(0.7);" alt="logo"/>
-      <span style="color:#6b7280;font-size:12px;">Wamucheha Trading Bot</span>
+      <span style="color:#6b7280;font-size:12px;font-weight:600;">{_esc(BRAND)} Trading Bot</span>
       <span style="color:#3d3f50;font-size:12px;margin:0 8px;">|</span>
       <span style="color:#6b7280;font-size:12px;">{now}</span>
+      {note_html}
       <p style="margin:8px 0 0;color:#4b5563;font-size:11px;">
         Automated alerts &mdash; Do not reply directly to this email.
       </p>
@@ -86,10 +131,10 @@ def _email_footer() -> str:
 
 
 def _kv_row(label: str, value: str, mono: bool = False) -> str:
-    font = "font-family:'Courier New',monospace;font-size:13px;" if mono else "font-size:14px;"
+    font = "font-family:'Courier New',Courier,monospace;font-size:13px;" if mono else "font-size:14px;"
     return f"""
     <tr>
-      <td style="padding:6px 0;color:{EMAIL_COLORS['text_secondary']};font-size:13px;width:130px;vertical-align:top;">{label}</td>
+      <td style="padding:6px 0;color:{EMAIL_COLORS['text_secondary']};font-size:13px;width:130px;vertical-align:top;">{_esc(label)}</td>
       <td style="padding:6px 0;color:{EMAIL_COLORS['text_primary']};{font}">{value}</td>
     </tr>"""
 
@@ -97,26 +142,91 @@ def _kv_row(label: str, value: str, mono: bool = False) -> str:
 def _section_divider(title: str) -> str:
     return f"""
     <tr>
-      <td colspan="2" style="padding:16px 0 6px;">
+      <td colspan="2" style="padding:18px 0 8px;">
         <table width="100%" cellpadding="0" cellspacing="0"><tr>
           <td style="border-bottom:1px solid {EMAIL_COLORS['border']};"></td>
-          <td style="padding:0 12px;color:{EMAIL_COLORS['accent_purple']};font-size:11px;font-weight:600;letter-spacing:1px;white-space:nowrap;">{title}</td>
+          <td style="padding:0 12px;color:{EMAIL_COLORS['accent_purple']};font-size:11px;font-weight:700;letter-spacing:1.4px;white-space:nowrap;">{_esc(title)}</td>
           <td style="border-bottom:1px solid {EMAIL_COLORS['border']};"></td>
         </tr></table>
       </td>
     </tr>"""
 
 
-def _build_email_body(header_html: str, rows_html: str, footer_html: str) -> str:
+def _stat_tiles(tiles: list) -> str:
+    """Row of headline numbers. Each tile is (value, label, color); built from
+    nested tables + inline styles so it survives Outlook's Word renderer.
+    Most email clients drop CSS grid/flex, so width is hard-set on the cells
+    and they wrap rather than collapse when the row is too tight."""
+    if not tiles:
+        return ""
+    cells = ""
+    for value, label, color in tiles:
+        cells += f"""
+        <td width="25%" align="center" style="padding:0 5px;vertical-align:top;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:{EMAIL_COLORS['bg_tile']};border:1px solid {EMAIL_COLORS['border']};border-radius:10px;">
+            <tr><td align="center" style="padding:12px 6px 10px;">
+              <div style="color:{color};font-size:20px;font-weight:800;line-height:1.2;letter-spacing:-0.4px;">{value}</div>
+            </td></tr>
+            <tr><td align="center" style="padding:0 6px 12px;">
+              <div style="color:{EMAIL_COLORS['text_secondary']};font-size:10px;font-weight:600;letter-spacing:0.8px;text-transform:uppercase;">{_esc(label)}</div>
+            </td></tr>
+          </table>
+        </td>"""
+    return f"""
+    <tr><td style="padding:4px 0 10px;">
+      <table width="100%" cellpadding="0" cellspacing="0"><tr>{cells}</tr></table>
+    </td></tr>"""
+
+
+def _score_bar(score, color: str = None, width: int = 56) -> str:
+    """Inline visual for a 0-100 rating. Rendered as a fixed-width track with
+    a filled cell sized in percent, using a spacer table — the only bar
+    construction that works without CSS in Gmail and Outlook."""
+    if score is None:
+        return '<span style="color:#6b7280;">n/a</span>'
+    score = max(0.0, min(100.0, float(score)))
+    color = color or _score_color(score)
+    pct = max(3, round(score))
+    return f"""
+    <table width="{width}" cellpadding="0" cellspacing="0" style="display:inline-table;vertical-align:middle;">
+      <tr>
+        <td width="{width}" style="padding:0;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#2d2f3e;border-radius:4px;">
+            <tr><td width="{pct}%" style="height:7px;line-height:7px;font-size:0;background:{color};border-radius:4px;">&nbsp;</td>
+                <td style="height:7px;line-height:7px;font-size:0;">&nbsp;</td></tr>
+          </table>
+        </td>
+        <td style="padding-left:7px;color:{color};font-size:12px;font-weight:700;vertical-align:middle;">{score:.0f}</td>
+      </tr>
+    </table>"""
+
+
+def _score_color(score) -> str:
+    if score is None:
+        return EMAIL_COLORS["text_secondary"]
+    if score >= 75:
+        return EMAIL_COLORS["accent_green"]
+    if score >= 55:
+        return EMAIL_COLORS["accent_cyan"]
+    if score >= 40:
+        return EMAIL_COLORS["accent_orange"]
+    return EMAIL_COLORS["accent_red"]
+
+
+def _build_email_body(header_html: str, rows_html: str, footer_html: str,
+                      preheader: str = "", width: int = 520) -> str:
+    pre = _preheader(preheader) if preheader else ""
     return f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="utf-8"/></head>
-<body style="margin:0;padding:0;background:{EMAIL_COLORS['bg_body']};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:{EMAIL_COLORS['bg_body']};padding:24px 0;">
-<tr><td align="center">
-<table width="520" cellpadding="0" cellspacing="0" style="background:{EMAIL_COLORS['bg_card']};border-radius:12px;overflow:hidden;border:1px solid {EMAIL_COLORS['border']};">
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{_esc(BRAND)}</title></head>
+<body style="margin:0;padding:0;background:{EMAIL_COLORS['bg_body']};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-text-size-adjust:100%;">
+{pre}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{EMAIL_COLORS['bg_body']};padding:24px 0;">
+<tr><td align="center" style="padding:0 12px;">
+<table role="presentation" width="{width}" cellpadding="0" cellspacing="0" style="width:100%;max-width:{width}px;background:{EMAIL_COLORS['bg_card']};border-radius:14px;border:1px solid {EMAIL_COLORS['border']};">
   <tr><td>{header_html}</td></tr>
   <tr><td style="padding:24px 28px;">
-    <table width="100%" cellpadding="0" cellspacing="0">{rows_html}</table>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows_html}</table>
   </td></tr>
   <tr><td>{footer_html}</td></tr>
 </table>
@@ -132,6 +242,7 @@ def _build_trade_open_email(symbol, side, amount, entry_price, stop_loss,
     mode = "PAPER TRADING" if dry_run else "LIVE"
     is_buy = side == "buy"
     mode_color = "#ff9f43" if dry_run else "#00d68f"
+    pnl_color = EMAIL_COLORS["accent_red"]
     side_color = EMAIL_COLORS["accent_green"] if is_buy else EMAIL_COLORS["accent_red"]
     side_label = "BUY / LONG" if is_buy else "SELL / SHORT"
     header_color = side_color
@@ -172,13 +283,27 @@ def _build_trade_open_email(symbol, side, amount, entry_price, stop_loss,
     rows += _kv_row("Session PnL", f'<span style="color:{pnl_color if total_pnl < 0 else "#00d68f"};font-weight:600;">${total_pnl:+.2f}</span>')
     rows += _kv_row("Total Money", f'<span style="color:#fff;font-weight:700;">${total_money:.2f}</span>')
 
+    # R:R is the single most useful number on an entry alert — how much the
+    # target pays for each unit risked, before fees.
+    risk = abs(entry_price - stop_loss)
+    reward = abs(take_profit - entry_price)
+    if risk > 0:
+        rr = reward / risk
+        rows += _kv_row("Risk / Reward", f'<span style="color:#fff;font-weight:600;">1 : {rr:.2f}</span>')
+    if entry_price:
+        rows += _kv_row("Notional", f'${amount * entry_price:,.2f}')
+    rows += _kv_row("Stop Distance", f'{abs(entry_price - stop_loss) / entry_price * 100:.2f}%')
+
     header = _email_header(
         f"{'🟢' if is_buy else '🔴'} Trade Opened — {symbol}",
         f"{side_label} {amount:.4f} on {exchange.upper()}",
         header_color,
     )
     footer = _email_footer()
-    return _build_email_body(header, rows, footer)
+    return _build_email_body(
+        header, rows, footer,
+        preheader=f"{side_label} {symbol} on {exchange.upper()} at {entry_price} — stop {stop_loss}, target {take_profit}",
+    )
 
 
 def _build_trade_close_email(symbol, side, amount, entry_price, exit_price,
@@ -194,13 +319,15 @@ def _build_trade_close_email(symbol, side, amount, entry_price, exit_price,
 
     rows = ""
     rows += _kv_row("Result", f'<span style="color:{pnl_color};font-weight:700;font-size:15px;">{result_emoji} {result_label}</span>')
-    rows += _kv_row("Pair", f'<span style="color:#fff;font-weight:600;">{symbol}</span>')
-    rows += _kv_row("Side", side.upper())
-    rows += _kv_row("Entry Price", entry_price, mono=True)
-    rows += _kv_row("Exit Price", exit_price, mono=True)
+    rows += _kv_row("Pair", f'<span style="color:#fff;font-weight:600;">{_esc(symbol)}</span>')
+    rows += _kv_row("Side", _esc(side.upper()))
+    rows += _kv_row("Entry Price", _esc(entry_price), mono=True)
+    rows += _kv_row("Exit Price", _esc(exit_price), mono=True)
     rows += _kv_row("PnL", f'<span style="color:{pnl_color};font-weight:700;font-size:15px;">{pnl:+.2f} USD ({pnl_pct:+.2f}%)</span>', mono=True)
-    rows += _kv_row("Reason", reason or "N/A")
-    rows += _kv_row("Exchange", exchange.upper())
+    rows += _kv_row("Notional", f'${amount * entry_price:,.2f}')
+    rows += _kv_row("Held Return", f'<span style="color:{pnl_color};font-weight:600;">{pnl_pct:+.2f}%</span>')
+    rows += _kv_row("Reason", _esc(reason or "N/A"))
+    rows += _kv_row("Exchange", _esc(exchange.upper()))
 
     if strategies:
         rows += _section_divider("STRATEGY DETAILS")
@@ -232,7 +359,10 @@ def _build_trade_close_email(symbol, side, amount, entry_price, exit_price,
         header_color,
     )
     footer = _email_footer()
-    return _build_email_body(header, rows, footer)
+    return _build_email_body(
+        header, rows, footer,
+        preheader=f"{symbol} closed {result_label.lower()} — {pnl:+.2f} USD ({pnl_pct:+.2f}%)",
+    )
 
 
 def _build_hourly_summary_email(summary: dict, session_stats: dict) -> str:
@@ -253,14 +383,22 @@ def _build_hourly_summary_email(summary: dict, session_stats: dict) -> str:
     status_label = "HALTED" if halted else "ACTIVE"
 
     rows = ""
+    rows += _stat_tiles([
+        (str(trades), "trades", EMAIL_COLORS["accent_blue"]),
+        (f"{wins}/{losses}", "w / l", EMAIL_COLORS["accent_green"]),
+        (f"{pnl:+.2f}", "hour pnl", pnl_color),
+        (f"${balance:,.0f}", "balance", EMAIL_COLORS["accent_purple"]),
+    ])
     rows += _kv_row("Status", f'<span style="color:{status_color};font-weight:700;">● {status_label}</span>')
-    rows += _kv_row("Time", summary.get("ts", "N/A")[:19] + "Z")
+    rows += _kv_row("Time", _esc(str(summary.get("ts", "N/A"))[:19] + "Z"))
     rows += _section_divider("HOURLY PERFORMANCE")
     rows += _kv_row("Trades", str(trades))
     rows += _kv_row("Wins / Losses", f"{wins} / {losses}")
+    hour_wr = (wins / trades * 100) if trades > 0 else 0
+    rows += _kv_row("Hour Win Rate", f"{hour_wr:.1f}%")
     rows += _kv_row("Hour PnL", f'<span style="color:{pnl_color};font-weight:600;">{pnl:+.2f} USD</span>')
     rows += _section_divider("ACCOUNT STATUS")
-    rows += _kv_row("Balance", f'<span style="color:#fff;font-weight:600;">${balance:.2f}</span>')
+    rows += _kv_row("Balance", f'<span style="color:#fff;font-weight:600;">${balance:,.2f}</span>')
     rows += _kv_row("Daily PnL", f'<span style="color:{pnl_color};">{daily_pnl:+.2f} USD</span>')
     rows += _kv_row("Open Positions", str(open_pos))
     rows += _kv_row("Consecutive Losses", str(consecutive))
@@ -279,7 +417,10 @@ def _build_hourly_summary_email(summary: dict, session_stats: dict) -> str:
         header_color,
     )
     footer = _email_footer()
-    return _build_email_body(header, rows, footer)
+    return _build_email_body(
+        header, rows, footer,
+        preheader=f"{trades} trades, {wins}W/{losses}L, PnL {pnl:+.2f} USD, balance ${balance:,.2f}",
+    )
 
 
 def _build_alert_email(event_type: str, message: str, priority: str) -> str:
@@ -294,9 +435,10 @@ def _build_alert_email(event_type: str, message: str, priority: str) -> str:
 
     rows = ""
     rows += _kv_row("Priority", f'<span style="color:{color};font-weight:700;">{priority_label}</span>')
-    rows += _kv_row("Event", f'<span style="color:#fff;font-weight:600;">{event_type}</span>')
+    rows += _kv_row("Event", f'<span style="color:#fff;font-weight:600;">{_esc(event_type)}</span>')
+    rows += _kv_row("Raised", _esc(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")))
     rows += _section_divider("ALERT DETAILS")
-    rows += f"""<tr><td colspan="2" style="padding:12px 0;color:{EMAIL_COLORS['text_primary']};font-size:14px;line-height:1.6;white-space:pre-wrap;">{message}</td></tr>"""
+    rows += f"""<tr><td colspan="2" style="padding:12px 0;color:{EMAIL_COLORS['text_primary']};font-size:14px;line-height:1.6;white-space:pre-wrap;word-break:break-word;">{_esc(message)}</td></tr>"""
 
     header = _email_header(
         f"{'🚨' if priority in ('critical','high') else 'ℹ️'} {event_type.replace('_', ' ').title()}",
@@ -304,7 +446,7 @@ def _build_alert_email(event_type: str, message: str, priority: str) -> str:
         color,
     )
     footer = _email_footer()
-    return _build_email_body(header, rows, footer)
+    return _build_email_body(header, rows, footer, preheader=message[:140])
 
 
 # ── Subject line builder ──────────────────────────────────────────────────
@@ -329,7 +471,9 @@ def _email_subject(event_type: str, trade_data: dict = None, priority: str = "no
         return f"🚨 CRITICAL: Circuit Breaker Triggered — Trading Halted"
     if event_type == "daily_loss_limit_hit":
         return f"🚨 CRITICAL: Daily Loss Limit Reached — Trading Halted"
-    return f"{prefix} [{event_type.replace('_', ' ').title()}] Wamucheha Bot"
+    if event_type == "long_term_daily_digest":
+        return f"📅 Daily Investing Digest — {datetime.now(timezone.utc):%a %d %b %Y}"
+    return f"{prefix} [{event_type.replace('_', ' ').title()}] {BRAND} Bot"
 
 
 # ── Main Notifier class ──────────────────────────────────────────────────
@@ -344,6 +488,9 @@ class Notifier:
         self.discord_webhook_trades = discord_webhook_trades or discord_webhook_url
         self.email_cfg = email_cfg or {}
         EVENT_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+        global _global_notifier
+        _global_notifier = self
 
         self._session_stats = {
             "total_trades": 0, "wins": 0, "losses": 0,
@@ -419,6 +566,8 @@ class Notifier:
                     logger.error(f"Discord report failed: {e}")
 
         cfg = self.email_cfg
+        if event_type not in EMAIL_ALLOWED_EVENTS:
+            return
         if cfg.get("address") and cfg.get("to"):
             try:
                 body = email_html or _build_alert_email(event_type, telegram_html, "normal")
@@ -763,6 +912,8 @@ class Notifier:
     def _send_email(self, event_type: str, message: str = "",
                      priority: str = "normal", trade_data: dict = None):
         cfg = self.email_cfg
+        if event_type not in EMAIL_ALLOWED_EVENTS:
+            return
         if not cfg.get("address") or not cfg.get("to"):
             return
 

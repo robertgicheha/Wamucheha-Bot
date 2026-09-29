@@ -96,11 +96,35 @@ Examples:
 NSE does NOT offer a public trading API. No ccxt support, no broker with open
 algo-access. The system handles this by:
 
-1. **Data**: Scrapes NSE daily OHLCV via Apify or web scraper, cached locally
-2. **Analysis**: Runs hourly technical analysis (200DMA, golden cross, momentum)
-3. **News sentiment**: Pulls headlines via NewsAPI, scores with VADER
-4. **Alerts**: Sends analysis to ALL channels (Telegram, Discord, email, dashboard)
-5. **No execution**: Any actual NSE trade must go through your broker manually
+1. **Data (prices)**: RapidAPI "Nairobi Stock Exchange (NSE)" `GET /stocks` —
+   every listed security (ticker, name, ISIN, volume, price, day change %,
+   sector) in one request. Called exactly once per trading day at 16:00 EAT by
+   `long_term/scheduler.py` (`nse.snapshot_schedule`), because the Basic plan
+   allows only 4 requests/hour and 250/month. The result is persisted to
+   `data/nse_cache/rapidapi_snapshot.json`; every other reader (the bot's main
+   loop, the hourly dashboard refresh, the dashboard process) reads that file
+   and spends no quota. Without a key it falls back to the free
+   afx.kwayisi.org scrape.
+2. **Data (fundamentals)**: afx.kwayisi.org per-ticker pages supply P/E, EPS,
+   dividend per share, dividend yield, market cap and multi-month price
+   returns. RapidAPI's `/stocks` endpoint carries no fundamentals at all, so
+   this path cannot be skipped if P/E is to be shown.
+3. **History**: The RapidAPI history endpoints are Pro-only, so there is no
+   backfill. `NSEFeed.record_daily_snapshot()` appends one close per ticker
+   per day to `data/nse_cache/{TICKER}_daily.csv`. The series — and therefore
+   the 200DMA, the charts and the projections — start empty and become
+   meaningful over months, not days.
+4. **Analysis**: Technical context (200DMA, golden cross, momentum) plus the
+   shared scorer in `long_term/stock_analysis.py`, so the NSE panel cannot
+   disagree with the weekly screen or the daily digest.
+5. **Projections**: `long_term/nse_forecast.py` — a random walk with drift on
+   log returns, drift shrunk by n/(n+20) and 80%/95% bands. It reports
+   "insufficient history" below 20 closes and is explicitly labelled as
+   statistical extrapolation, not advice.
+6. **News sentiment**: Pulls headlines via NewsAPI, scores with VADER
+7. **Alerts**: Analysis reaches Telegram/Discord and the dashboard; only the
+   long-term daily digest is emailed (see `EMAIL_ALLOWED_EVENTS`).
+8. **No execution**: Any actual NSE trade must go through your broker manually
    (Genghis Capital, AIB-AXYS, Faida Investment Bank)
 
 NSE alert event type: `nse_alert`

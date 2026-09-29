@@ -89,8 +89,10 @@ class ExecutionManager:
         if side != "buy":
             return None
 
-        # Portfolio-level risk check (correlation, asset-class caps, max positions)
-        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol)
+        # Portfolio-level risk check (correlation, asset-class caps, venue cap,
+        # max positions)
+        decision = self.risk.pre_trade_check(proposed_amount, symbol=symbol,
+                                             venue=self.exchange_id)
         if not decision.allowed:
             self.notifier.notify("trade_rejected", f"{symbol} {side} rejected: {decision.reason}")
             return None

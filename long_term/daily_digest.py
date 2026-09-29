@@ -13,6 +13,10 @@ Cadences, driven from long_term/scheduler.py:
   - Daily (heavier): run_daily_digest() — full analysis + day-over-day
     deterioration check (sell candidates) + gainers/losers, sent to
     Telegram/Discord/email and cached for the dashboard.
+  - Daily 16:00 EAT: refresh_nse_dashboard() — the whole listed NSE exchange
+    (every security, not a 20-name watchlist) with fundamentals, P/E, a chart
+    series and a price projection per ticker, cached separately for the
+    dashboard's NSE panel.
 
 Persisted state (data/long_term_state.json) is what makes "sell candidates"
 possible: each daily run compares today's screen/trend result for a ticker
@@ -28,6 +32,7 @@ logger = logging.getLogger("daily_digest")
 
 STATE_FILE = Path(__file__).parent.parent / "data" / "long_term_state.json"
 CACHE_FILE = Path(__file__).parent.parent / "data" / "intel_cache" / "long_term_dashboard.json"
+NSE_CACHE_FILE = Path(__file__).parent.parent / "data" / "intel_cache" / "nse_dashboard.json"
 CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -341,65 +346,246 @@ def format_digest(analysis: dict, outlook: dict, sell: list, movers: dict) -> st
     return "\n".join(lines)
 
 
-def format_digest_email(analysis: dict, outlook: dict, sell: list) -> str:
-    from alerts.notifier import _email_header, _email_footer, EMAIL_COLORS as C
+def format_digest_email(analysis: dict, outlook: dict, sell: list,
+                        movers: dict = None) -> str:
+    """HTML email for the digest. Email gets the wide layout and the full data
+    set (every column, not the Telegram top-5 cut) because it is read once and
+    kept; Telegram/Discord are read in a live channel where brevity wins."""
+    from alerts.notifier import (
+        _email_header, _email_footer, _build_email_body, _stat_tiles, _score_bar,
+        _score_color, _esc, EMAIL_COLORS as C,
+    )
+    from long_term.stock_analysis import top_picks
+
+    movers = movers or {}
     rec_color = {"Strong Buy": C["accent_green"], "Buy": "#7bd88f", "Hold": C["accent_orange"],
                  "Avoid": C["accent_red"]}
-    th = f'style="text-align:left;padding:6px 8px;color:{C["text_secondary"]};font-size:11px;border-bottom:1px solid {C["border"]}"'
-    td = f'style="padding:6px 8px;color:{C["text_primary"]};font-size:13px;border-bottom:1px solid {C["border"]}"'
+    th = f'style="text-align:left;padding:7px 8px;color:{C["text_secondary"]};font-size:10px;font-weight:700;letter-spacing:0.8px;text-transform:uppercase;border-bottom:1px solid {C["border"]};white-space:nowrap;"'
+    td = f'style="padding:7px 8px;color:{C["text_primary"]};font-size:12px;border-bottom:1px solid {C["border"]};vertical-align:top;"'
+    td_n = f'style="padding:7px 8px;color:{C["text_secondary"]};font-size:12px;border-bottom:1px solid {C["border"]};white-space:nowrap;"'
 
-    def table(title, headers, rows):
-        head = "".join(f"<th {th}>{h}</th>" for h in headers)
-        body = "".join("<tr>" + "".join(f"<td {td}>{c}</td>" for c in r) + "</tr>" for r in rows)
-        return (f'<h3 style="color:{C["accent_purple"]};font-size:13px;letter-spacing:1px;margin:22px 0 6px">{title}</h3>'
-                f'<table width="100%" cellpadding="0" cellspacing="0"><tr>{head}</tr>{body}</table>')
+    def table(title, headers, rows, empty="No qualifying names today."):
+        if not rows:
+            return ""
+        head = "".join(f"<th {th}>{_esc(h)}</th>" for h in headers)
+        body = "".join(
+            "<tr>" + "".join(f'<td {td}>{c}</td>' if isinstance(c, str) and c.startswith("<")
+                             else f'<td {td_n}>{c}</td>' for c in r) + "</tr>"
+            for r in rows)
+        return (f'<h3 style="color:{C["accent_purple"]};font-size:12px;font-weight:700;'
+                f'letter-spacing:1.4px;margin:24px 0 8px;">{_esc(title)}</h3>'
+                f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+                f'<tr>{head}</tr>{body}</table>')
 
     def rec(r):
-        return f'<b style="color:{rec_color.get(r, C["text_secondary"])}">{r}</b>'
+        return f'<b style="color:{rec_color.get(r, C["text_secondary"])};">{_esc(r)}</b>'
+
+    def pct_cell(v, fmt="{:+.1f}"):
+        """Coloured change. Absent data stays neutral grey rather than
+        borrowing the wrong direction's colour."""
+        if v is None:
+            return '<span style="color:#6b7280;">n/a</span>'
+        color = C["accent_green"] if v > 0 else C["accent_red"] if v < 0 else C["text_secondary"]
+        return f'<span style="color:{color};font-weight:600;">{fmt.format(v)}</span>'
+
+    stocks = analysis.get("stocks", [])
+    etfs = analysis.get("etfs", [])
+    instruments = outlook.get("instruments", [])
+
+    us_picks = top_picks(analysis, "us", 3)
+    nse_picks = top_picks(analysis, "nse", 3)
+    buys = [s for s in stocks if s["recommendation"] in ("Strong Buy", "Buy")]
+    best = max(buys, key=lambda s: s["score"] or 0, default=None)
+    avoid = [s for s in stocks if s["recommendation"] == "Avoid"]
+    bullish = sum(1 for r in instruments if r["outlook"] == "Bullish")
+    bearish = sum(1 for r in instruments if r["outlook"] == "Bearish")
+
+    # ── Hero: the one-glance summary ──────────────────────────────────────
+    rows = ""
+    rows += _stat_tiles([
+        (str(len(buys)), "buy-rated", C["accent_green"]),
+        (str(len(avoid)), "avoid", C["accent_red"]),
+        (f"{bullish}/{bearish}", "bull / bear", C["accent_cyan"]),
+        (str(len(etfs)), "etfs", C["accent_purple"]),
+    ])
+
+    # ── Spotlight: highest-conviction name, given room to breathe ─────────
+    if best:
+        bm = best["metrics"]
+        detail = (f'P/E {_num(bm["pe_ratio"])} &nbsp;·&nbsp; '
+                  f'Div {_num(bm["dividend_yield"], "{:.1f}", "%")} &nbsp;·&nbsp; '
+                  + (f'ROE {_num(bm["roe_pct"], "{:.0f}", "%")} &nbsp;·&nbsp; '
+                     f'upside {_num(bm.get("analyst_upside_pct"), "{:+.0f}", "%")}'
+                     if best["market"] == "us" else
+                     f'1y {_num(bm.get("return_1y"), "{:+.0f}", "%")} &nbsp;·&nbsp; '
+                     f'KES {_num(best.get("price"), "{:,.2f}")}'))
+        rows += f"""
+    <tr><td style="padding:6px 0 4px;">
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0"
+             style="background:{C['bg_tile']};border:1px solid {C['border']};border-left:3px solid {_score_color(best['score'])};border-radius:10px;">
+        <tr><td style="padding:16px 18px;">
+          <div style="color:{C['accent_purple']};font-size:10px;font-weight:700;letter-spacing:1.4px;">TOP CONVICTION PICK</div>
+          <div style="padding:5px 0 3px;">
+            <span style="color:#fff;font-size:21px;font-weight:800;letter-spacing:-0.3px;">{_esc(best['ticker'])}</span>
+            <span style="color:{C['text_secondary']};font-size:13px;padding-left:8px;">{_esc((best.get('name') or '')[:38])}</span>
+          </div>
+          <div style="padding:0 0 9px;">
+            {rec(best['recommendation'])} &nbsp;
+            <span style="color:{C['text_secondary']};font-size:12px;">{_money(best.get('market_cap_usd'))} cap</span>
+          </div>
+          {_score_bar(best['score'])}
+          <div style="padding-top:9px;color:{C['text_secondary']};font-size:12px;line-height:1.5;">{detail}</div>
+        </td></tr>
+      </table>
+    </td></tr>"""
 
     parts = []
-    for market, title in (("us", "US STOCKS"), ("nse", "NSE KENYA STOCKS")):
-        rows = []
-        for s in [s for s in analysis.get("stocks", []) if s["market"] == market][:12]:
+
+    # ── Runners-up, the usual one-line-each treatment ─────────────────────
+    spotlight = []
+    for market, flag, title in (("us", "🇺🇸", "TOP US PICKS"), ("nse", "🇰🇪", "TOP NSE KENYA PICKS")):
+        picks = [s for s in (us_picks if market == "us" else nse_picks) if s is not best]
+        sub = []
+        for s in picks[:3]:
             m = s["metrics"]
-            rows.append([f"<b>{s['ticker']}</b><br><span style='color:#888;font-size:11px'>{(s['name'] or '')[:28]}</span>",
-                         rec(s["recommendation"]), f"{s['score']:.0f}" if s["score"] is not None else "n/a",
-                         _num(m["pe_ratio"]), _num(m["dividend_yield"], "{:.1f}", "%"),
-                         _num(m["roe_pct"], "{:.0f}", "%") if market == "us" else _num(m["return_1y"], "{:+.0f}", "%"),
-                         _money(s["market_cap_usd"]),
-                         "; ".join(s["positives"][:2]) or "; ".join(s["negatives"][:1])])
-        parts.append(table(title, ["Stock", "Call", "Score", "P/E", "Div", "ROE" if market == "us" else "1Y",
-                                   "Mkt cap", "Why"], rows))
+            why = (f'P/E {_num(m["pe_ratio"])} · ROE {_num(m["roe_pct"], "{:.0f}", "%")}'
+                   if market == "us" else
+                   f'P/E {_num(m["pe_ratio"])} · 1y {_num(m.get("return_1y"), "{:+.0f}", "%")}')
+            sub.append(f"""
+        <tr><td style="padding:9px 0;border-bottom:1px solid {C['border']};">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
+            <td style="padding-right:12px;vertical-align:middle;width:78px;">
+              <span style="color:#fff;font-size:14px;font-weight:700;">{_esc(s['ticker'])}</span>
+            </td>
+            <td style="vertical-align:middle;width:74px;">{rec(s['recommendation'])}</td>
+            <td style="vertical-align:middle;width:64px;">{_score_bar(s['score'], width=40)}</td>
+            <td style="vertical-align:middle;color:{C['text_secondary']};font-size:11px;">{_esc(why)}</td>
+          </tr></table>
+        </td></tr>""")
+        if sub:
+            spotlight.append(f'<h3 style="color:{C["accent_purple"]};font-size:12px;font-weight:700;'
+                             f'letter-spacing:1.4px;margin:22px 0 4px;">{flag} {_esc(title)}</h3>'
+                             f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">'
+                             + "".join(sub) + "</table>")
+    if spotlight:
+        rows += '<tr><td colspan="2" style="padding:0;">' + "".join(spotlight) + "</td></tr>"
 
-    etf_rows = [[f"<b>{e['ticker']}</b>", rec(e["recommendation"]), f"{e['score']:.0f}" if e["score"] is not None else "n/a",
-                 _num(e["metrics"]["expense_ratio_pct"], "{:.2f}", "%"),
-                 _num(e["metrics"]["return_5y_avg"], "{:.1f}", "%/yr"), _money(e["metrics"]["total_assets"])]
-                for e in analysis.get("etfs", [])]
-    if etf_rows:
-        parts.append(table("ETFS", ["ETF", "Call", "Score", "Fee", "5y avg", "Assets"], etf_rows))
+    # ── Full ranked tables ────────────────────────────────────────────────
+    for market, flag, title in (("us", "🇺🇸", "ALL US STOCKS"), ("nse", "🇰🇪", "ALL NSE KENYA STOCKS")):
+        table_rows = []
+        ranked = sorted([s for s in stocks if s["market"] == market],
+                        key=lambda s: (s["score"] or 0), reverse=True)[:12]
+        for s in ranked:
+            m = s["metrics"]
+            table_rows.append([
+                f'<b style="color:#fff;">{_esc(s["ticker"])}</b>'
+                f'<br><span style="color:#7b7d90;font-size:10px;">{_esc((s.get("name") or "")[:30])}</span>',
+                rec(s["recommendation"]),
+                _score_bar(s["score"], width=42),
+                _num(m["pe_ratio"]),
+                _num(m["dividend_yield"], "{:.1f}", "%"),
+                _num(m["roe_pct"], "{:.0f}", "%") if market == "us"
+                else pct_cell(m.get("return_1y"), "{:+.0f}"),
+                _money(s.get("market_cap_usd")),
+                _esc("; ".join(s["positives"][:2]) or "; ".join(s["negatives"][:1])),
+            ])
+        parts.append(table(f"{flag} {title}",
+                           ["Stock", "Call", "Score", "P/E", "Div", "ROE" if market == "us" else "1Y",
+                            "Mkt cap", "Why"], table_rows))
 
-    outlook_color = {"Bullish": C["accent_green"], "Bearish": C["accent_red"]}
-    out_rows = [[f"<b>{r['name']}</b>", f"{r['price']:,}", _num(r["change_1w"], "{:+.1f}", "%"),
-                 _num(r["change_1m"], "{:+.1f}", "%"), _num(r["rsi"], "{:.0f}"), r["trend"],
-                 f'<b style="color:{outlook_color.get(r["outlook"], C["accent_orange"])}">{r["outlook"]}</b>']
-                for r in outlook.get("instruments", [])]
-    if out_rows:
-        parts.append(table("FOREX / CRYPTO / GOLD OUTLOOK", ["Market", "Price", "1w", "1m", "RSI", "Trend", "Outlook"], out_rows))
+    etf_rows = []
+    for e in sorted(etfs, key=lambda e: (e["score"] or 0), reverse=True):
+        m = e["metrics"]
+        etf_rows.append([
+            f'<b style="color:#fff;">{_esc(e["ticker"])}</b>'
+            f'<br><span style="color:#7b7d90;font-size:10px;">{_esc((e.get("name") or "")[:30])}</span>',
+            rec(e["recommendation"]),
+            _score_bar(e["score"], width=42),
+            _num(m["expense_ratio_pct"], "{:.2f}", "%"),
+            _num(m["return_5y_avg"], "{:.1f}", "%/yr"),
+            _money(m.get("total_assets")),
+        ])
+    parts.append(table("🧺 ETFs", ["ETF", "Call", "Score", "Fee", "5y avg", "Assets"], etf_rows))
+
+    # ── Macro: adds RSI state and 1m alongside the existing 1w ────────────
+    out_rows = []
+    for r in sorted(instruments, key=lambda r: (r.get("change_1w") or 0), reverse=True):
+        rsi = r.get("rsi")
+        rsi_color = (C["accent_red"] if rsi is not None and rsi >= 70
+                     else C["accent_green"] if rsi is not None and rsi <= 30
+                     else C["text_secondary"])
+        outlook_color = {"Bullish": C["accent_green"], "Bearish": C["accent_red"]}.get(
+            r.get("outlook"), C["accent_orange"])
+        out_rows.append([
+            f'<b style="color:#fff;">{_esc(r["name"])}</b>',
+            f'{r["price"]:,}' if r.get("price") is not None else "n/a",
+            pct_cell(r.get("change_1w")),
+            pct_cell(r.get("change_1m")),
+            f'<span style="color:{rsi_color};font-weight:600;">{_num(rsi, "{:.0f}")}</span>',
+            _esc(r.get("trend", "")),
+            f'<b style="color:{outlook_color};">{_esc(r.get("outlook", ""))}</b>',
+        ])
+    parts.append(table("🌍 FOREX / CRYPTO / GOLD OUTLOOK",
+                       ["Market", "Price", "1w", "1m", "RSI", "Trend", "Outlook"], out_rows))
 
     if sell:
-        parts.append(table("CONSIDER SELLING / REVIEWING", ["Ticker", "Why"],
-                           [[f"<b>{c['ticker']}</b>", c["reasons"][0]] for c in sell[:10]]))
+        parts.append(table("🔴 CONSIDER SELLING / REVIEWING", ["Ticker", "Why"],
+                           [[f'<b style="color:{C["accent_red"]};">{_esc(c["ticker"])}</b>', _esc(c["reasons"][0])]
+                            for c in sell[:10]]))
 
-    body = "".join(parts) + (f'<p style="color:#6b7280;font-size:11px;margin-top:18px">Rules-based scores from public '
-                             f'data (yfinance, afx.kwayisi.org). Not financial advice or a price prediction.</p>')
-    return f"""<!DOCTYPE html><html><head><meta charset="utf-8"/></head>
-<body style="margin:0;padding:0;background:{C['bg_body']};font-family:-apple-system,Segoe UI,Roboto,sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="padding:24px 0;"><tr><td align="center">
-<table width="760" cellpadding="0" cellspacing="0" style="background:{C['bg_card']};border-radius:12px;border:1px solid {C['border']};">
-<tr><td>{_email_header("📅 Daily Investing & Markets Digest", "Stock picks, ETFs and forex/crypto/gold outlook")}</td></tr>
-<tr><td style="padding:8px 28px 24px;">{body}</td></tr>
-<tr><td>{_email_footer()}</td></tr>
-</table></td></tr></table></body></html>"""
+    # Movers were Telegram-only before — the single biggest gap for a reader
+    # who wants context on why today's scores moved.
+    for label, mv in (("US / ETF", movers.get("us", {})), ("NSE", movers.get("nse", {}))):
+        mover_rows = []
+        for m in list(mv.get("gainers", []))[:5]:
+            mover_rows.append([
+                f'<b style="color:#fff;">{_esc(m["ticker"])}</b>',
+                pct_cell(m.get("change_pct")),
+                f'<span style="color:{C["accent_green"]};font-size:11px;font-weight:600;">GAINER</span>',
+            ])
+        for m in list(mv.get("losers", []))[:5]:
+            mover_rows.append([
+                f'<b style="color:#fff;">{_esc(m["ticker"])}</b>',
+                pct_cell(m.get("change_pct")),
+                f'<span style="color:{C["accent_red"]};font-size:11px;font-weight:600;">LOSER</span>',
+            ])
+        parts.append(table(f"📈 {label} MOVERS TODAY", ["Ticker", "Change", ""], mover_rows))
+
+    if avoid:
+        parts.append(table("⛔ AVOID FOR NOW", ["Ticker", "Why"],
+                           [[f'<b style="color:#fff;">{_esc(s["ticker"])}</b>',
+                             _esc(s["negatives"][0] if s.get("negatives") else "weak score")]
+                            for s in avoid[:6]]))
+
+    if parts:
+        rows += ('<tr><td colspan="2" style="padding:0;">'
+                 + '<h3 style="color:#6b7280;font-size:11px;font-weight:700;letter-spacing:1.6px;'
+                   'margin:24px 0 0;padding-top:20px;border-top:1px solid '
+                 + C["border"] + ';">FULL RANKED UNIVERSE</h3>'
+                 + "".join(parts)
+                 + "</td></tr>")
+
+    body = (f'<p style="color:{C["text_secondary"]};font-size:12px;line-height:1.7;margin:14px 0 0;'
+            f'padding-top:16px;border-top:1px solid {C["border"]};">'
+            f'Rules-based scores computed from public data (yfinance, afx.kwayisi.org). '
+            f'Not financial advice and not a price prediction. Scores are relative to each '
+            f'market&rsquo;s own universe, so a 60 on NSE and a 60 on the US are not directly comparable. '
+            f'Full tables and history on the dashboard.</p>')
+
+    if best:
+        preheader = (f"Top pick {best['ticker']} ({best['recommendation']}, {best['score']:.0f}/100) — "
+                     f"{len(buys)} buy-rated, {len(avoid)} to avoid, {bullish} markets bullish")
+    else:
+        preheader = "No stocks met the buy threshold today — here is the full ranked universe"
+
+    header = _email_header(
+        "Daily Investing & Markets Digest",
+        f"{datetime.now(timezone.utc):%A, %d %B %Y} · scored universe, macro outlook and movers",
+        badge="Daily Briefing",
+    )
+    footer = _email_footer()
+    return _build_email_body(header, rows, footer + body, preheader=preheader, width=760)
+
 
 
 # ---------- entry points (called from long_term/scheduler.py) ----------
@@ -461,8 +647,8 @@ def run_daily_digest(config: dict, fundamentals, nse_feed, notifier):
     notifier.notify_report(
         "long_term_daily_digest",
         format_digest(analysis, outlook, sell, movers),
-        subject=f"📅 Daily Investing Digest — {datetime.now(timezone.utc):%d %b %Y}",
-        email_html=format_digest_email(analysis, outlook, sell),
+        subject=f"📅 Daily Investing Digest — {datetime.now(timezone.utc):%a %d %b %Y}",
+        email_html=format_digest_email(analysis, outlook, sell, movers),
     )
 
     result = {
@@ -498,4 +684,203 @@ def refresh_dashboard_cache(config: dict, nse_feed):
         "kind": "hourly",
     }
     _write_cache(result)
+    return result
+
+
+# ---------- NSE Kenya: whole-exchange dashboard ----------
+
+def read_nse_cache() -> dict:
+    if NSE_CACHE_FILE.exists():
+        try:
+            return json.loads(NSE_CACHE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _write_nse_cache(result: dict):
+    try:
+        NSE_CACHE_FILE.write_text(json.dumps(result, indent=2, default=str))
+    except Exception as e:
+        logger.warning(f"Failed to write NSE dashboard cache: {e}")
+
+
+def _chart_series(history, points: int = 120) -> dict:
+    """Last `points` closes for the dashboard chart, as parallel date/close
+    lists. Returns empty lists rather than None so the chart JS can bind to
+    them unconditionally."""
+    if history is None or len(history) == 0 or "close" not in history:
+        return {"dates": [], "closes": [], "volumes": []}
+    tail = history.tail(points)
+    return {
+        "dates": [str(d)[:10] for d in tail.index],
+        "closes": [None if c != c else float(c) for c in tail["close"]],  # NaN -> null
+        "volumes": [int(v) if v == v else 0 for v in tail.get("volume", [])],
+    }
+
+
+def _enrich_nse_stock(stock: dict, fundamentals, nse_feed) -> dict:
+    """Merge a RapidAPI quote with AFX fundamentals, the existing scorer, the
+    accumulated chart series, and a price projection for one NSE security.
+
+    Every field is independently optional: RapidAPI has no fundamentals, AFX
+    may not have a page for a newly listed name, and the forecast needs
+    accumulated history. A missing piece is reported as null, never faked."""
+    from long_term.stock_analysis import analyze_stock, analyze_etf
+    from long_term.nse_forecast import build_forecast, direction_label
+
+    ticker = stock["ticker"]
+    row = {
+        "ticker": ticker,
+        "name": stock.get("name") or ticker,
+        "sector": stock.get("sector"),
+        "isin": stock.get("isin"),
+        "price": stock.get("price"),
+        "change_pct": stock.get("change_pct"),
+        "volume": stock.get("volume"),
+        "stale": bool(stock.get("stale")),
+        "pe_ratio": None,
+        "eps": None,
+        "dividend_yield": None,
+        "payout_ratio": None,
+        "market_cap": None,
+        "market_cap_usd": None,
+        "dividend_per_share": None,
+        "return_1y": None,
+        "recommendation": None,
+        "score": None,
+        "coverage": None,
+        "positives": [],
+        "negatives": [],
+        "trend": None,
+        "forecast": None,
+        "chart": {"dates": [], "closes": [], "volumes": []},
+    }
+
+    history = nse_feed.get_accumulated_history(ticker)
+    row["chart"] = _chart_series(history)
+
+    # Price projection from the accumulated closes. Available=False carries its
+    # own reason string, which the dashboard renders verbatim.
+    forecast = build_forecast(history)
+    forecast["label"] = direction_label(forecast)
+    row["forecast"] = forecast
+
+    profile = None
+    try:
+        profile = fundamentals.get_profile(ticker, market="nse")
+    except Exception as e:
+        logger.warning(f"NSE fundamentals failed for {ticker}: {e}")
+
+    if profile:
+        row["pe_ratio"] = profile.get("pe_ratio")
+        row["eps"] = profile.get("eps")
+        row["dividend_yield"] = profile.get("dividend_yield")
+        row["payout_ratio"] = profile.get("payout_ratio")
+        row["market_cap"] = profile.get("market_cap")
+        row["market_cap_usd"] = profile.get("market_cap_usd")
+        row["dividend_per_share"] = profile.get("dividend_per_share")
+        row["return_1y"] = profile.get("return_1y")
+        row["sector"] = row["sector"] or profile.get("sector")
+
+        # Reuse the same scorer the weekly screen and the digest use, so the
+        # NSE panel can't quietly disagree with the rest of the product.
+        try:
+            is_etf = profile.get("quote_type") == "ETF"
+            trend = analyze_etf(profile, None) if is_etf else analyze_stock(profile, None)
+            row["recommendation"] = trend.get("recommendation")
+            row["score"] = trend.get("score")
+            row["coverage"] = trend.get("coverage")
+            row["positives"] = trend.get("positives") or []
+            row["negatives"] = trend.get("negatives") or []
+        except Exception as e:
+            logger.warning(f"NSE scoring failed for {ticker}: {e}")
+    else:
+        row["error"] = "No fundamentals available for this security yet."
+
+    return row
+
+
+def refresh_nse_dashboard(config: dict, fundamentals, nse_feed, max_workers: int = 4) -> dict:
+    """Build the whole-exchange NSE panel: every listed security with its
+    price, P/E, score, chart series and price projection.
+
+    Runs once per trading day at 16:00 EAT, right after
+    NSEFeed.refresh_market_snapshot() has written the day's close. The
+    per-ticker fundamentals pass hits the free afx.kwayisi.org site (no quota,
+    no key) with a small thread pool; it is bounded because one thread per
+    ticker would be rude to a free third-party service.
+
+    Reads and writes data/intel_cache/nse_dashboard.json, which the dashboard
+    process serves. Nothing here calls RapidAPI — the snapshot on disk was
+    already paid for by the 16:00 job."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    nse_cfg = config.get("nse", {})
+    notes: list[str] = []
+
+    snapshot = nse_feed.get_market_snapshot()
+    if not snapshot:
+        notes.append("No NSE snapshot available — RapidAPI not configured and "
+                     "afx.kwayisi.org was unreachable.")
+        logger.warning("refresh_nse_dashboard: no NSE snapshot available")
+        result = {"updated_at": datetime.now(timezone.utc).isoformat(),
+                  "stocks": [], "counts": {"total": 0}, "notes": notes}
+        _write_nse_cache(result)
+        return result
+
+    universe = snapshot.get("universe") or []
+    # The AFX fallback has no `stale` flag; treat a missing volume as unknown
+    # rather than as a suspended name.
+    stocks = [{"ticker": s["ticker"], "name": s.get("name"), "sector": s.get("sector"),
+               "isin": s.get("isin"), "price": s.get("price"),
+               "change_pct": s.get("change_pct"), "volume": s.get("volume"),
+               "stale": bool(s.get("stale"))}
+              for s in universe]
+
+    workers = max(1, min(max_workers, nse_cfg.get("fundamentals_max_workers", 4)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        rows = list(pool.map(
+            lambda s: _enrich_nse_stock(s, fundamentals, nse_feed), stocks))
+
+    rows.sort(key=lambda r: -(r.get("change_pct") if r.get("change_pct") is not None else -1e9))
+
+    with_fundamentals = sum(1 for r in rows if r.get("pe_ratio") is not None
+                            or r.get("eps") is not None)
+    forecasts = [r for r in rows if (r.get("forecast") or {}).get("available")]
+    if not forecasts:
+        notes.append("No price projections yet: the daily close history is still "
+                     "short. The RapidAPI history endpoints are Pro-only, so the "
+                     "series builds up one close per trading day from the first run.")
+    if snapshot.get("source") == "afx.kwayisi.org":
+        notes.append("Showing the free afx.kwayisi.org fallback; no RapidAPI "
+                     "snapshot has been persisted yet.")
+    if snapshot.get("stale"):
+        notes.append("The persisted RapidAPI snapshot is more than 36h old "
+                     "(weekend or public holiday). Prices may not be current.")
+
+    result = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "trading_date": snapshot.get("trading_date"),
+        "fetched_at": snapshot.get("fetched_at"),
+        "source": snapshot.get("source"),
+        "stale": bool(snapshot.get("stale")),
+        "counts": {
+            "total": len(rows),
+            "with_fundamentals": with_fundamentals,
+            "with_forecasts": len(forecasts),
+            "stale_quotes": sum(1 for r in rows if r.get("stale")),
+        },
+        "sectors": snapshot.get("sectors") or [],
+        "gainers": [r["ticker"] for r in rows[:8]],
+        "losers": [r["ticker"] for r in rows[-8:][::-1]],
+        "stocks": rows,
+        "notes": notes,
+        "disclaimer": "Projections are statistical extrapolations, not "
+                      "recommendations. NSE Kenya is analysis-only — there is no "
+                      "automated execution.",
+    }
+    _write_nse_cache(result)
+    logger.info(f"NSE dashboard cache: {len(rows)} securities, "
+                f"{with_fundamentals} with fundamentals, {len(forecasts)} with projections")
     return result

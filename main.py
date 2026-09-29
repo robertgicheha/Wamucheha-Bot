@@ -66,7 +66,6 @@ if _env_stake is not None:
     except ValueError:
         print(f"WARNING: Invalid STAKE_AMOUNT '{_env_stake}' in .env — using config.yaml default")
 
-<<<<<<< HEAD
 # Separate from the stake: how much capital you're actually choosing to
 # trade with. Only takes effect on true first run (see StateManager) — on
 # every later start this is a no-op and the persisted, accumulated balance
@@ -78,14 +77,16 @@ if _env_initial_balance is not None:
         INITIAL_TRADING_BALANCE = float(_env_initial_balance)
     except ValueError:
         print(f"WARNING: Invalid INITIAL_TRADING_BALANCE '{_env_initial_balance}' in .env — treating as unset")
-=======
+
+# Fallback seed for a fresh state DB, applied in main() once peak_balance
+# is still 0. Independent of INITIAL_TRADING_BALANCE, which StateManager
+# consumes at construction.
 _env_balance = os.environ.get("TRADING_BALANCE")
 if _env_balance is not None:
     try:
         CONFIG["account"]["trading_balance"] = float(_env_balance)
     except ValueError:
         print(f"WARNING: Invalid TRADING_BALANCE '{_env_balance}' in .env — using config.yaml default")
->>>>>>> 2135efce8ad13ff0406f6b4e9e4c74f672e7604d
 
 
 def build_notifier():
@@ -287,6 +288,22 @@ def main():
 
     executors = {}
 
+    def venue_enabled(venue: str) -> bool:
+        """Is a venue switched on in config.yaml?
+
+        Every executor must gate on this. OANDA, Alpaca and MT5 are built in
+        separate hardcoded blocks rather than the loop below, so without this
+        check a venue left `enabled: false` would still construct an executor
+        and could trade if its markets were ever listed. That matters because
+        ALPACA_PAPER / OANDA_PRACTICE are independent of LIVE_TRADING: they can
+        point at production endpoints while the bot is in dry-run, so flipping
+        LIVE_TRADING alone would put real money at risk with no second prompt.
+        """
+        return any(
+            ex.get("name") == venue and ex.get("enabled")
+            for ex in CONFIG.get("execution", {}).get("exchanges", [])
+        )
+
     # ccxt executors (Binance, OKX, etc.)
     for ex_cfg in CONFIG["execution"]["exchanges"]:
         if not ex_cfg["enabled"]:
@@ -312,8 +329,10 @@ def main():
     # OANDA executor
     oanda_key = os.environ.get("OANDA_API_KEY")
     oanda_account = os.environ.get("OANDA_ACCOUNT_ID")
-    if oanda_key and oanda_account:
+    if oanda_key and oanda_account and venue_enabled("oanda"):
         practice = os.environ.get("OANDA_PRACTICE", "true").lower() == "true"
+        print(f"  OANDA: practice={practice} "
+              f"({'DEMO' if practice else 'LIVE — real money'})")
         executors["oanda"] = OandaExecutor(
             api_key=oanda_key,
             account_id=oanda_account,
@@ -328,8 +347,10 @@ def main():
     # Alpaca executor
     alpaca_key = os.environ.get("ALPACA_API_KEY")
     alpaca_secret = os.environ.get("ALPACA_API_SECRET")
-    if alpaca_key and alpaca_secret:
+    if alpaca_key and alpaca_secret and venue_enabled("alpaca"):
         paper = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
+        print(f"  Alpaca: paper={paper} "
+              f"({'PAPER' if paper else 'LIVE — real money'})")
         executors["alpaca"] = AlpacaExecutor(
             api_key=alpaca_key,
             api_secret=alpaca_secret,
@@ -341,11 +362,15 @@ def main():
         )
         print("  Alpaca executor initialized")
 
-    # MT5 executor
+    # MT5 executor. The server name decides whether this is demo or live:
+    # "MetaQuotes-Demo" is a demo server, so capital cannot reach it, but a
+    # real broker server name would be live with no separate flag to check.
     mt5_login = int(os.environ.get("MT5_LOGIN", "0"))
     mt5_password = os.environ.get("MT5_PASSWORD", "")
     mt5_server = os.environ.get("MT5_SERVER", "")
-    if mt5_login:
+    if mt5_login and venue_enabled("mt5"):
+        print(f"  MT5: login={mt5_login} server={mt5_server} "
+              f"({'DEMO server' if 'demo' in mt5_server.lower() else 'LIVE — real money'})")
         mt5_exec = MT5Executor(
             state_manager=state,
             risk_manager=risk,
@@ -355,6 +380,13 @@ def main():
             server=mt5_server,
             dry_run=not LIVE_TRADING,
             allow_min_lot=CONFIG["execution"].get("mt5_allow_min_lot", False),
+            # Bridge-side guards, enforced on the Windows box independently of
+            # the engine so a compromised engine still cannot place a runaway
+            # order. Sized well above what the risk manager allows in normal
+            # operation, so they bite on a malfunction rather than on a signal.
+            max_lot=CONFIG.get("risk", {}).get("mt5_max_lot", 0),
+            max_open_trades=CONFIG.get("risk", {}).get("mt5_max_open_trades", 0),
+            max_daily_loss_pct=CONFIG.get("risk", {}).get("mt5_max_daily_loss_pct", 0),
         )
         if mt5_exec.connect():
             executors["mt5"] = mt5_exec

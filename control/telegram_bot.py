@@ -14,10 +14,14 @@ real-time control and monitoring via Telegram commands with HTML formatting:
 /hourly    - Recent hourly reports
 /kill      - Emergency halt all trading
 /resume    - Resume trading after review
+/venues    - Per-venue exposure and kill-switch state
+/disable_venue - Block new entries on one venue
+/enable_venue  - Allow entries on a venue again
 /help      - List all commands
 """
 import os
 import json
+import html
 import logging
 import threading
 
@@ -41,6 +45,12 @@ def _is_authorized(user_id: int) -> bool:
         return True
     allowed = [int(uid.strip()) for uid in ALLOWED_USERS.split(",") if uid.strip()]
     return user_id in allowed
+
+
+def _esc_html(value) -> str:
+    """Telegram sends these as parse_mode=HTML, so operator-supplied arguments
+    (venue names, reasons) must be escaped before they are interpolated."""
+    return html.escape(str(value), quote=False)
 
 
 def _pnl_color(pnl: float) -> str:
@@ -75,6 +85,9 @@ class TelegramControlBot:
         self._app.add_handler(CommandHandler("hourly", self._cmd_hourly))
         self._app.add_handler(CommandHandler("kill", self._cmd_kill))
         self._app.add_handler(CommandHandler("resume", self._cmd_resume))
+        self._app.add_handler(CommandHandler("venues", self._cmd_venues))
+        self._app.add_handler(CommandHandler("disable_venue", self._cmd_disable_venue))
+        self._app.add_handler(CommandHandler("enable_venue", self._cmd_enable_venue))
         self._app.add_handler(CommandHandler("help", self._cmd_help))
 
         self._thread = threading.Thread(target=self._run_polling, daemon=True)
@@ -92,6 +105,13 @@ class TelegramControlBot:
             from core.state_manager import StateManager
             self.state = StateManager(stake_amount=0)
         return self.state
+
+    def _get_risk(self):
+        """The risk manager is in-process, so the venue kill switch it holds is
+        the one the engine consults on every order. A second instance would be
+        a different set with no effect on trading, so fall back to nothing
+        rather than constructing a detached one."""
+        return self.risk
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _is_authorized(update.effective_user.id):
@@ -366,6 +386,89 @@ class TelegramControlBot:
             parse_mode="HTML",
         )
 
+    # ---------- per-venue kill switch ----------
+
+    def _venue_exposure(self) -> dict:
+        """Open notional per venue, using the risk manager's own notional
+        conversion so a reported figure matches what the cap is measured on."""
+        from core.risk_manager import position_notional_usd
+
+        out = {}
+        for p in self._get_state().get_open_positions():
+            venue = (p.get("exchange") or "unknown").lower()
+            out[venue] = out.get(venue, 0.0) + position_notional_usd(p)
+        return out
+
+    async def _cmd_venues(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        risk = self._get_risk()
+        rs = self._get_state().get_risk_state()
+        balance = rs.get("trading_balance", 0) or 0
+        if risk is None:
+            await update.message.reply_text(
+                "Risk manager unavailable in this process — venue kill switch state unknown.",
+                parse_mode="HTML")
+            return
+        cap = risk.max_venue_exposure_pct
+        disabled = set(risk.get_disabled_venues())
+        exposure = self._venue_exposure()
+
+        msg = ("<b>🏦 Venues</b>\n"
+               "<i>Each venue holds its own balance and deposit address.\n"
+               "Open notional vs cap:</i>\n\n")
+        if not exposure:
+            msg += "  no open positions\n"
+        for venue, value in sorted(exposure.items()):
+            pct = value / balance * 100 if balance > 0 else 0
+            msg += f"  <b>{venue}</b> — ${value:,.2f} ({pct:.1f}% of {cap}% cap)\n"
+        if disabled:
+            msg += f"\n🔴 <b>BLOCKED:</b> {', '.join(sorted(disabled))}\n"
+        msg += ("\n/disable_venue binance — block new entries on a venue\n"
+                "/enable_venue binance — allow again\n"
+                "<i>Open positions are still closed normally.</i>")
+        await update.message.reply_text(msg, parse_mode="HTML")
+
+    async def _cmd_disable_venue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: <code>/disable_venue binance</code>", parse_mode="HTML")
+            return
+        venue = context.args[0].strip().lower()
+        reason = " ".join(context.args[1:]) or "no reason given"
+        if self._get_risk() is None:
+            await update.message.reply_text(
+                "Risk manager unavailable — cannot change the kill switch.", parse_mode="HTML")
+            return
+        self._get_risk().disable_venue(venue, reason, actor=f"TG user {update.effective_user.id}")
+        await update.message.reply_text(
+            f"🔴 New entries on <b>{_esc_html(venue)}</b> are now blocked.\n"
+            f"Open positions there are still managed and closed normally.\n"
+            f"Re-enable with <code>/enable_venue {_esc_html(venue)}</code>.",
+            parse_mode="HTML")
+
+    async def _cmd_enable_venue(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update.effective_user.id):
+            await update.message.reply_text("Unauthorized.")
+            return
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: <code>/enable_venue binance</code>", parse_mode="HTML")
+            return
+        venue = context.args[0].strip().lower()
+        if self._get_risk() is None:
+            await update.message.reply_text(
+                "Risk manager unavailable — cannot change the kill switch.", parse_mode="HTML")
+            return
+        self._get_risk().enable_venue(venue, actor=f"TG user {update.effective_user.id}")
+        await update.message.reply_text(
+            f"🟢 New entries on <b>{_esc_html(venue)}</b> re-enabled.",
+            parse_mode="HTML")
+
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = (
             "<b>🤖 Wamucheha Trading Bot</b>\n"
@@ -378,10 +481,13 @@ class TelegramControlBot:
             "  /history [SYMBOL] — Trade history\n"
             "  /performance — Per-symbol breakdown\n"
             "  /equity — Equity curve\n"
-            "  /hourly — Hourly reports\n\n"
+            "  /hourly — Hourly reports\n"
+            "  /venues — Per-venue exposure & kill switch state\n\n"
             "<b>Control:</b>\n"
             "  /kill — Emergency halt trading\n"
-            "  /resume — Resume trading\n\n"
+            "  /resume — Resume trading\n"
+            "  /disable_venue [venue] [reason] — block new entries on one venue\n"
+            "  /enable_venue [venue] — allow entries again\n\n"
             "  /help — This message"
         )
         await update.message.reply_text(msg, parse_mode="HTML")

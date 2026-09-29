@@ -23,27 +23,72 @@ risk:
   max_open_positions: 12             # absolute cap on simultaneous open trades
   max_asset_class_exposure_pct: 30   # max % of trading_balance exposed to any single asset class
   max_correlated_positions: 3        # max positions in the same correlation group (e.g. BTC+ETH+...)
+  # Max % of trading_balance exposed to a single venue, so one exchange
+  # freezing, freezing withdrawals, or being hacked cannot take everything.
+  # Measured on open-position notional, not margin.
+  max_venue_exposure_pct: 40
+  # --- MT5 bridge guards ---
+  # Enforced on the Windows side by the executor, independently of the engine,
+  # so a compromised or malfunctioning engine still cannot place a runaway
+  # order. Sized well above normal operation: these exist to catch a fault,
+  # not to interfere with a signal. 0 = that particular guard is off.
+  mt5_max_lot: 1.0             # absolute ceiling on any single MT5 order
+  mt5_max_open_trades: 4      # concurrent MT5 positions
+  mt5_max_daily_loss_pct: 4   # daily loss halt, independent of the engine's
   reconciliation_interval_seconds: 300  # how often to reconcile exchange balances with tracked state
 
 execution:
+  # Venue layout. Every venue holds its OWN balance and has its OWN deposit
+  # address — they are never "funded by" each other. The cold/stake wallet
+  # (account.stake_wallet_address) is the treasury above them: you send USDT
+  # from it to a venue's deposit address, and withdraw profits back to it.
+  # Per-venue funding amounts are yours to set on the exchange side; the bot
+  # never moves funds and is never given withdrawal permission.
+  # Full per-venue checklist, network fees and the pre-flight go-live steps:
+  #   docs/FUNDING.md
+  # A venue listed here with enabled:false gets NO executor at all, which is
+  # what stops it trading even when its env keys point at a live endpoint.
+  # Before flipping LIVE_TRADING=true run: python scripts/preflight.py
+  #
+  # Symbol selection is by LIQUIDITY, not unit price. A coin's price per unit
+  # has nothing to do with how expensive it is to trade — you can buy
+  # fractions, and a 5% move earns the same % whatever the price. What matters
+  # is 24h volume, spread, and that volatility comfortably exceeds
+  # fees + spread. Thin pairs (QNT) are added last and capped.
   exchanges:
     - name: binance
       enabled: true
-      markets: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+      markets: ["ETH/USDT", "SOL/USDT", "XRP/USDT", "LINK/USDT"]
     - name: okx
       enabled: true
-      markets: ["BTC/USDT", "ETH/USDT", "SOL/USDT", "DOGE/USDT", "ADA/USDT"]
+      markets: ["ETH/USDT", "SOL/USDT"]
+    # Bybit needs no new code: the name is already whitelisted in the executor
+    # (main.py), the market-data router (data_feeds/feed_router.py) and the
+    # always-open crypto set (core/market_hours.py), and it resolves through
+    # the same generic ccxt ExecutionManager as Binance and OKX. It reads
+    # BYBIT_API_KEY / BYBIT_API_SECRET from .env.
+    - name: bybit
+      enabled: true
+      markets: ["ETH/USDT", "SOL/USDT"]
+    # OANDA overlaps MT5 on both forex and metals. One venue for both keeps
+    # margin and risk in one place. Left disabled; re-enable only if you
+    # deliberately want a second forex venue.
     - name: oanda
-      enabled: true
+      enabled: false
       markets: []
+    # US equities stay off until you confirm your Alpaca account type is
+    # available to Kenyan residents.
     - name: alpaca
-      enabled: true
+      enabled: false
       markets: []
     - name: mt5
       enabled: true
       markets: []
-  # This OANDA account offers currency pairs only (no XAU/USD, BTC/USD CFDs) —
-  # gold trades through MT5 (XAUUSD) and Alpaca (GLD ETF) instead.
+  # MT5 carries forex AND metals, so all your non-crypto risk is sized in one
+  # place against one broker's margin. BTCUSD is left out on purpose: the same
+  # exposure is available as a spot pair on Binance/OKX with real volume, and
+  # a CFD price feed adds spread for no diversification.
+  # Silver (XAGUSD) is commented out until the broker is confirmed to offer it.
   oanda_markets:
     - "GBP/USD"
     - "EUR/USD"
@@ -55,13 +100,14 @@ execution:
     - "GBP/JPY"
   mt5_markets:
     - "XAUUSD"
-    - "BTCUSD"
-    - "GBPUSD"
     - "EURUSD"
+    - "GBPUSD"
     - "AUDUSD"
     - "EURJPY"
     - "EURGBP"
     - "USDCAD"
+    # - "XAGUSD"     # silver — uncomment once the broker lists it
+    # - "BTCUSD"    # crypto CFD — prefer spot on Binance/OKX (deeper book)
   alpaca_markets: ["AAPL", "MSFT", "SPY", "QQQ", "GLD", "TLT"]
   # MT5's minimum order is 0.01 lot (~$1,000 EURUSD, ~$4,000 gold) — far above
   # max_position_pct of a small trading balance. false: skip such trades.
@@ -174,8 +220,11 @@ intelligence:
 
 long_term:
   # Free by default: US/ETF data+fundamentals via yfinance (no key/signup),
-  # NSE data+fundamentals via afx.kwayisi.org (no key/signup). FMP/Alpha
-  # Vantage API keys in .env are optional richer fallbacks, not required.
+  # NSE prices via RapidAPI NSE_RAPIDAPI_KEY (optional, gives the whole
+  # exchange in one request) with a free afx.kwayisi.org fallback, and NSE
+  # fundamentals via afx.kwayisi.org — RapidAPI's /stocks endpoint returns no
+  # P/E, EPS or dividend data. FMP/Alpha Vantage keys in .env are optional
+  # richer fallbacks, not required.
   universe:
     us_stocks: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "JNJ", "KO",
                 "PG", "V", "JPM", "XOM", "WMT", "HD", "UNH", "PEP", "AVGO"]
@@ -201,8 +250,21 @@ nse:
               "COOP", "ABSA", "SCBK", "NCBA"]
   analysis_interval_minutes: 60   # how often to check NSE stocks for alerts
 
+  # --- Exchange-wide daily snapshot (RapidAPI) ---
+  # NSE trades 09:00-15:00 EAT, so 16:00 EAT is after the close. This trigger is
+  # pinned to Africa/Nairobi in long_term/scheduler.py, so it does not depend on
+  # the host clock. It is the ONLY job permitted to call RapidAPI: the Basic plan
+  # allows 4 requests/hour and 250/month, and this costs ~22 calls/month.
+  snapshot_schedule: "0 16 * * MON-FRI"
+  misfire_grace_minutes: 180       # if the process was down at 16:00, still take the close
+  fundamentals_max_workers: 4      # threads hitting the free afx.kwayisi.org site for P/E etc.
+
 alerts:
   channels: [telegram, discord, email, dashboard]
+  # NOTE: this block is not read by the code. Per-event channel routing lives in
+  # code — see EMAIL_ALLOWED_EVENTS in alerts/notifier.py, which decides the only
+  # event type that reaches email (the daily investing digest). Everything else
+  # is Telegram/Discord only.
   notify_on:
     - trade_opened
     - trade_closed

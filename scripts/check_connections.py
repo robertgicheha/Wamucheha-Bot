@@ -6,9 +6,14 @@ sends NO messages. Run it on the VPS after deploying — OKX keys are
 IP-whitelisted, so results from another machine can differ:
 
     python scripts/check_connections.py
+
+Quota note: the RapidAPI NSE check deliberately hits /health, never /stocks.
+The Basic plan allows only 4 requests/hour and 250/month, and /stocks is
+reserved for the single daily call in long_term/scheduler.py.
 """
 import os
 import sys
+import json
 import smtplib
 from pathlib import Path
 
@@ -124,10 +129,42 @@ def news():
     return "ok"
 run("NewsAPI", news)
 
-def apify():
-    r = requests.get("https://api.apify.com/v2/users/me", params={"token": E("APIFY_TOKEN")}, timeout=T)
-    r.raise_for_status(); return f"user={r.json()['data']['username']}"
-run("Apify", apify)
+# ---------- NSE Kenya ----------
+# Checks the RapidAPI NSE subscription, NOT the /stocks endpoint. /stocks is the
+# one quota-consuming call (4/hour, 250/month) and this script must never spend
+# it, so plan validity is verified against /health and a live fetch is left to
+# the 16:00 EAT job.
+NSE_HOST = "nairobi-stock-exchange-nse.p.rapidapi.com"
+NSE_HDRS = {"x-rapidapi-key": E("NSE_RAPIDAPI_KEY"), "x-rapidapi-host": NSE_HOST}
+
+def nse_rapidapi():
+    if not E("NSE_RAPIDAPI_KEY"):
+        return "SKIP - NSE_RAPIDAPI_KEY not set (falls back to afx.kwayisi.org)"
+    r = requests.get(f"https://{NSE_HOST}/health", headers=NSE_HDRS, timeout=T)
+    if r.status_code in (401, 403):
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:120]} - "
+                           "key is wrong or the plan is not subscribed")
+    r.raise_for_status()
+    return f"ok (no /stocks call - that is the daily job's budget)"
+
+run("RapidAPI NSE", nse_rapidapi)
+
+def nse_afx():
+    # Free fallback source: also supplies every NSE fundamental (P/E, EPS, DPS).
+    r = requests.get("https://afx.kwayisi.org/nse/", timeout=T,
+                     headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return "ok" if "<table" in r.text.lower() else "reachable but no tables found"
+run("NSE fundamentals (afx.kwayisi.org)", nse_afx)
+
+def nse_cache():
+    f = ROOT / "data" / "nse_cache" / "rapidapi_snapshot.json"
+    if not f.exists():
+        return "no snapshot yet - run the 16:00 EAT job, or: python -c \"from data_feeds.nse_feed import NSEFeed; NSEFeed().refresh_market_snapshot()\""
+    j = json.loads(f.read_text())
+    return (f"{len(j.get('stocks', []))} securities, trading_date={j.get('trading_date')}, "
+            f"fetched_at={j.get('fetched_at')}")
+run("NSE persisted snapshot", nse_cache)
 
 # ---------- Alerts / control bots (no messages sent) ----------
 def tg():

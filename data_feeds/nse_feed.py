@@ -5,24 +5,30 @@ The Nairobi Securities Exchange does NOT offer a public trading API. There is no
 ccxt support, no OANDA equivalent, no broker with open algo-access for NSE.
 
 Data sources, in priority order:
-1. Apify NSE scraper (paid, requires APIFY_TOKEN) — used for get_ohlcv() when
-   available, since it's the only source here that returns real historical
-   daily OHLCV series.
+1. RapidAPI "Nairobi Stock Exchange (NSE)" (paid, requires NSE_RAPIDAPI_KEY) —
+   the structured source of record for the exchange-wide price feed.
+   GET /stocks returns EVERY listed security in a single request
+   (ticker, name, ISIN, volume, price, day change %, sector), which is what
+   refresh_market_snapshot() persists once per trading day. See the quota
+   note on refresh_market_snapshot() before adding any other call site.
 2. afx.kwayisi.org (free, no key, no signup) — a live NSE quote aggregator.
    Verified working against real requests: the exchange-wide page
    (afx.kwayisi.org/nse/) exposes the full listed-companies table plus
    ready-made Top Gainers / Bottom Losers tables in ONE request, and each
    ticker's page (afx.kwayisi.org/nse/<ticker>/) exposes price, day
    low/high, volume, and fundamentals (EPS, P/E, dividend yield, market
-   cap) — this is what get_market_snapshot() and get_quote() use, and it's
-   also what fills the fundamentals gap noted in long_term/fundamentals.py.
+   cap) — this is what get_quote() uses, and it's also what fills the
+   fundamentals gap noted in long_term/fundamentals.py, because RapidAPI's
+   /stocks endpoint returns no fundamentals at all. It also serves as the
+   free between-days fallback for the exchange-wide snapshot.
    It does NOT expose a historical daily-close time series though (only a
    live snapshot + 1WK/4WK/3MO % performance), so it cannot alone support a
    200-day-moving-average trend check — see _accumulate_daily_snapshot().
 3. Local CSV cache, including a slow-building one built by appending one
-   snapshot row per calendar day (see _accumulate_daily_snapshot) so
-   trend_context-style analysis becomes possible for free after enough
-   days have accumulated, without ever promising it's available on day one.
+   snapshot row per calendar day (see _accumulate_daily_snapshot and
+   record_daily_snapshot) so trend_context-style analysis and the forecast
+   module become possible for free after enough days have accumulated,
+   without ever promising it's available on day one.
 
 CRITICAL LIMITATION: NSE is alert/analysis only — NOT automated execution.
 The long_term/screener.py uses this for trend context on Kenyan stocks, but
@@ -32,13 +38,14 @@ AIB-AXYS, Faida) manually or via their proprietary FIX/API if they offer one.
 import os
 import re
 import time
+import json
 import logging
 from typing import TYPE_CHECKING, Any
 
 import requests
 import pandas as pd
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date as _date
 
 if TYPE_CHECKING:
     # Always visible to the type checker, regardless of whether bs4 is
@@ -61,6 +68,61 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 AFX_BASE = "https://afx.kwayisi.org/nse"
 _HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+
+# ---------- RapidAPI: "Nairobi Stock Exchange (NSE)" ----------
+
+# Primary structured price feed for the whole exchange. The Basic plan allows
+# only 4 requests/hour and 250/month, so the quota is a hard design constraint
+# here: see refresh_market_snapshot() for how that is enforced.
+RAPIDAPI_HOST = os.environ.get(
+    "NSE_RAPIDAPI_HOST", "nairobi-stock-exchange-nse.p.rapidapi.com"
+).strip()
+RAPIDAPI_BASE = f"https://{RAPIDAPI_HOST}"
+SNAPSHOT_FILE = CACHE_DIR / "rapidapi_snapshot.json"
+
+# A persisted snapshot older than this is treated as stale (covers weekends
+# and public holidays, when no new snapshot is written).
+SNAPSHOT_MAX_AGE = timedelta(hours=36)
+
+
+def _nse_today() -> _date:
+    """Today's date in East Africa Time.
+
+    NSE trades 09:00-15:00 EAT (06:00-12:00 UTC), so a UTC calendar date is
+    the *previous* day for any snapshot taken before 03:00 EAT. Using the
+    Nairobi date keeps one trading day mapped to one row, which is what the
+    per-ticker CSVs and the forecast windows depend on.
+    """
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).date()
+
+
+def _nse_time() -> datetime:
+    """Current time in East Africa Time (UTC+3, no DST)."""
+    return datetime.now(timezone.utc) + timedelta(hours=3)
+
+
+def _rapidapi_headers(key: str) -> dict[str, str]:
+    return {"x-rapidapi-key": key, "x-rapidapi-host": RAPIDAPI_HOST}
+
+
+def _to_float(value: Any) -> float | None:
+    """RapidAPI returns every number as a string ("36.50", ".45", "0.00")."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().replace(",", "")
+    if not text or text.lower() in ("null", "none", "n/a", "-"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _to_int(value: Any) -> int | None:
+    number = _to_float(value)
+    return int(number) if number is not None else None
 
 # Every security listed on the NSE, verified against the live
 # afx.kwayisi.org/nse/ listed-companies table (71 tickers, including the two
@@ -136,21 +198,217 @@ def _kv_table(table: Any) -> dict[str, str]:
 
 
 class NSEFeed:
-    def __init__(self, apify_token: str | None = None):
-        self.apify_token = apify_token or os.environ.get("APIFY_TOKEN")
+    def __init__(self, rapidapi_key: str | None = None):
+        self.rapidapi_key = rapidapi_key or os.environ.get("NSE_RAPIDAPI_KEY")
         self._snapshot_cache = None
         self._snapshot_cache_ts = 0
         self._snapshot_cache_ttl = 900  # 15 min — index page is cheap, refresh often
         self._quote_cache = {}
         self._quote_cache_ttl = 900
 
+    # ---------- RapidAPI: the one quota-burning call site ----------
+
+    @property
+    def rapidapi_configured(self) -> bool:
+        return bool(self.rapidapi_key)
+
+    def refresh_market_snapshot(self, force_refresh: bool = False) -> dict[str, Any] | None:
+        """Fetch the whole exchange from RapidAPI GET /stocks, persist it, and
+        append one row per ticker to the daily history CSVs.
+
+        THIS IS THE ONLY FUNCTION THAT CALLS RAPIDAPI. Quota is 4 requests/hour
+        and 250/month on the Basic plan, so at one call per trading day this
+        costs ~22 calls/month. Nothing else in this codebase — the hourly
+        dashboard refresh included — may call it directly; every other reader
+        goes through get_market_snapshot(), which prefers the persisted file.
+        Call it from the 16:00 EAT job, not from a per-request code path.
+        """
+        if not self.rapidapi_key:
+            logger.warning("NSE_RAPIDAPI_KEY not set — cannot refresh RapidAPI snapshot")
+            return None
+
+        persisted = self.load_persisted_snapshot()
+        if not force_refresh and persisted and not persisted.get("stale"):
+            logger.info("RapidAPI NSE snapshot already persisted and fresh — skipping call")
+            return persisted
+
+        try:
+            resp = requests.get(
+                f"{RAPIDAPI_BASE}/stocks",
+                headers=_rapidapi_headers(self.rapidapi_key),
+                timeout=25,
+            )
+        except Exception as e:
+            logger.warning(f"NSE RapidAPI /stocks fetch failed: {e}")
+            return persisted
+
+        if resp.status_code == 429:
+            logger.warning("NSE RapidAPI rate limited (429) — keeping previous snapshot")
+            return persisted
+        if resp.status_code != 200:
+            logger.warning(f"NSE RapidAPI /stocks returned HTTP {resp.status_code}: "
+                           f"{resp.text[:200]}")
+            return persisted
+
+        try:
+            payload = resp.json()
+        except ValueError as e:
+            logger.warning(f"NSE RapidAPI /stocks returned non-JSON body: {e}")
+            return persisted
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            logger.warning(f"NSE RapidAPI /stocks unexpected shape: {type(payload).__name__}")
+            return persisted
+
+        stocks = []
+        for row in payload["data"]:
+            ticker = str(row.get("ticker") or "").strip().upper()
+            if not ticker:
+                continue
+            price = _to_float(row.get("price"))
+            volume = _to_int(row.get("volume"))
+            change_pct = _to_float(row.get("change"))
+            stocks.append({
+                "ticker": ticker,
+                "name": (row.get("name") or ticker).strip(),
+                "isin": (row.get("isin") or None),
+                "sector": (row.get("sector") or None),
+                "price": price,
+                # "change" is the day move in PERCENT POINTS vs previous close.
+                "change_pct": change_pct,
+                "volume": volume,
+                # A listed name that traded nothing today is stale, not delisted
+                # — keep it, the user asked for all stocks, but flag it so the
+                # dashboard can grey it out instead of implying a live price.
+                "stale": bool(volume == 0),
+            })
+
+        if not stocks:
+            logger.warning("NSE RapidAPI /stocks returned zero usable rows — keeping previous snapshot")
+            return persisted
+
+        snapshot = {
+            "stocks": stocks,
+            "meta": payload.get("meta") or {},
+            "api_timestamp": payload.get("timestamp"),
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "trading_date": _nse_today().isoformat(),
+            "source": "rapidapi",
+        }
+        self._persist_snapshot(snapshot)
+        self.record_daily_snapshot(snapshot)
+        logger.info(f"RapidAPI NSE snapshot: {len(stocks)} securities persisted")
+        return snapshot
+
+    def load_persisted_snapshot(self) -> dict[str, Any] | None:
+        """Read the last RapidAPI snapshot from disk. Safe for any process —
+        the scheduler writes it, the dashboard and the bot's main loop read it,
+        and none of those readers spend quota."""
+        if not SNAPSHOT_FILE.exists():
+            return None
+        try:
+            snapshot = json.loads(SNAPSHOT_FILE.read_text())
+        except (ValueError, OSError) as e:
+            logger.warning(f"Could not read persisted NSE snapshot: {e}")
+            return None
+        if not isinstance(snapshot, dict) or not snapshot.get("stocks"):
+            return None
+        snapshot["stale"] = self._snapshot_is_stale(snapshot)
+        return snapshot
+
+    @staticmethod
+    def _snapshot_is_stale(snapshot: dict[str, Any]) -> bool:
+        fetched_at = snapshot.get("fetched_at")
+        if not fetched_at:
+            return True
+        try:
+            fetched = datetime.fromisoformat(fetched_at)
+        except (TypeError, ValueError):
+            return True
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - fetched) > SNAPSHOT_MAX_AGE
+
+    def _persist_snapshot(self, snapshot: dict[str, Any]) -> None:
+        """Atomic write — the dashboard may read this file at any moment."""
+        tmp = SNAPSHOT_FILE.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(snapshot, indent=2, default=str))
+            tmp.replace(SNAPSHOT_FILE)
+        except OSError as e:
+            logger.warning(f"Failed to persist NSE snapshot: {e}")
+
     # ---------- free live snapshot (afx.kwayisi.org) ----------
 
     def get_market_snapshot(self, force_refresh: bool = False) -> dict[str, Any] | None:
-        """One request covering the whole exchange: NASI index, ready-made
-        Top Gainers / Bottom Losers, and the full listed-companies table
-        (ticker, name, volume, price, day change). Returns None if the
-        source is unreachable (caller should fall back to cache/skip)."""
+        """One exchange-wide snapshot in a single request, regardless of source.
+
+        Prefers the persisted RapidAPI /stocks file when one exists (it carries
+        every listed security plus ISIN and sector, which the AFX scrape lacks),
+        and falls back to the free afx.kwayisi.org scrape otherwise. Both paths
+        return the SAME shape so every existing consumer keeps working:
+            {"gainers": [...], "losers": [...], "universe": [...],
+             "fetched_at": ..., "source": ...}
+        Returns None if no source is reachable (caller should skip).
+        """
+        persisted = self.load_persisted_snapshot()
+        if persisted is not None:
+            return self._snapshot_as_movers(persisted)
+
+        return self._get_afx_snapshot(force_refresh=force_refresh)
+
+    @staticmethod
+    def _snapshot_as_movers(snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Map a RapidAPI /stocks snapshot onto the existing
+        gainers/losers/universe contract. Gainers and losers are derived by
+        sorting on change_pct, since the RapidAPI endpoint has no per-sector
+        "top movers" tables."""
+        universe = []
+        for stock in snapshot.get("stocks", []):
+            change_pct = stock.get("change_pct")
+            universe.append({
+                "ticker": stock["ticker"],
+                "name": stock.get("name"),
+                "isin": stock.get("isin"),
+                "sector": stock.get("sector"),
+                "volume": stock.get("volume"),
+                "price": stock.get("price"),
+                "change_pct": change_pct,
+                "direction": ("up" if (change_pct or 0) > 0
+                              else "down" if (change_pct or 0) < 0 else "flat"),
+                "stale": bool(stock.get("stale")),
+            })
+
+        ranked = [u for u in universe if u["change_pct"] is not None]
+        gainers = sorted(ranked, key=lambda u: u["change_pct"], reverse=True)
+        losers = sorted(ranked, key=lambda u: u["change_pct"])
+
+        out = dict(snapshot)
+        out["universe"] = universe
+        out["gainers"] = gainers
+        out["losers"] = losers
+        out["sectors"] = NSEFeed._sector_breakdown(universe)
+        return out
+
+    @staticmethod
+    def _sector_breakdown(universe: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Per-sector counts and total traded value, for the dashboard."""
+        by_sector: dict[str, dict[str, Any]] = {}
+        for row in universe:
+            sector = row.get("sector") or "Unclassified"
+            entry = by_sector.setdefault(sector, {"sector": sector, "count": 0,
+                                                   "traded_value": 0.0})
+            entry["count"] += 1
+            price, volume = row.get("price"), row.get("volume")
+            if price and volume:
+                entry["traded_value"] += price * volume
+        return sorted(by_sector.values(), key=lambda e: e["traded_value"], reverse=True)
+
+    def _get_afx_snapshot(self, force_refresh: bool = False) -> dict[str, Any] | None:
+        """The free afx.kwayisi.org fallback: the exchange-wide page exposes the
+        full listed-companies table plus ready-made Top Gainers / Bottom Losers
+        tables in ONE request. Used when no RapidAPI snapshot has been persisted
+        yet, and between trading days when prices have moved on."""
         now = time.time()
         if not force_refresh and self._snapshot_cache is not None \
                 and now - self._snapshot_cache_ts < self._snapshot_cache_ttl:
@@ -213,6 +471,7 @@ class NSEFeed:
             "gainers": parse_movers(tables[1]),
             "losers": parse_movers(tables[2]),
             "universe": parse_universe(tables[3]),
+            "sectors": self._sector_breakdown(parse_universe(tables[3])),
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "source": "afx.kwayisi.org",
         }
@@ -294,32 +553,72 @@ class NSEFeed:
 
     # ---------- slow-building free historical cache ----------
 
-    def _accumulate_daily_snapshot(self, ticker: str, quote: dict[str, Any]):
-        """Append one row/day to a per-ticker CSV so a real (if initially
-        short) daily-close history builds up for free over time, since
-        afx.kwayisi.org itself only exposes a live snapshot, not a
-        historical series. Safe to call every time get_quote() runs —
-        dedupes on calendar date."""
-        if quote.get("price") is None:
-            return
-        cache_file = CACHE_DIR / f"{ticker}_daily.csv"
-        today = datetime.now(timezone.utc).date().isoformat()
-        row = {
-            "date": today, "open": quote["price"], "high": quote.get("day_high") or quote["price"],
-            "low": quote.get("day_low") or quote["price"], "close": quote["price"],
-            "volume": quote.get("volume") or 0,
-        }
+    def record_daily_snapshot(self, snapshot: dict[str, Any]) -> int:
+        """Append one row per ticker to the daily history CSVs, from a RapidAPI
+        /stocks snapshot.
+
+        This is what actually builds the chart and forecast history: the
+        RapidAPI Basic plan serves only the live /stocks list (history
+        endpoints are Pro-only), so the time series is accumulated locally,
+        one close per trading day, for every security on the exchange.
+        /stocks carries no intraday high/low, so open=high=low=close=price.
+        Returns the number of tickers written.
+        """
+        written = 0
+        trading_date = snapshot.get("trading_date") or _nse_today().isoformat()
+        for stock in snapshot.get("stocks", []):
+            price = stock.get("price")
+            if not price:
+                continue
+            if self._append_history_row(
+                stock["ticker"], trading_date,
+                open_=price, high=price, low=price, close=price,
+                volume=stock.get("volume") or 0,
+            ):
+                written += 1
+        logger.info(f"Recorded NSE daily close for {written}/{len(snapshot.get('stocks', []))} "
+                    f"securities ({trading_date})")
+        return written
+
+    def _append_history_row(self, ticker: str, day: str, open_: float, high: float,
+                            low: float, close: float, volume: float) -> bool:
+        """Append or replace one trading day in a ticker's CSV. Returns True if
+        the file was written. Dedupes on date so re-running is safe."""
+        cache_file = CACHE_DIR / f"{ticker.upper()}_daily.csv"
+        row = {"date": day, "open": open_, "high": high, "low": low,
+               "close": close, "volume": int(volume or 0)}
         try:
             if cache_file.exists():
                 existing = pd.read_csv(cache_file)
-                if today in existing["date"].astype(str).values:
-                    return
+                if day in existing["date"].astype(str).values:
+                    return False
                 existing = pd.concat([existing, pd.DataFrame([row])], ignore_index=True)
             else:
                 existing = pd.DataFrame([row])
             existing.to_csv(cache_file, index=False)
+            return True
         except Exception as e:
             logger.warning(f"Failed to accumulate NSE daily snapshot for {ticker}: {e}")
+            return False
+
+    def _accumulate_daily_snapshot(self, ticker: str, quote: dict[str, Any]):
+        """Append one row/day to a per-ticker CSV so a real (if initially
+        short) daily-close history builds up for free over time, since
+        neither afx.kwayisi.org nor RapidAPI's /stocks exposes a historical
+        series. Safe to call every time get_quote() runs — dedupes on the
+        East Africa trading date, not the UTC one, so a 02:00 UTC run and a
+        16:00 EAT run land on the same trading day rather than two."""
+        if quote.get("price") is None:
+            return
+        price = quote["price"]
+        self._append_history_row(
+            ticker, _nse_today().isoformat(),
+            open_=price,
+            high=quote.get("day_high") or price,
+            low=quote.get("day_low") or price,
+            close=price,
+            volume=quote.get("volume") or 0,
+        )
 
     def get_accumulated_history(self, ticker: str) -> pd.DataFrame | None:
         """Daily OHLCV built from accumulated free snapshots (see above).
@@ -336,19 +635,17 @@ class NSEFeed:
         except Exception:
             return None
 
-    # ---------- historical OHLCV (Apify only — the one real source) ----------
+    # ---------- historical OHLCV (locally accumulated) ----------
 
     def get_ohlcv(self, symbol: str, timeframe: str = "1d", limit: int = 200) -> pd.DataFrame:
-        """Historical daily OHLCV. Apify (paid) is the only source here that
-        provides a real historical series; without it, falls back to
-        whatever has accumulated in get_accumulated_history() — which may
-        be much shorter than `limit` days, especially early on."""
-        ticker = symbol.replace(".NSE", "").replace("/NSE", "").upper()
+        """Historical daily OHLCV, served from the locally accumulated CSV.
 
-        if self.apify_token:
-            df = self._fetch_via_apify(ticker)
-            if df is not None and len(df) > 0:
-                return df.tail(limit)
+        There is no backfill: the RapidAPI history endpoints are Pro-only, so
+        the series starts at the first scheduled 16:00 EAT snapshot and grows
+        one row per trading day. Callers must handle a short series — the
+        screener's 200DMA check needs 200 rows, i.e. roughly 10 months, and the
+        trend/forecast code degrades honestly below that."""
+        ticker = symbol.replace(".NSE", "").replace("/NSE", "").upper()
 
         accumulated = self.get_accumulated_history(ticker)
         if accumulated is not None and len(accumulated) > 0:
@@ -356,75 +653,14 @@ class NSEFeed:
 
         return pd.DataFrame(columns=pd.Index(["open", "high", "low", "close", "volume"]))
 
-    def _fetch_via_apify(self, ticker: str) -> pd.DataFrame | None:
-        """Use the Apify NSE Kenya scraper actor."""
-        try:
-            url = "https://api.apify.com/v2/acts/wafspaul~nse-kenya-market-data/runs"
-            resp = requests.post(
-                url,
-                json={"tickers": [ticker], "days": 90},
-                headers={"Authorization": f"Bearer {self.apify_token}"},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            run_data = resp.json().get("data", {})
-            run_id = run_data.get("id")
-            if not run_id:
-                return None
-
-            # Poll for completion (Apify runs are async)
-            succeeded = False
-            status_resp = None
-            for _ in range(30):
-                time.sleep(2)
-                status_resp = requests.get(
-                    f"https://api.apify.com/v2/actor-runs/{run_id}",
-                    headers={"Authorization": f"Bearer {self.apify_token}"},
-                    timeout=10,
-                )
-                status = status_resp.json().get("data", {}).get("status")
-                if status == "SUCCEEDED":
-                    succeeded = True
-                    break
-                elif status in ("FAILED", "ABORTED", "TIMED-OUT"):
-                    return None
-
-            if not succeeded or status_resp is None:
-                return None  # still running after ~60s of polling — give up rather than use a stale status
-
-            # Fetch dataset
-            dataset_id = status_resp.json().get("data", {}).get("defaultDatasetId")
-            if not dataset_id:
-                return None
-            data_resp = requests.get(
-                f"https://api.apify.com/v2/datasets/{dataset_id}/items",
-                headers={"Authorization": f"Bearer {self.apify_token}"},
-                timeout=15,
-            )
-            items = data_resp.json()
-            if not items:
-                return None
-
-            rows: list[dict[str, object]] = []
-            for item in items:
-                rows.append({
-                    "timestamp": pd.Timestamp(item.get("date", item.get("timestamp"))),
-                    "open": float(item.get("open", 0)),
-                    "high": float(item.get("high", 0)),
-                    "low": float(item.get("low", 0)),
-                    "close": float(item.get("close", 0)),
-                    "volume": int(item.get("volume", 0)),
-                })
-            df = pd.DataFrame(rows)
-            df.set_index("timestamp", inplace=True)
-            df.sort_index(inplace=True)
-            return df
-        except Exception:
-            return None
-
     def latest_price(self, symbol: str) -> float | None:
-        """Get latest price — prefers the free live afx.kwayisi.org quote."""
+        """Get latest price — the persisted RapidAPI snapshot first (it is
+        fresher and costs no quota), then the free AFX quote, then the last
+        accumulated close."""
         ticker = symbol.replace(".NSE", "").replace("/NSE", "").upper()
+        for stock in (self.load_persisted_snapshot() or {}).get("stocks", []):
+            if stock["ticker"] == ticker and stock.get("price"):
+                return float(stock["price"])
         quote = self.get_quote(ticker)
         if quote and quote.get("price") is not None:
             return quote["price"]
@@ -434,8 +670,14 @@ class NSEFeed:
         return None
 
     def get_nse_tickers(self) -> list[str]:
-        """Returns the default NSE watchlist — every security verified
-        listed on the exchange as of when DEFAULT_NSE_TICKERS was last
-        checked (see its comment). For the true current universe, live,
-        use get_market_snapshot()["universe"] instead."""
+        """The full listed universe.
+
+        Prefers the persisted RapidAPI snapshot, which is the true current
+        list and picks up listings/delistings automatically. Falls back to
+        DEFAULT_NSE_TICKERS — a point-in-time snapshot of every security
+        verified on the exchange when that constant was last checked, which
+        is how fundamentals.py decides whether a bare ticker is Kenyan."""
+        snapshot = self.load_persisted_snapshot()
+        if snapshot:
+            return [stock["ticker"] for stock in snapshot["stocks"]]
         return DEFAULT_NSE_TICKERS.copy()

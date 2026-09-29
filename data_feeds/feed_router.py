@@ -88,8 +88,7 @@ class FeedRouter:
             self.feeds["alpaca"] = AlpacaFeed(alpaca_key, alpaca_secret, paper=paper)
 
         # NSE feed for Kenyan stocks
-        apify_token = os.environ.get("APIFY_TOKEN")
-        self.feeds["nse"] = NSEFeed(apify_token=apify_token)
+        self.feeds["nse"] = NSEFeed()
 
         # MT5 feed for MetaTrader 5 symbols
         mt5_login = int(os.environ.get("MT5_LOGIN", "0"))
