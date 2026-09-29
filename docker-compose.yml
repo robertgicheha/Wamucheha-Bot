@@ -22,7 +22,8 @@ services:
       - engine-data:/app/data
       - ml-models:/app/ml/saved_models
     environment:
-      MT5_RPC_HOST: mt5          # compose service name (systemd deploy uses 127.0.0.1 from .env)
+      MT5_RPC_HOST: mt5
+      PYTHONUNBUFFERED: "1"          # compose service name (systemd deploy uses 127.0.0.1 from .env)
     networks:
       - trading-net
     depends_on:
