@@ -203,15 +203,25 @@ def main() -> int:
         else:
             warn(f"METAMASK_NETWORK='{network}' is not a known USDT network "
                  f"(expected TRC20, BEP20 or ERC20)")
+    # FUNDING_<VENUE>_USDT predates this check and its name is misleading: it
+    # holds the venue's DEPOSIT ADDRESS, not a target amount. It was printed as
+    # "... USDT", which made a 0x address look like a dollar figure and hid the
+    # fact that no amount is stored anywhere — the bot never moves money, so
+    # there is nothing to compare an amount against anyway.
     for name in ("binance", "okx", "bybit"):
         v = clean(f"FUNDING_{name.upper()}_USDT")
         if v:
-            ok(f"{name} funding target: {v} USDT")
+            if v.startswith("0x") and len(v) == 42:
+                ok(f"{name} deposit address: {v[:10]}...{v[-6:]}")
+            else:
+                warn(f"FUNDING_{name.upper()}_USDT does not look like a deposit "
+                     f"address (expected 0x followed by 40 hex chars): '{v}'")
     unfunded = [n for n in ("binance", "okx", "bybit")
                 if not clean(f"FUNDING_{n.upper()}_USDT")]
     if unfunded:
-        warn(f"no FUNDING_*_USDT target set for: {', '.join(unfunded)}. "
-             f"These are documentation only — you move money in MetaMask.")
+        warn(f"no deposit address recorded for: {', '.join(unfunded)} "
+             f"(set FUNDING_<VENUE>_USDT in .env). Documentation only — you "
+             f"move money in MetaMask and the bot never holds withdrawal rights.")
 
     # ---------- 5. IP allowlist ----------
     # Both Binance and OKX reject any request from an address that is not on

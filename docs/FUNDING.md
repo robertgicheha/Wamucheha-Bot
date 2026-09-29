@@ -8,6 +8,10 @@ key exists. Every transfer below is something **you** do, by hand, in the
 MetaMask UI or the venue's own screen. That is deliberate: a compromised VPS
 can lose trades, but it cannot drain your account.
 
+> **Quick reference:** [DEPOSIT_WITHDRAWAL.md](../DEPOSIT_WITHDRAWAL.md) —
+> one-page cheat sheet with addresses, networks (TRC20/BEP20), fees and the
+> preflight command.
+
 `core/risk_manager.py` watches the balance and, when it crosses
 `profit_withdrawal_threshold`, it only *notifies* you that a manual transfer
 is due. It does not transfer.

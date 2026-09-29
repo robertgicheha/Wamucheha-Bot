@@ -8,12 +8,14 @@ signal price and actual fill price.
 import uuid
 import ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from core.fee_manager import FeeModel
 from core.structured_logger import slippage_tracker, strategy_perf_tracker, api_failure_tracker, log_trade_open, log_trade_close
 
 
 class ExecutionManager:
     def __init__(self, exchange_id: str, api_key: str, api_secret: str,
-                 state_manager, risk_manager, notifier, dry_run: bool = True):
+                 state_manager, risk_manager, notifier, dry_run: bool = True,
+                 fee_model=None):
         self.state = state_manager
         self.risk = risk_manager
         self.notifier = notifier
@@ -29,6 +31,9 @@ class ExecutionManager:
         # In-memory only: after a restart the bot's own position monitor still
         # enforces the stop, and close_trade() sells whatever is actually free.
         self._stop_orders = {}
+        # Cost model. Built from config when the caller does not supply one,
+        # so an existing caller can never end up with an unpriced trade.
+        self.fees = fee_model or FeeModel()
 
     def _new_client_order_id(self, symbol: str) -> str:
         # Alphanumeric only: OKX rejects '-' in clOrdId (max 32 chars).
@@ -107,6 +112,23 @@ class ExecutionManager:
         target_price = entry_price * (1 + take_profit_pct / 100) if side == "buy" \
             else entry_price * (1 - take_profit_pct / 100)
 
+        # Minimum-edge guard: the expected gross profit at take-profit must exceed
+        # the round-trip cost by a margin, otherwise the trade is a guaranteed
+        # loss to fees. We use the configured notional (decision.position_size)
+        # and the venue's taker fee model.
+        estimated_notional = decision.position_size
+        round_trip_cost = self.fees.cost_estimate(
+            self.exchange_id, symbol, estimated_notional)
+        expected_gross = estimated_notional * (take_profit_pct / 100.0)
+        # Require expected gross >= 3x round-trip cost (i.e. fees < 33% of
+        # the target profit). If not, the signal cannot possibly pay for itself.
+        if expected_gross < 3 * round_trip_cost:
+            self.notifier.notify("trade_rejected",
+                f"{symbol} rejected: expected gross ${expected_gross:.2f} "
+                f"at {take_profit_pct:.1f}% TP < 3x round-trip cost "
+                f"${round_trip_cost:.2f} — fee drag too high")
+            return None
+
         # decision.position_size is a USD notional; exchanges want base-asset quantity.
         try:
             amount = self._base_amount(symbol, decision.position_size, entry_price)
@@ -122,6 +144,7 @@ class ExecutionManager:
         if self.dry_run:
             fill_price = entry_price
             filled_amount = amount
+            open_order = None
         else:
             try:
                 order = self._submit_order(
@@ -130,11 +153,21 @@ class ExecutionManager:
                 )
                 fill_price = order.get("average") or order.get("price") or entry_price
                 filled_amount = order.get("filled") or amount
+                open_order = order
             except Exception as e:
                 api_failure_tracker.record_failure(self.exchange_id, e, f"open_trade_{symbol}")
                 self.notifier.notify("trade_rejected", f"{symbol} order failed: {e}")
                 return None
 
+        # Venue fee on the way IN, priced from what the venue actually charged
+        # when it reports it and from the configured taker rate when it does
+        # not. Stored so the close can subtract the true round trip.
+        entry_notional = float(fill_price) * float(filled_amount)
+        entry_fee = self.fees.cost_for_fill(
+            self.exchange_id, symbol, entry_notional, order=open_order, fill_price=fill_price)
+        fee_rate = self.fees.rate_for(self.exchange_id, symbol)
+
+        if not self.dry_run:
             try:
                 # Spot stop-loss: Binance STOP_LOSS / OKX conditional order, market on trigger.
                 sl_amount = float(self.exchange.amount_to_precision(symbol, self._free_base(symbol, filled_amount)))
@@ -151,6 +184,7 @@ class ExecutionManager:
             client_order_id, self.exchange_id, symbol, side, filled_amount,
             fill_price, stop_price, target_price,
             strategies=strategies, score=score, regime=regime,
+            entry_fee=entry_fee["cost"], fee_rate=fee_rate,
         )
 
         # Track slippage (signal price vs actual fill)
@@ -162,7 +196,8 @@ class ExecutionManager:
 
         # Structured log
         log_trade_open(symbol, side, filled_amount, fill_price,
-                       self.exchange_id, strategies, score)
+                       self.exchange_id, strategies, score,
+                       entry_fee=entry_fee["cost"])
 
         # Rich notification
         self.notifier.notify_trade_opened(
@@ -171,6 +206,12 @@ class ExecutionManager:
             take_profit=target_price, exchange=self.exchange_id,
             dry_run=self.dry_run, strategies=strategies,
             score=score, regime=regime,
+            entry_fee=entry_fee["cost"],
+            # What the round trip will cost before it has happened. On a 3%
+            # target at 10bps a side this is ~0.2% of notional, and it belongs
+            # on the entry alert — a target that stops being worth reaching is
+            # a decision, not a detail.
+            round_trip_fee=self.fees.cost_estimate(self.exchange_id, symbol, entry_notional),
         )
 
         return client_order_id
@@ -183,15 +224,15 @@ class ExecutionManager:
 
         if not self.dry_run:
             symbol = pos["symbol"]
-            try:
-                # Free the coins locked in the resting stop-loss before selling them.
+            close_order = None
+            try:                # Free the coins locked in the resting stop-loss before selling them.
                 self._cancel_stop_order(client_order_id, symbol)
                 sell_amount = float(self.exchange.amount_to_precision(
                     symbol, self._free_base(symbol, pos["amount"])))
                 min_amount = self.exchange.market(symbol)["limits"]["amount"]["min"] or 0
                 if sell_amount > 0 and sell_amount >= min_amount:
-                    self._submit_order(symbol, "sell", sell_amount, "market",
-                                       {"clientOrderId": f"{client_order_id}CL"})
+                    close_order = self._submit_order(symbol, "sell", sell_amount, "market",
+                                                     {"clientOrderId": f"{client_order_id}CL"})
                 else:
                     # Coins already gone (exchange stop-loss fired, or sold manually).
                     self.notifier.notify("position_drift",
@@ -203,8 +244,23 @@ class ExecutionManager:
                 self.notifier.notify("trade_rejected", f"{symbol} close failed: {e}", priority="high")
                 return
 
+        # ── The number that matters: profit AFTER what it cost to trade ──
+        # gross_pnl is what the price chart says. net_pnl is what landed in
+        # the account. The gap is the venue fee on both fills, and it is the
+        # gap that turns a 60%-win-rate system into a losing one once the
+        # targets are only 2-3x the stop. Everything downstream — the balance,
+        # the daily PnL, the loss streak, the circuit breakers — is driven
+        # from net_pnl, never from gross_pnl.
         direction = 1 if pos["side"] == "buy" else -1
-        pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
+        gross_pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
+        exit_notional = float(exit_price) * float(pos["amount"])
+        exit_fee_info = self.fees.cost_for_fill(
+            self.exchange_id, pos["symbol"], exit_notional,
+            order=close_order, fill_price=exit_price)
+        exit_fee = exit_fee_info["cost"]
+        entry_fee = float(pos.get("entry_fee") or 0.0)
+        pnl = gross_pnl - entry_fee - exit_fee
+        total_fees = entry_fee + exit_fee
 
         # Get trade metadata for rich notification
         from sqlalchemy.orm import Session
@@ -212,6 +268,7 @@ class ExecutionManager:
         strategies = None
         score = None
         regime = None
+        opened_at = None
         with Session(engine) as session:
             trade = session.query(TradeRow).filter_by(
                 client_order_id=client_order_id
@@ -220,16 +277,20 @@ class ExecutionManager:
                 strategies = trade.strategies
                 score = trade.score
                 regime = trade.regime
+                opened_at = trade.opened_at
                 if strategies:
                     import json
                     strategies = json.loads(strategies)
 
-        self.state.record_trade_close(client_order_id, exit_price, pnl, reason)
+        self.state.record_trade_close(client_order_id, exit_price, pnl, reason,
+                                      exit_fee=exit_fee,
+                                      fees_are_estimated=exit_fee_info["estimated"])
         self.risk.on_trade_closed(pnl)
 
         # Structured logging
         log_trade_close(pos["symbol"], pos["side"], pos["entry_price"],
-                        exit_price, pnl, reason, self.exchange_id)
+                        exit_price, pnl, reason, self.exchange_id,
+                        gross_pnl=gross_pnl, fees=total_fees)
 
         # Track per-strategy performance
         if strategies:
@@ -241,4 +302,7 @@ class ExecutionManager:
             entry_price=pos["entry_price"], exit_price=exit_price,
             pnl=pnl, exchange=self.exchange_id, reason=reason,
             strategies=strategies,
+            gross_pnl=gross_pnl, entry_fee=entry_fee, exit_fee=exit_fee,
+            fees_are_estimated=exit_fee_info["estimated"],
+            opened_at=opened_at,
         )

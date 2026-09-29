@@ -30,9 +30,11 @@ from core.oanda_executor import OandaExecutor
 from core.alpaca_executor import AlpacaExecutor
 from core.mt5_executor import MT5Executor
 from core.feature_store import init_feature_store, get_feature_store
+from core.fee_manager import FeeModel
 from core.structured_logger import (
     slippage_tracker, api_failure_tracker, strategy_perf_tracker,
     log_trade_open, log_trade_close, log_signal, log_risk_event, log_system_event,
+    heartbeat,
 )
 from alerts.notifier import Notifier
 from data_feeds.feed_router import FeedRouter
@@ -47,6 +49,7 @@ from ml.lstm_predictor import LSTMPricePredictor
 from core.position_monitor import check_and_close_positions
 from core.market_hours import market_is_open
 from reporting.hourly_report import HourlyReporter
+from reporting.session_report import SessionReporter
 from long_term.market_intelligence import MarketIntelligence
 from control.telegram_bot import TelegramControlBot
 from control.discord_bot import DiscordControlBot
@@ -246,6 +249,13 @@ def main():
     )
     risk = RiskManager(state, CONFIG, notifier)
 
+    # One cost model for the whole process. Every executor prices its fills
+    # through this, and the notifier reads it to report the day's gas spend,
+    # so a fee can never be counted in one place and forgotten in another.
+    fee_model = FeeModel(CONFIG.get("fees"))
+    notifier.attach_state(state, fee_model)
+    fee_model.reset_daily()
+
     # A fresh state DB starts at trading_balance=0, and the risk manager
     # rejects every trade at 0. Fund it once (peak_balance 0 = never funded);
     # an existing balance — including one drawn down by losses — is left alone.
@@ -321,6 +331,7 @@ def main():
                 risk_manager=risk,
                 notifier=notifier,
                 dry_run=not LIVE_TRADING,
+                fee_model=fee_model,
             )
             if passphrase:
                 executors[name].exchange.password = passphrase
@@ -412,14 +423,26 @@ def main():
     mode_str = "LIVE — REAL MONEY" if LIVE_TRADING else "DRY-RUN (simulated, no real orders)"
     print(f"*** MODE: {mode_str} ***")
     print(f"Strategy: 20-strategy adaptive ensemble (10 categories) + portfolio-level strategies")
+    print(f"Costs: taker {fee_model.taker_bps:.0f}bps base, network fee "
+          f"~{fee_model.network_fee_for():.2f} USD on {fee_model.network}")
     log_system_event("startup",
         f"Bot started in {mode_str}. {len(all_markets)} symbols, {len(executors)} brokers, "
         f"{len(ml_models)} ML models. 20-strategy adaptive ensemble + feature store + "
         f"signal aggregation + portfolio risk active.")
-    notifier.notify("startup",
-        f"Bot started in {mode_str}. {len(all_markets)} symbols, {len(executors)} brokers, "
-        f"{len(ml_models)} ML models. Architecture: 20 strategies, feature store, "
-        f"signal aggregation, portfolio risk controls.",
+    # Startup is one of the few messages that earns its place: it is the only
+    # time the operator learns which mode, which venues and which cost model
+    # the process actually came up with — all three of which can differ from
+    # what the .env appears to say.
+    venues = ", ".join(f"{v.upper()}{'' if getattr(x, 'dry_run', True) else ' (LIVE)'}"
+                       for v, x in executors.items()) or "none"
+    notifier.notify(
+        "startup",
+        f"🟢 {mode_str}\n"
+        f"🏦 Venues: {venues}\n"
+        f"📊 Markets: {len(all_markets)}\n"
+        f"⛽ Cost model: {fee_model.taker_bps:.0f}bps taker base · gas ~"
+        f"{fee_model.network_fee_for():.2f} USD on {fee_model.network}\n"
+        f"💼 Balance: {risk_state.get('trading_balance', 0):.2f} USD",
         priority="high" if LIVE_TRADING else "normal",
     )
 
@@ -440,7 +463,19 @@ def main():
     else:
         print("  Discord control bot: no token configured (skipped)")
 
-    hourly_reporter = HourlyReporter(state, notifier, interval_minutes=60)
+    # 6-hour and 24-hour reports. The old 60-minute reporter fired 24 times a
+    # day, almost all of them reporting no change, and that is exactly how a
+    # notification channel gets trained into being ignored.
+    session_reporter = SessionReporter(
+        state, notifier, risk_manager=risk,
+        window_hours=CONFIG.get("reporting", {}).get("window_report_hours", 6),
+        day_hours=CONFIG.get("reporting", {}).get("day_report_hours", 24),
+    )
+
+    # Record the run start before anything else can fail. Without this the
+    # 24-hour report has no uptime to report, and a bot that dies during
+    # start-up leaves no evidence it was ever attempted.
+    heartbeat.beat(health="starting", force=True)
 
     from data_feeds.nse_feed import NSEFeed
     from long_term.fundamentals import FundamentalsFetcher
@@ -485,6 +520,18 @@ def main():
 
     while True:
         risk_state = state.get_risk_state()
+
+        # Liveness first, and unconditionally. A halted bot is still a running
+        # bot: it still has to answer "are you up, and what is the state of the
+        # account", and the 24-hour report has to say HALTED rather than go
+        # silent for a day. Skipping these while halted would turn a deliberate
+        # risk stop into an indistinguishable outage.
+        heartbeat.beat(health="halted" if risk_state.get("trading_halted") else "running")
+        try:
+            session_reporter.maybe_report()
+        except Exception as e:
+            print(f"Session reporter error: {e}")
+
         if risk_state["trading_halted"]:
             time.sleep(30)
             continue
@@ -679,12 +726,6 @@ def main():
                 main._last_opt_check = now
             except Exception as e:
                 print(f"Options signal error: {e}")
-
-        # Hourly report
-        try:
-            hourly_reporter.maybe_report()
-        except Exception as e:
-            print(f"Hourly reporter error: {e}")
 
         # Portfolio position reconciliation (check exchange balances vs tracked state)
         try:

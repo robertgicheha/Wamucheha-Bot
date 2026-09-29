@@ -271,23 +271,41 @@ strategy_perf_tracker = StrategyPerformanceTracker()
 # ---------- Structured log helpers ----------
 
 def log_trade_open(symbol: str, side: str, amount: float, price: float,
-                   exchange: str, strategies: list = None, score: float = 0):
+                   exchange: str, strategies: list = None, score: float = 0,
+                   entry_fee: float = 0.0):
     _write_entry({
         "type": "trade_open",
         "symbol": symbol, "side": side, "amount": amount,
         "price": price, "exchange": exchange,
         "strategies": strategies or [], "score": score,
+        "entry_fee": entry_fee,
+        "notional": round(float(price) * float(amount), 4),
         "ts": datetime.now(timezone.utc).isoformat(),
     })
 
 
 def log_trade_close(symbol: str, side: str, entry_price: float, exit_price: float,
-                    pnl: float, reason: str, exchange: str):
+                    pnl: float, reason: str, exchange: str,
+                    gross_pnl: float = None, fees: float = 0.0):
+    # gross and net are both recorded. A log that only holds the net number
+    # cannot answer 'was this trade a good idea that fees ate, or a bad idea
+    # outright' — and that is the question you need when the day is red.
     _write_entry({
         "type": "trade_close",
         "symbol": symbol, "side": side,
         "entry_price": entry_price, "exit_price": exit_price,
         "pnl": pnl, "reason": reason, "exchange": exchange,
+        "gross_pnl": gross_pnl if gross_pnl is not None else pnl,
+        "fees": fees,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+def log_fee_event(kind: str, venue: str, amount_usd: float, detail: str = ""):
+    _write_entry({
+        "type": "fee",
+        "kind": kind, "venue": venue, "amount_usd": amount_usd,
+        "detail": detail,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
 
@@ -316,3 +334,73 @@ def log_system_event(event_type: str, details: str):
         "event": event_type, "details": details,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+
+
+# ---------- engine heartbeat ----------
+# The 24-hour report has to answer "was the bot on?" and nothing in-process
+# can answer that, because the process that would answer it is the thing that
+# might be dead. This file is written every tick and carries the run's start
+# time plus a restart counter derived from it, so an uptime figure survives
+# the very crash it is meant to describe.
+
+HEARTBEAT_PATH = LOG_DIR.parent / "engine_heartbeat.json"
+HEARTBEAT_INTERVAL = 60  # seconds between writes; the file is a status
+# snapshot, not a stream, and writing it on every 15s loop tick buys nothing.
+
+
+class EngineHeartbeat:
+    def __init__(self, path=HEARTBEAT_PATH):
+        self.path = path
+        self._last_write = 0.0
+        self._run_started = time.time()
+        # A previous run that ended less than this long ago means this is a
+        # restart, not a cold boot — worth knowing, because a crash loop looks
+        # exactly like a healthy day if nobody counts restarts.
+        self._restarts = self._count_restarts()
+
+    def _count_restarts(self) -> int:
+        try:
+            if not self.path.exists():
+                return 0
+            data = json.loads(self.path.read_text())
+            previous_start = float(data.get("run_started_epoch", 0))
+            if previous_start and previous_start < self._run_started - 60:
+                return int(data.get("restarts", 0)) + 1
+            return int(data.get("restarts", 0))
+        except Exception:
+            return 0
+
+    def beat(self, health: str = "running", force: bool = False):
+        now = time.time()
+        if not force and now - self._last_write < HEARTBEAT_INTERVAL:
+            return
+        self._last_write = now
+        payload = {
+            "run_started_epoch": self._run_started,
+            "run_started": datetime.fromtimestamp(
+                self._run_started, timezone.utc).isoformat(),
+            "uptime_seconds": now - self._run_started,
+            "restarts": self._restarts,
+            "health": health,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            # Write-then-rename: a reader must never see a half-written file
+            # and report a corrupt uptime.
+            tmp = self.path.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(payload))
+            tmp.replace(self.path)
+        except Exception:
+            pass
+
+    @property
+    def restarts(self) -> int:
+        return self._restarts
+
+    @property
+    def uptime(self) -> float:
+        return time.time() - self._run_started
+
+
+heartbeat = EngineHeartbeat()

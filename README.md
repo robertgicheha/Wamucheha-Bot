@@ -44,6 +44,13 @@ Edit `.env` with your API keys. At minimum, fill in:
 - `STAKE_AMOUNT=10` (start small for testing)
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (for alerts)
 
+### Fund your exchange accounts (manual, one-time)
+The bot **never moves money on-chain**. You deposit USDT from MetaMask to each
+exchange's deposit address, and withdraw profits back to MetaMask.
+See **[DEPOSIT_WITHDRAWAL.md](DEPOSIT_WITHDRAWAL.md)** for the exact addresses,
+networks (TRC20/BEP20), fees, and step-by-step checklist.
+Run `python scripts/preflight.py` to validate your setup before going live.
+
 ### 3. Set your stake amount
 In `.env`:
 ```

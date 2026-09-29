@@ -9,7 +9,8 @@ Extended with:
 """
 import json
 import shutil
-from datetime import datetime, timezone
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from sqlalchemy import (
@@ -76,6 +77,10 @@ class TradeRow(Base):
     strategies = Column(Text, nullable=True)  # JSON list of strategy names
     score = Column(Float, nullable=True)
     regime = Column(String, nullable=True)
+    entry_fee = Column(Float, nullable=True)   # venue fee charged on the open fill
+    exit_fee = Column(Float, nullable=True)    # venue fee charged on the close fill
+    fees = Column(Float, nullable=True)        # entry_fee + exit_fee
+    fees_are_estimated = Column(Integer, nullable=True, default=0)
     opened_at = Column(String, nullable=False)
     closed_at = Column(String, nullable=True)
 
@@ -92,6 +97,11 @@ class TradeRow(Base):
             "status": self.status,
             "pnl": self.pnl,
             "pnl_pct": self.pnl_pct,
+            "gross_pnl": None if self.pnl is None or self.fees is None else self.pnl + self.fees,
+            "fees": self.fees,
+            "entry_fee": self.entry_fee,
+            "exit_fee": self.exit_fee,
+            "fees_are_estimated": bool(self.fees_are_estimated),
             "reason": self.reason,
             "strategies": json.loads(self.strategies) if self.strategies else [],
             "score": self.score,
@@ -112,6 +122,8 @@ class OpenPositionRow(Base):
     entry_price = Column(Float, nullable=False)
     stop_loss_price = Column(Float, nullable=True)
     take_profit_price = Column(Float, nullable=True)
+    entry_fee = Column(Float, nullable=True)   # paid on the way in
+    fee_rate = Column(Float, nullable=True)    # taker rate used, for the way out
     opened_at = Column(String, nullable=False)
 
     def to_dict(self) -> dict:
@@ -124,7 +136,41 @@ class OpenPositionRow(Base):
             "entry_price": self.entry_price,
             "stop_loss_price": self.stop_loss_price,
             "take_profit_price": self.take_profit_price,
+            "entry_fee": self.entry_fee,
+            "fee_rate": self.fee_rate,
             "opened_at": self.opened_at,
+        }
+
+
+# ── Daily economics (UTC) ─────────────────────────────────────────────────
+# Net PnL, fees paid and gas spent are different quantities and are summed
+# separately. Collapsing them into one "profit" number is how a losing day
+# gets reported as a winning one.
+
+
+class DailyEconomicsRow(Base):
+    __tablename__ = "daily_economics"
+
+    day = Column(String, primary_key=True)          # YYYY-MM-DD (UTC)
+    realized_pnl = Column(Float, default=0.0)        # net of venue fees
+    gross_pnl = Column(Float, default=0.0)          # before venue fees
+    fees_paid = Column(Float, default=0.0)
+    network_fees = Column(Float, default=0.0)
+    trades = Column(Integer, default=0)
+    wins = Column(Integer, default=0)
+    losses = Column(Integer, default=0)
+
+    def to_dict(self) -> dict:
+        return {
+            "day": self.day,
+            "realized_pnl": self.realized_pnl or 0.0,
+            "gross_pnl": self.gross_pnl or 0.0,
+            "fees_paid": self.fees_paid or 0.0,
+            "network_fees": self.network_fees or 0.0,
+            "net_after_all_costs": (self.realized_pnl or 0.0) - (self.network_fees or 0.0),
+            "trades": self.trades or 0,
+            "wins": self.wins or 0,
+            "losses": self.losses or 0,
         }
 
 
@@ -134,15 +180,26 @@ def _safe_migrate():
     import sqlite3
     try:
         conn = sqlite3.connect(str(DB_PATH))
-        cursor = conn.execute("PRAGMA table_info(trades)")
-        existing_cols = {row[1] for row in cursor.fetchall()}
-        new_cols = {
-            "pnl_pct": "REAL", "reason": "TEXT", "strategies": "TEXT",
-            "score": "REAL", "regime": "TEXT",
+        # Raw ALTERs, because the ORM models already declare these columns —
+        # create_all() only creates missing TABLES, it never adds columns to a
+        # table that already exists from an earlier version of the schema.
+        additions = {
+            "trades": {
+                "pnl_pct": "REAL", "reason": "TEXT", "strategies": "TEXT",
+                "score": "REAL", "regime": "TEXT",
+                "entry_fee": "REAL", "exit_fee": "REAL", "fees": "REAL",
+                "fees_are_estimated": "INTEGER DEFAULT 0",
+            },
+            "open_positions": {
+                "entry_fee": "REAL", "fee_rate": "REAL",
+            },
         }
-        for col_name, col_type in new_cols.items():
-            if col_name not in existing_cols:
-                conn.execute(f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}")
+        for table, cols in additions.items():
+            cursor = conn.execute(f"PRAGMA table_info({table})")
+            existing = {row[1] for row in cursor.fetchall()}
+            for col_name, col_type in cols.items():
+                if col_name not in existing:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col_name} {col_type}")
         conn.commit()
         conn.close()
     except Exception:
@@ -206,7 +263,8 @@ class StateManager:
 
     def record_trade_open(self, client_order_id, exchange, symbol, side, amount,
                            entry_price, stop_loss_price=None, take_profit_price=None,
-                           strategies=None, score=None, regime=None):
+                           strategies=None, score=None, regime=None,
+                           entry_fee=0.0, fee_rate=0.0):
         now = self._now()
         strategies_json = json.dumps(strategies) if strategies else None
         with Session(engine) as session:
@@ -222,6 +280,8 @@ class StateManager:
                     strategies=strategies_json,
                     score=score,
                     regime=regime,
+                    entry_fee=float(entry_fee or 0.0),
+                    fee_rate=float(fee_rate or 0.0),
                     opened_at=now,
                 ))
                 session.add(OpenPositionRow(
@@ -233,34 +293,117 @@ class StateManager:
                     entry_price=entry_price,
                     stop_loss_price=stop_loss_price,
                     take_profit_price=take_profit_price,
+                    entry_fee=float(entry_fee or 0.0),
+                    fee_rate=float(fee_rate or 0.0),
                     opened_at=now,
                 ))
         self.snapshot()
 
-    def record_trade_close(self, client_order_id, exit_price, pnl, reason=""):
-        direction = 1
+    def record_trade_close(self, client_order_id, exit_price, pnl, reason="",
+                           exit_fee=0.0, fees_are_estimated=False, day=None):
+        """`pnl` MUST already be net of venue fees — the balance, the daily
+        PnL, the streak and the circuit breakers are all driven from it, so a
+        gross number here would report a losing day as a winning one."""
         with Session(engine) as session:
             with session.begin():
                 trade = session.query(TradeRow).filter_by(
                     client_order_id=client_order_id
                 ).first()
                 if trade:
+                    entry_fee = float(trade.entry_fee or 0.0)
+                    exit_fee = float(exit_fee or 0.0)
                     trade.exit_price = exit_price
+                    trade.exit_fee = exit_fee
+                    trade.fees = entry_fee + exit_fee
+                    trade.fees_are_estimated = 1 if fees_are_estimated else 0
                     trade.pnl = pnl
                     trade.status = "closed"
                     trade.closed_at = self._now()
                     trade.reason = reason
-                    # Calculate PnL percentage
                     if trade.entry_price and trade.entry_price > 0:
                         if trade.side == "buy":
                             trade.pnl_pct = (exit_price - trade.entry_price) / trade.entry_price * 100
                         else:
                             trade.pnl_pct = (trade.entry_price - exit_price) / trade.entry_price * 100
-                    direction = 1 if trade.side == "buy" else -1
+                    self._bump_daily_economics(
+                        session,
+                        day or self._today(),
+                        gross_pnl=float(pnl) + trade.fees,
+                        net_pnl=float(pnl),
+                        fees=trade.fees,
+                        win=float(pnl) > 0,
+                    )
                 session.query(OpenPositionRow).filter_by(
                     client_order_id=client_order_id
                 ).delete()
         self.snapshot()
+
+    # ---------- daily economics ----------
+
+    @staticmethod
+    def _bump_daily_economics(session, day: str, gross_pnl: float, net_pnl: float,
+                              fees: float, win: bool, network_fees: float = 0.0):
+        """Accumulate a day's costs. Fees and PnL are kept in separate columns
+        so a report can never quietly add them together into a nicer number."""
+        row = session.get(DailyEconomicsRow, day)
+        if row is None:
+            row = DailyEconomicsRow(day=day)
+            session.add(row)
+        row.gross_pnl = (row.gross_pnl or 0.0) + gross_pnl
+        row.realized_pnl = (row.realized_pnl or 0.0) + net_pnl
+        row.fees_paid = (row.fees_paid or 0.0) + fees
+        row.network_fees = (row.network_fees or 0.0) + network_fees
+        row.trades = (row.trades or 0) + 1
+        row.wins = (row.wins or 0) + (1 if win else 0)
+        row.losses = (row.losses or 0) + (0 if win else 1)
+
+    def record_network_fee(self, venue: str, amount_usdt: float, cost_usdt: float,
+                           network: str = ""):
+        """Charge an on-chain transfer's gas against the day's economics."""
+        with Session(engine) as session:
+            with session.begin():
+                self._bump_daily_economics(
+                    session, self._today(), gross_pnl=0.0, net_pnl=0.0,
+                    fees=0.0, win=False, network_fees=cost_usdt,
+                )
+        self.snapshot()
+
+    def get_daily_economics(self, day: str = None) -> dict:
+        with Session(engine) as session:
+            row = session.get(DailyEconomicsRow, day or self._today())
+            if row is None:
+                return {
+                    "day": day or self._today(), "realized_pnl": 0.0, "gross_pnl": 0.0,
+                    "fees_paid": 0.0, "network_fees": 0.0, "net_after_all_costs": 0.0,
+                    "trades": 0, "wins": 0, "losses": 0,
+                }
+            return row.to_dict()
+
+    def get_daily_economics_range(self, days: int = 7) -> list:
+        cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days - 1)).isoformat()
+        with Session(engine) as session:
+            rows = session.query(DailyEconomicsRow).filter(
+                DailyEconomicsRow.day >= cutoff
+            ).order_by(DailyEconomicsRow.day.asc()).all()
+            return [r.to_dict() for r in rows]
+
+    def get_fee_totals(self) -> dict:
+        """All-time venue fees. The number that answers 'what has execution
+        cost me so far', which no other stat in the system does."""
+        with Session(engine) as session:
+            total = session.query(func.coalesce(func.sum(TradeRow.fees), 0.0)).filter(
+                TradeRow.status == "closed"
+            ).scalar() or 0.0
+            by_exchange = defaultdict(float)
+            rows = session.query(TradeRow.exchange, TradeRow.fees).filter(
+                TradeRow.status == "closed", TradeRow.fees.isnot(None)
+            ).all()
+            for exchange, fees in rows:
+                by_exchange[exchange] += float(fees or 0.0)
+            return {
+                "total_fees": float(total),
+                "by_exchange": {k: round(v, 4) for k, v in sorted(by_exchange.items())},
+            }
 
     def get_open_positions(self) -> list:
         with Session(engine) as session:
@@ -352,6 +495,10 @@ class StateManager:
             net_pnl = session.query(func.sum(TradeRow.pnl)).filter(
                 TradeRow.status == "closed"
             ).scalar() or 0
+            total_fees = session.query(func.sum(TradeRow.fees)).filter(
+                TradeRow.status == "closed"
+            ).scalar() or 0
+            gross_pnl = float(net_pnl) + float(total_fees)
             avg_pnl = (net_pnl / total) if total > 0 else 0
 
             # Best and worst trades
@@ -370,11 +517,16 @@ class StateManager:
             "total_won": total_won,
             "total_lost": total_lost,
             "net_pnl": net_pnl,
+            "gross_pnl": gross_pnl,
+            "total_fees": float(total_fees),
             "win_rate": win_rate,
             "avg_pnl": avg_pnl,
             "best_trade": best,
             "worst_trade": worst,
             "profit_factor": (total_won / abs(total_lost)) if total_lost else 0,
+            # Profit factor measured AFTER costs. The gross version is the one
+            # that makes a fee-dragging system look profitable.
+            "profit_factor_net": (gross_pnl / abs(total_lost)) if total_lost else 0,
         }
 
     def is_duplicate_order(self, client_order_id) -> bool:

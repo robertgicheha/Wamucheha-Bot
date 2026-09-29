@@ -7,6 +7,33 @@ account:
   currency: USD
   stake_wallet_address: ""     # cold wallet / separate account, bot has no access
 
+# Real cost of trading, used to report P&L NET of what it cost to execute.
+# Two distinct costs — see core/fee_manager.py for why they are not mixed:
+#   * venue taker fee: per fill, charged by the exchange, subtracted from the
+#     P&L of that trade. 10 bps round-trips to 0.20% of notional, which
+#     against a 3% target is ~7% of the intended reward — enough to turn a
+#     marginally profitable backtest into a losing live account.
+#   * network (gas) fee: paid once per deposit/withdrawal, by you, on-chain.
+#     Tracked as a cumulative pot and reported daily, never divided per trade.
+# Set these to the rate YOU actually pay (VIP tier/BNB discount), not the
+# headline number, because in dry-run there is no order to read the truth from.
+fees:
+  enabled: true
+  taker_fee_bps: 10              # fallback for any venue not listed below
+  per_venue_taker_bps:
+    binance: 10                  # 0.10% spot taker, standard tier
+    okx: 10
+    bybit: 10
+    alpaca: 0                    # commission-free equities
+    oanda: 0                     # cost is in the spread, not a commission line
+    mt5: 0                       # cost is in the spread
+  network: TRC20                 # network you actually fund the venues over
+  network_fee_usdt:             # typical cost per transfer, in USDT
+    TRC20: 1.0
+    BEP20: 0.30
+    ERC20: 5.0
+    SOL: 0.01
+
 risk:
   max_consecutive_losses: 8          # hard stop, per your spec
   max_daily_loss_pct: 5              # % of trading_balance; drawdown limit < 5%
@@ -276,4 +303,18 @@ alerts:
     - long_term_daily_digest
     - nse_alert
     - market_regime_change
-    - hourly_summary
+    - window_report
+    - daily_report
+
+# Two scheduled reports, both deliberately infrequent. Individual trades are
+# announced the moment they close, so a periodic report has no job restating
+# them — its only job is to aggregate. Hourly (the old behaviour) meant 24
+# messages a day that mostly read "0 trades, unchanged", which is how the two
+# messages a week that actually need a human get swiped past.
+reporting:
+  window_report_hours: 6         # "is this working right now?" — net of costs
+  day_report_hours: 24           # "was the bot on, and what did the day cost?"
+  # The 24h report leads with uptime and restart count, because a P&L figure
+  # without them cannot be read: red from a bot that was up is an edge
+  # problem, red from a bot that was restarting is an infrastructure problem,
+  # and they need opposite responses.

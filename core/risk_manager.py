@@ -284,7 +284,11 @@ class RiskManager:
             print(f"  Reconciliation: {drift_count} stale positions closed")
 
     # ---------- called after every trade closes ----------
-    def on_trade_closed(self, pnl: float):
+    def on_trade_closed(self, pnl: float, fees: float = 0.0):
+        """`pnl` is NET of venue fees — callers must not pass a gross figure.
+        Fees are additionally shown here rather than silently folded in, so
+        a day that lost money to costs is visibly a day that lost money to
+        costs, not an unexplained gap between the chart and the balance."""
         risk_state = self.state.get_risk_state()
         new_balance = risk_state["trading_balance"] + pnl
         new_daily_pnl = risk_state["daily_pnl"] + pnl
