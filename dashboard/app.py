@@ -60,15 +60,30 @@ if _env_stake is not None:
         pass
 
 app = FastAPI(title="Wamucheha Trading Bot Dashboard")
+
+# CORS is a browser-side control only; it does not stop curl. The dashboard is
+# served behind a reverse proxy that enforces auth, so this list is scoped to
+# the real origin instead of "*". "*" plus the public terminal route meant any
+# website could drive an authenticated dashboard.
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS or [],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-Dashboard-Key"],
 )
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET_KEY", "change_me")
+
+# The terminal runs real shell commands as the container user (root). That is
+# remote code execution, so it is opt-in: it stays off unless explicitly
+# enabled, even when the endpoint is reachable.
+TERMINAL_ENABLED = os.environ.get("ENABLE_TERMINAL_API", "0") == "1"
 
 _start_time = datetime.now(timezone.utc)
 _state_manager = None
@@ -453,6 +468,11 @@ def resume(x_dashboard_key: str = Header(None)):
 
 @app.post("/api/terminal")
 def terminal_exec(body: dict, x_dashboard_key: str = Header(None)):
+    if not TERMINAL_ENABLED:
+        raise HTTPException(
+            status_code=403,
+            detail="Terminal API is disabled. Set ENABLE_TERMINAL_API=1 to enable.",
+        )
     if x_dashboard_key != DASHBOARD_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
 

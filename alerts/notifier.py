@@ -78,6 +78,14 @@ COLOR_CYAN = 0x00BCD4
 COLOR_GRAY = 0x9E9E9E
 COLOR_DARK = 0x1A1A2E
 
+# Discord's per-embed limits. Discord rejects an embed that exceeds either one
+# with a 400, and the webhook helper swallows that response — so an embed built
+# without these in mind fails silently and the operator sees no digest at all.
+# Named here so the numbers are stated once, from the API's side, rather than
+# guessed at each call site.
+DISCORD_FIELD_MAX = 1024
+DISCORD_FIELD_MAX_COUNT = 25
+
 # ── Email color palette ──────────────────────────────────────────────────
 EMAIL_COLORS = {
     "bg_body":      "#0f1117",
@@ -97,6 +105,125 @@ EMAIL_COLORS = {
 }
 
 BRAND = "Wamucheha"
+
+
+# ── Non-trade event styling ──────────────────────────────────────────────
+# Every non-trade event gets a headline that says what happened in the
+# operator's language, not the name of the code path that noticed it. Anything
+# unlisted falls back to a readable title-cased version of the event name, so a
+# new event is never silently worse-formatted than the existing ones.
+#
+#   "ℹ️ [position_drift] BTC/USDT: drift 2.1%"   ← debug output
+#   "🟡 POSITION DRIFT · BTC/USDT: drift 2.1%"   ← a log line
+
+EVENT_STYLE = {
+    "startup":                    ("🚀", "BOT STARTED"),
+    "circuit_breaker_triggered":  ("🔴", "TRADING HALTED"),
+    "circuit_breaker_reset":      ("🟢", "TRADING RESUMED"),
+    "daily_loss_limit_hit":       ("🔴", "DAILY LOSS LIMIT HIT"),
+    "heartbeat_missed":           ("🔴", "HEARTBEAT MISSED"),
+    "profit_swept_to_stake":      ("🏦", "PROFIT SWEPT TO STAKE WALLET"),
+    "trade_rejected":             ("⚠️", "ORDER REJECTED"),
+    "trade_opened":               ("📈", "TRADE OPENED"),
+    "trade_closed":               ("📉", "TRADE CLOSED"),
+    "high_slippage":              ("⚠️", "SLIPPAGE HIGH"),
+    "api_failure_burst":          ("🔌", "API FAILURES"),
+    "position_drift":             ("🟡", "POSITION DRIFT"),
+    "nse_alert":                  ("🇰🇪", "NSE ALERT"),
+    "arbitrage_opportunity":      ("⚖️", "ARBITRAGE"),
+    "portfolio_rotation":         ("🔄", "PORTFOLIO ROTATION"),
+    "options_signal":             ("📋", "OPTIONS SIGNAL"),
+    "long_term_signal":           ("🧠", "LONG-TERM SIGNAL"),
+    "venue_disabled":             ("🛑", "VENUE DISABLED"),
+    "venue_enabled":              ("🟢", "VENUE ENABLED"),
+    "warning":                    ("🟡", "WARNING"),
+    "report_failed":              ("🚨", "REPORTING FAILED"),
+    "reconciliation_drift":       ("🟡", "RECONCILIATION DRIFT"),
+    "nse_data_unavailable":       ("🟡", "NSE DATA UNAVAILABLE"),
+    "deposit":                    ("📥", "DEPOSIT LOGGED"),
+    "withdrawal":                 ("📤", "WITHDRAWAL LOGGED"),
+}
+
+
+def _event_style(event_type: str, message: str, priority: str) -> tuple:
+    """(icon, headline, body). `high` priority forces the red alarm treatment
+    regardless of the event, because a high-priority event is by definition
+    one the operator is meant to act on now."""
+    icon, headline = EVENT_STYLE.get(event_type, ("ℹ️", event_type.replace("_", " ").upper()))
+    if priority == "high" and icon not in ("🔴", "🚨"):
+        icon = "🚨"
+    return icon, headline, message
+
+
+def _group_by(items: list, key_fn) -> dict:
+    """Count and net PnL per key, biggest absolute mover first.
+
+    Used to answer 'which market class is this result coming from', which is
+    the difference between a broad-based gain and one lucky gold trade."""
+    out = {}
+    for item in items:
+        k = key_fn(item)
+        entry = out.setdefault(k, {"count": 0, "net": 0.0})
+        entry["count"] += 1
+        entry["net"] += float(item.get("pnl", 0.0) or 0.0)
+    return dict(sorted(out.items(), key=lambda kv: abs(kv[1]["net"]), reverse=True))
+
+
+def _chunk_lines(lines: list, limit: int) -> list:
+    """Greedily pack lines into groups no longer than `limit`.
+
+    Splits on line boundaries and never drops anything. A single line longer
+    than the limit is broken mid-line as a last resort: losing characters from
+    a price is bad, but the alternative is the whole message failing to send,
+    which loses all of it."""
+    chunks, current = [], ""
+    for line in lines:
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current)
+            current = ""
+        while len(line) > limit:
+            chunks.append(line[:limit])
+            line = line[limit:]
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current)
+    return chunks or [""]
+
+
+def _aggregate_trades(trades: list) -> dict:
+    """Collapse the non-movers into one entry per (symbol, side, venue).
+
+    The venue is part of the key, not decoration: 20 fills of the same pair
+    across three exchanges is three different venues' risk being taken, and
+    reporting it as one line would hide exactly the concentration the digest
+    exists to surface."""
+    out = {}
+    for t in trades:
+        key = (f"{t['symbol']} {'LONG' if t['side'] == 'buy' else 'SHORT'} "
+               f"{f.BULLET} {f.market_tag(t['symbol'], t['exchange'])}")
+        agg = out.setdefault(key, {"count": 0, "net": 0.0})
+        agg["count"] += 1
+        agg["net"] += float(t.get("pnl", 0.0) or 0.0)
+    return dict(sorted(out.items(), key=lambda kv: abs(kv[1]["net"]), reverse=True))
+
+
+def _exposure_line(exposure: dict, balance: float) -> str:
+    """'CRYPTO 45% · GOLD/METALS 12%' — open risk as a share of the balance,
+    because an absolute notional means nothing without the account it sits on.
+
+    Anything past 100% of the balance is reported as a breach rather than
+    printed as a five-digit percentage. That combination is either leverage
+    the bot is not meant to have, or broker lots that have not been converted
+    correctly, and both cases are worth saying out loud instead of dressing up
+    as a precise-looking figure."""
+    parts = []
+    for name, value in list(exposure.items())[:4]:
+        pct = (value / balance * 100) if balance else 0.0
+        if pct > 100:
+            parts.append(f"⚠️ {name} OVER CAP ({pct:.0f}%)")
+        else:
+            parts.append(f"{name} {pct:.0f}%")
+    return " · ".join(parts)
 
 
 def _esc(value) -> str:
@@ -617,6 +744,28 @@ class Notifier:
 
     # ── Long reports (daily digest, stock recommendations) ────────────────
 
+    def record_deposit(self, amount: float, venue: str = "", note: str = ""):
+        """Log money you moved in. Declaration only — the bot has no keys and
+        never moves funds. Recorded so a later report can tell your deposit
+        apart from the bot's profit; without it, a top-up looks exactly like a
+        winning streak."""
+        self.state.record_cash_flow("deposit", amount, venue=venue, note=note)
+        self.notify("deposit", f"{f.venue_name(venue) if venue else 'Account'} received "
+                               f"{f.money(amount)} USD. Logged as capital in, not profit.",
+                    priority="high")
+        return True
+
+    def record_withdrawal(self, amount: float, venue: str = "", note: str = ""):
+        """Log money you took out. Kept separate from profit in every report,
+        because withdrawing your own capital is not a gain and reporting it
+        as one is how an account ends up looking like it made 4x."""
+        self.state.record_cash_flow("withdrawal", amount, venue=venue, note=note)
+        self.notify("withdrawal", f"{f.money(amount)} USD left "
+                                  f"{f.venue_name(venue) if venue else 'the account'}. "
+                                  f"Logged as capital out, not profit.",
+                    priority="high")
+        return True
+
     def notify_report(self, event_type: str, telegram_html: str, subject: str = None,
                       email_html: str = None):
         """Multi-section report to every channel. notify() sends one message,
@@ -755,10 +904,11 @@ class Notifier:
             f"<b>{f.E_BUY if is_buy else f.E_SELL} {'LONG OPENED' if is_buy else 'SHORT OPENED'} "
             f"· {f.E_BOOK} {symbol}</b>   <i>{mode}</i>",
             f.rules(),
+            f"{f.market_tag(symbol, exchange)}",
             f"{f.E_ENTRY} <b>Entry</b>   <code>{f.price(entry_price)}</code>",
             f"{f.E_SIZE} <b>Size</b>    <code>{f.qty(amount)} {symbol.split('/')[0]}</code>"
             f"  <i>({f.money(notional)} USD · {notional_pct_of_bal:.1f}% of balance)</i>",
-            f"{f.E_VENUE} <b>Venue</b>   {exchange.upper()}",
+            f"{f.E_VENUE} <b>Venue</b>   {f.venue_name(exchange)}",
             f"{f.E_TARGET} <b>Target</b>  <code>{f.price(take_profit)}</code>  "
             f"{f.ARROW_UP} <b>+{abs(take_profit - entry_price) / entry_price * 100:.2f}%</b>",
             f"{f.E_STOP} <b>Stop</b>    <code>{f.price(stop_loss)}</code>  "
@@ -821,7 +971,7 @@ class Notifier:
         # ── Event log ─────────────────────────────────────────────────────
         self._log_trade("opened", trade_data)
 
-    # ── Trade close ───────────────────────────────────────────────────────
+    # ── Trade close (feeds the 5-minute digest, does not message) ─────────
 
     def notify_trade_closed(self, symbol: str, side: str, amount: float,
                             entry_price: float, exit_price: float, pnl: float,
@@ -830,16 +980,26 @@ class Notifier:
                             gross_pnl: float = None, entry_fee: float = 0.0,
                             exit_fee: float = 0.0, fees_are_estimated: bool = False,
                             opened_at: str = None):
-        """`pnl` is NET of venue fees. `gross_pnl` is what the price chart says.
-        Both are shown: the gap between them is the cost of doing the trade,
-        and a day that only ever shows the net number hides exactly the thing
+        """A closed trade does NOT message you here. It updates the session
+        counters, appends to the trade log, and leaves. The 5-minute digest
+        (reporting/trade_digest.py) reads the closed trades out of the ledger
+        and sends one message per window that had any.
+
+        The reason is volume, not latency. A position that takes 20 minutes to
+        reach its target is not newsworthy 20 minutes after it opened, it is
+        newsworthy once, with the balance it moved and the cost it took. Sending
+        it per-trade meant a quiet afternoon produced a stream of identical
+        'still nothing' messages, and quiet afternoons are most of the time.
+
+        `pnl` is NET of venue fees. `gross_pnl` is what the price chart says.
+        Both are recorded: the gap between them is the cost of doing the trade,
+        and a log that only ever shows the net number hides exactly the thing
         you need to see when the strategy starts bleeding."""
-        is_win = pnl > 0
         gross = float(gross_pnl if gross_pnl is not None else pnl)
         total_fees = float(entry_fee or 0) + float(exit_fee or 0)
         notional = float(amount) * float(entry_price)
 
-        if is_win:
+        if pnl > 0:
             self._session_stats["wins"] += 1
             self._session_stats["total_profit"] += pnl
         else:
@@ -853,88 +1013,445 @@ class Notifier:
 
         pnl_pct = ((exit_price - entry_price) / entry_price * 100) if side == "buy" \
             else ((entry_price - exit_price) / entry_price * 100)
-        fee_pct = (total_fees / notional * 100) if notional else 0.0
-        held = _held_seconds(opened_at)
-        icon = f.E_PROFIT if is_win else f.E_LOSS
-        result_text = "PROFIT" if is_win else "LOSS"
 
         trade_data = {
             "symbol": symbol, "side": side, "amount": amount,
             "entry_price": entry_price, "exit_price": exit_price,
             "pnl": pnl, "pnl_pct": pnl_pct, "exchange": exchange,
+            "asset_class": f.asset_class(symbol),
             "reason": reason, "gross_pnl": gross,
             "entry_fee": entry_fee, "exit_fee": exit_fee, "fees": total_fees,
             "fees_are_estimated": fees_are_estimated,
-            "held_seconds": held, "notional": notional,
+            "held_seconds": _held_seconds(opened_at), "notional": notional,
             "strategies": strategies,
         }
 
-        # ── Telegram ──────────────────────────────────────────────────────
-        s = self._session_stats
-        wr = s['wins'] / max(1, s['wins'] + s['losses']) * 100
-        total_money = s['start_balance'] + s['total_pnl']
+        # ── Event log (durable; the digest reads the DB, not this) ───────
+        self._log_trade("closed", trade_data)
+
+    # ── 5-minute trade digest ─────────────────────────────────────────────
+
+    def notify_trade_digest(self, digest: dict):
+        """One message per 5-minute window that contained a trade.
+
+        Built to be read in one pass on a phone. The order is deliberate:
+        what happened, what it earned, what it cost, where the balance ended
+        up, and whether the record justifies continuing. Every line names the
+        asset class and the venue, because "4.10 profit" is not a fact until
+        you know it was crypto on Binance rather than gold on a CFD broker —
+        those are different risks producing the same number.
+
+        Returns without sending when the window was empty. This method is only
+        called when there is something to say, but the guard is here too so a
+        future caller cannot accidentally turn silence into noise."""
+        trades = digest.get("trades") or []
+        flows = digest.get("cash_flows") or []
+        if not trades and not flows:
+            return
+
+        net = float(digest.get("net_pnl", 0.0))
+        gross = float(digest.get("gross_pnl", 0.0))
+        fees = float(digest.get("fees", 0.0))
+        wins = int(digest.get("wins", 0))
+        losses = int(digest.get("losses", 0))
+        count = len(trades)
+        bal_now = float(digest.get("balance_now", 0.0))
+        # None means the digest could not reconstruct the window start; it is
+        # carried through as None rather than coerced to 0.0, because 0.0 is
+        # a real balance and would print as a confident wrong figure.
+        bal_before = digest.get("balance_before")
+        bal_before = float(bal_before) if bal_before is not None else None
+        all_time = digest.get("all_time", {}) or {}
+        cash = digest.get("cash", {}) or {}
+        daily = digest.get("daily", {}) or {}
+
+        accuracy = f.accuracy_pct(wins, count)
+        efficiency = f.efficiency_pct(net, gross)
+        total_trades = int(all_time.get("total", 0) or 0)
+        total_wins = int(all_time.get("wins", 0) or 0)
+        all_time_accuracy = f.accuracy_pct(total_wins, total_trades)
+        pnls = [t["pnl"] for t in trades]
+        avg_win, avg_loss = f.avg_win_loss(pnls)
+        expectancy = f.expectancy_pct(net, count, bal_before)
+        fee_drag = (fees / gross * 100) if gross > 0 else 0.0
+
+        # Direction of the window, and the classes and venues it came from.
+        # Grouping by class is what stops a "green" window that is entirely
+        # one lucky gold trade from reading like broad-based health.
+        by_class = _group_by(trades, lambda t: f.class_label(t["symbol"]))
+        by_venue = _group_by(trades, lambda t: f.venue_name(t["exchange"]))
+
+        header_icon = f.arrow(net)
+        window_label = f"{int(digest.get('window_seconds', 300) // 60)} MIN"
 
         tg = [
-            f"<b>{icon} CLOSED {'▲ IN PROFIT' if is_win else '▼ IN LOSS'} · {symbol}</b>",
+            f"<b>{header_icon} {window_label} TRADE DIGEST</b>   <i>{f.utc_stamp(digest.get('epoch'))}</i>",
             f.rules(),
-            f"{'📈 LONG' if side == 'buy' else '📉 SHORT'}  <code>{f.qty(amount)}</code>  "
-            f"{f.ARROW_RIGHT}  {f.E_VENUE} {exchange.upper()}",
-            f"{f.E_ENTRY} <code>{f.price(entry_price)}</code>  "
-            f"{f.ARROW_RIGHT}  {f.E_EXIT} <code>{f.price(exit_price)}</code>  "
-            f"{f.arrow(pnl_pct)} <b>{f.signed_pct(pnl_pct)}</b>",
-            f.rules(),
-            f"💰 <b>Gross</b>    <code>{f.arrow(gross)} {f.signed_money(gross)} USD</code>"
-            f"  <i>(price move only)</i>",
-            f"{f.E_FEES} <b>Fees</b>     <code>{f.arrow(-total_fees)} {f.signed_money(-total_fees, 4)} USD</code>"
-            f"  <i>−{fee_pct:.2f}% · in ${f.money(entry_fee, 4)} / out ${f.money(exit_fee, 4)}"
-            f"{' · estimated' if fees_are_estimated else ''}</i>",
-            f"🧾 <b>NET</b>      <code>{f.arrow(pnl)} {f.signed_money(pnl)} USD "
-            f"({f.signed_pct(pnl / notional * 100 if notional else 0)})</b>",
-            f"{f.E_TIME} <b>Held</b>     {f.holding_time(held)}   ·   🏁 <b>Exit</b> {reason or 'manual'}",
-            f.rules(),
-            f"📅 <b>Today</b>  {f.arrow(s['total_pnl'])} <code>{f.signed_money(s['total_pnl'])} USD</code>"
-            f"  <i>· {s['wins']}W {s['losses']}L · {wr:.0f}% WR</i>",
-            f"⛽ <b>Costs today</b>  <code>{f.signed_money(-s.get('fees_paid', 0.0), 4)} USD</code>",
-            f"💼 <b>Balance</b>  <code>{f.money(total_money)} USD</code>",
         ]
-        if strategies:
-            tg.append(f"{f.E_BRAIN} <b>Strategy</b>  {', '.join(strategies)}")
-        self._send_telegram_styled("\n".join(tg))
 
-        # ── Discord ───────────────────────────────────────────────────────
-        color = COLOR_GREEN if is_win else COLOR_RED
-        fields = [
-            {"name": f"{f.E_BOOK} Pair", "value": f"`{symbol}`", "inline": True},
-            {"name": f"{f.E_STATS} Side", "value": "📈 LONG" if side == "buy" else "📉 SHORT", "inline": True},
-            {"name": "🎯 Result", "value": f"{icon} **{result_text}**", "inline": True},
-            {"name": f"{f.E_ENTRY} Entry", "value": f"`{f.price(entry_price)}`", "inline": True},
-            {"name": f"{f.E_EXIT} Exit", "value": f"`{f.price(exit_price)}`", "inline": True},
-            {"name": "📊 Move", "value": f"{f.arrow(pnl_pct)} `{f.signed_pct(pnl_pct)}`", "inline": True},
-            {"name": f"{f.E_SIZE} Size", "value": f"`{f.qty(amount)}` (${f.money(notional)})", "inline": True},
-            {"name": f"{f.E_VENUE} Venue", "value": exchange.upper(), "inline": True},
-            {"name": f"{f.E_TIME} Held", "value": f.holding_time(held), "inline": True},
-            {"name": "💰 Gross", "value": f"{f.arrow(gross)} `{f.signed_money(gross)} USD`", "inline": True},
-            {"name": f"{f.E_FEES} Fees", "value": f"`{f.signed_money(-total_fees, 4)} USD` "
-                                                f"(−{fee_pct:.2f}%)"
-                                                f"{' · estimated' if fees_are_estimated else ''}", "inline": True},
-            {"name": "🧾 NET", "value": f"{f.arrow(pnl)} **`{f.signed_money(pnl)} USD`**", "inline": True},
-            {"name": "🏁 Exit reason", "value": reason or "manual", "inline": True},
-        ]
-        if strategies:
-            fields.append({"name": f"{f.E_BRAIN} Strategies", "value": ", ".join(strategies), "inline": False})
-        self._send_discord_embed(
-            title=f"{icon} CLOSED {result_text} · {symbol}",
-            description=f"**{side.upper()}** {f.qty(amount)} on {exchange.upper()} — "
-                        f"`{f.price(entry_price)}` {f.ARROW_RIGHT} `{f.price(exit_price)}` "
-                        f"({f.signed_pct(pnl_pct)}) → net `{f.signed_money(pnl)} USD`",
-            color=color,
-            fields=fields,
-            footer=self._daily_footer(),
-            webhook_url=self.discord_webhook_trades,
+        # ── 1. what happened, trade by trade ──
+        # A busy window gets its biggest movers spelled out and the rest
+        # collapsed onto one line each. A 25-trade window rendered in full is
+        # a 7,000-character message that Telegram rejects outright, and even
+        # if it did arrive it would be the exact wall-of-nothing the digest
+        # exists to prevent. Detail is spent on the trades that moved the
+        # number; the remainder still appear, just compactly.
+        ranked = sorted(trades, key=lambda t: abs(t["pnl"]), reverse=True)
+        detailed, rest = ranked[:f.MAX_DETAILED_TRADES], ranked[f.MAX_DETAILED_TRADES:]
+        for i, t in enumerate(detailed, 1):
+            tg.append(self._trade_line(t, index=i, total=count))
+        if rest:
+            # The remainder, aggregated by market and venue. Twenty-five
+            # separate one-liners saying the same thing is the wall this whole
+            # feature exists to remove, so identical activity is collapsed into
+            # one attributed line. Nothing is lost: the count and the net are
+            # both stated, and every trade remains in the ledger for /trades
+            # and /digest.
+            for key, agg in _aggregate_trades(rest).items():
+                tg.append(
+                    f"{f.arrow(agg['net'])} <b>{key}</b> <code>×{agg['count']}</code> "
+                    f"{f.ARROW_RIGHT} <b>{f.signed_money(agg['net'])} USD</b>"
+                    f"  <i>smaller movers</i>"
+                )
+
+        # ── 2. what the window earned, and what it cost ──
+        tg.append(f.rules())
+        tg.append(
+            f"🧾 <b>WINDOW NET</b>  {f.arrow(net)} <code>{f.signed_money(net)} USD</code>"
+            f"   <i>{f.signed_pct(net / bal_before * 100 if bal_before else 0)} on the balance it traded</i>"
+        )
+        if gross:
+            tg.append(
+                f"💰 <b>GROSS</b>  <code>{f.signed_money(gross)} USD</code>"
+                f"   {f.BULLET}  ⛽ <b>COST</b> <code>{f.signed_money(-fees, 4)} USD</code>"
+                f"   <i>({fee_drag:.0f}% of gross given to execution)</i>"
+            )
+        if count:
+            tg.append(
+                f"📊 <b>WINDOW RECORD</b>  <code>{count}</code> trade{'' if count == 1 else 's'}  {f.BULLET}  "
+                f"🟢 {wins}W {f.BULLET} 🔴 {losses}L  {f.BULLET}  "
+                f"<b>{accuracy:.0f}% accuracy</b>"
+                + (f"  <i>({count} trade{'' if count == 1 else 's'} — "
+                   f"too few to call a rate)</i>" if count < 5 else "")
+            )
+        if avg_win or avg_loss:
+            tg.append(
+                f"⚖️ <b>AVG WIN / LOSS</b>  <code>+{f.money(avg_win, 4)}</code> {f.BULLET} "
+                f"<code>−{f.money(avg_loss, 4)}</code> USD"
+            )
+
+        # ── 3. where the balance went ──
+        # The balance line shows the ACTUAL movement, not the trade PnL. They
+        # differ whenever a sweep fired in the window, and showing "+0.15" next
+        # to a balance that fell 20 dollars is the kind of pairing that makes a
+        # reader stop trusting the log entirely. The movement is broken out
+        # beneath it so the difference is explained rather than hidden.
+        swept = sum(flow["amount"] for flow in flows if flow["kind"] == "sweep")
+        tg.append(f.rules())
+        if bal_before is None:
+            # The starting balance could not be reconstructed, so only the
+            # ending one is stated. Printing a reconstructed figure anyway would
+            # be a confident number built on an assumption that has already
+            # failed; saying so is the useful part.
+            balance_line = (
+                f"💼 <b>BALANCE NOW</b>  <code>{f.money(bal_now)} USD</code>"
+                f"\n   <i>⚠️ start of window not derivable — a logged cash "
+                f"transfer does not match the balance movement. Update the "
+                f"balance after moving money, or this reads as a loss.</i>"
+            )
+        else:
+            moved = bal_now - bal_before
+            balance_line = (
+                f"💼 <b>BALANCE</b>  <code>{f.money(bal_before)}</code> {f.ARROW_RIGHT} "
+                f"{f.arrow(moved)} <code>{f.money(bal_now)}</code> USD"
+                f"   <i>change {f.signed_money(moved)}</i>"
+            )
+            if swept and abs(moved - net) > 0.005:
+                balance_line += (f"\n   <i>= trading {f.signed_money(net)} · "
+                                 f"{f.signed_money(-swept)} swept out to your stake wallet</i>")
+        tg.append(balance_line)
+        peak = float(digest.get("peak_balance", 0.0) or 0.0)
+        if peak:
+            from_peak = (bal_now - peak) / peak * 100
+            tg.append(
+                f"📉 <b>FROM PEAK</b>  {f.arrow(from_peak)} <code>{f.signed_pct(from_peak)}</code>"
+                f"   <i>peak {f.money(peak)} USD</i>"
+            )
+
+        # ── 4. profit vs money returned — never one number ──
+        if cash.get("entries"):
+            returned = float(cash.get("returned", 0.0))
+            swept_total = float(cash.get("swept", 0.0))
+            tg.append(
+                f"🏦 <b>YOUR MONEY</b>  funded <code>{f.money(cash.get('funding', 0.0))}</code> {f.BULLET} "
+                f"returned <code>{f.money(returned)}</code> {f.BULLET} "
+                f"profit <code>{f.signed_money(cash.get('profit', 0.0))}</code> USD"
+                + ("  <i>— returned capital is not profit</i>" if returned else "")
+            )
+            if swept_total:
+                # Swept profit is a fifth figure rather than a fourth, because
+                # it is already inside "profit". Adding it anywhere near the
+                # other columns invites the reader to count it twice.
+                tg.append(
+                    f"🏦 <b>OF WHICH SWEPT</b>  {f.arrow(swept_total)} "
+                    f"<code>{f.money(swept_total)} USD</code>"
+                    f"  <i>earned, moved to your stake wallet</i>"
+                )
+        if flows:
+            for flow in flows:
+                tg.append(self._flow_line(flow))
+
+        # ── 5. is the record good enough to keep going ──
+        if total_trades:
+            tg.append(f.rules())
+            tg.append(
+                f"💎 <b>TOTAL INCOME</b>  {f.arrow(all_time.get('net_pnl', 0))} "
+                f"<code>{f.signed_money(all_time.get('net_pnl', 0))} USD</code>  {f.BULLET}  "
+                f"all time, net of costs  {f.BULLET}  "
+                f"<code>{total_trades}</code> trades  {f.BULLET}  "
+                f"<b>{all_time_accuracy:.0f}% accuracy</b>"
+            )
+            pf = float(all_time.get("profit_factor_net", 0.0) or 0.0)
+            income = float(all_time.get("net_pnl", 0.0))
+            if pf:
+                # The wording follows the sign of the income, not the size of
+                # the factor. A factor slightly under 1.0 on a book that is
+                # ahead overall is a book with thin coverage, and calling it
+                # "losing money" next to a positive total income contradicts
+                # itself on one screen.
+                if income > 0:
+                    pf_note = ("profitable system" if pf >= 1.5 else
+                               "winners just cover the losers" if pf >= 1.0 else
+                               "ahead, but losers outweigh winners")
+                elif income < 0:
+                    pf_note = ("losing money" if pf < 1.0 else
+                               "losing, but the ratio is not the cause")
+                else:
+                    pf_note = "flat"
+                tg.append(
+                    f"🎯 <b>PROFIT FACTOR</b>  <code>{pf:.2f}</code>  {f.BULLET}  "
+                    f"⛽ <b>EFFICIENCY</b> <code>{efficiency:.0f}%</code>  {f.BULLET}  "
+                    f"📐 <b>EXPECTANCY</b> <code>{f.signed_pct(expectancy)}</code>/trade"
+                    f"  <i>({pf_note}, after costs)</i>"
+                )
+        daily_net = float(daily.get("realized_pnl", 0.0)) - float(daily.get("network_fees", 0.0) or 0.0)
+        tg.append(
+            f"📅 <b>TODAY</b>  {f.arrow(daily_net)} <code>{f.signed_money(daily_net)} USD</code>  {f.BULLET}  "
+            f"{int(daily.get('trades', 0))}t  {int(daily.get('wins', 0))}W/"
+            f"{int(daily.get('losses', 0))}L  {f.BULLET}  fees "
+            f"${f.money(daily.get('fees_paid', 0.0), 4)}"
         )
 
-        # ── Event log ─────────────────────────────────────────────────────
-        self._log_trade("closed", trade_data)
+        # ── 6. what is still exposed, and to what ──
+        open_pos = int(digest.get("open_positions", 0) or 0)
+        if open_pos:
+            exposure = float(digest.get("open_notional", 0.0) or 0.0)
+            tg.append(f.rules())
+            tg.append(
+                f"📂 <b>OPEN</b>  <code>{open_pos}</code> positions  {f.BULLET}  "
+                f"${f.money(exposure)} notional  {f.BULLET}  "
+                f"stops live on every one"
+            )
+            by_class_open = digest.get("open_by_class") or {}
+            by_venue_open = digest.get("open_by_venue") or {}
+            if by_class_open:
+                tg.append(f"   <i>class: {_exposure_line(by_class_open, bal_now)}</i>")
+            if by_venue_open:
+                tg.append(f"   <i>venue: {_exposure_line(by_venue_open, bal_now)}</i>")
+
+        if digest.get("trading_halted"):
+            tg.append(f.rules())
+            tg.append(f"🔴 <b>TRADING HALTED</b> — {digest.get('halt_reason') or 'reason not recorded'}")
+        streak = int(digest.get("consecutive_losses", 0) or 0)
+        if streak >= 3:
+            tg.append(f"⚠️ <i>{streak} losses in a row — sized positions are still open and managed.</i>")
+
+        suppressed = digest.get("suppressed") or []
+        if suppressed:
+            held = ", ".join(f"{e['label']} ×{e['count']}" for e in suppressed[:4])
+            tg.append(f"🔕 <i>held back: {held}</i>")
+
+        tg.append(f.rules())
+        verdict, verdict_icon, _ = self._verdict(net, count, fees)
+        tg.append(f"<b>{verdict_icon} {verdict}</b>")
+
+        self._send_telegram_styled("\n".join(tg))
+        self._send_digest_discord(digest, net, gross, fees, wins, losses, count,
+                                  accuracy, efficiency, verdict, verdict_icon)
+
+        self._log({
+            "type": "trade_digest",
+            "message": f"{count} trade(s) in 5m: net {net:+.2f}, fees {fees:.4f}, "
+                       f"balance "
+                       f"{f'{bal_before:.2f} -> ' if bal_before is not None else ''}"
+                       f"{bal_now:.2f}",
+            "priority": "normal",
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "trade_data": {
+                "trade_count": count, "wins": wins, "losses": losses,
+                "net_pnl": net, "gross_pnl": gross, "fees": fees,
+                "balance_before": bal_before, "balance_now": bal_now,
+                "symbols": sorted({t["symbol"] for t in trades}),
+                "by_class": by_class, "by_venue": by_venue,
+                "cash_flows": flows,
+            },
+        })
+
+    def _trade_line(self, t: dict, index: int = 0, total: int = 0) -> str:
+        """One trade, on one screen, in the shared house style.
+
+        The pairing of entry price ➜ exit price ➜ net, each with its own
+        arrow, is the part worth keeping: it makes the direction legible
+        before any digit is read, which is the whole reason arrows are in the
+        formatting module at all."""
+        is_win = t["pnl"] > 0
+        icon = f.E_PROFIT if is_win else f.E_LOSS
+        side = "LONG" if t["side"] == "buy" else "SHORT"
+        side_icon = "📈" if t["side"] == "buy" else "📉"
+        held = f.holding_time(t.get("held_seconds", 0))
+        prefix = f"{icon} " if total <= 1 else f"{index}. "
+
+        return (
+            f"{prefix}<b>{t['symbol']}</b>  {side_icon} {side}  {f.BULLET}  "
+            f"{f.market_tag(t['symbol'], t['exchange'])}\n"
+            f"   {f.E_ENTRY} <code>{f.price(t['entry_price'])}</code> {f.ARROW_RIGHT} "
+            f"{f.E_EXIT} <code>{f.price(t['exit_price'])}</code>  {f.ARROW_RIGHT} "
+            f"<code>{f.qty(t['amount'])}</code>  {f.BULLET} ${f.money(t['notional'])}\n"
+            f"   {f.arrow(t['pnl'])} <b>NET {f.signed_money(t['pnl'])} USD</b>"
+            + (f"  ({f.signed_pct(t['pnl_pct'])} price move)" if t.get("pnl_pct") is not None else "")
+            + f"  {f.BULLET} gross {f.signed_money(t['gross'])} {f.BULLET} "
+            f"cost {f.signed_money(-t['fees'], 4)}"
+            + (f" (est)" if t.get("fees_are_estimated") else "")
+            + f"  {f.BULLET} {f.E_TIME} {held}\n"
+            f"   <i>🏁 {t.get('reason') or 'manual exit'}</i>"
+        )
+
+    def _flow_line(self, flow: dict) -> str:
+        """A deposit, a withdrawal, or a profit sweep, stated as what it is.
+
+        The three carry different footnotes because they mean different things.
+        A deposit and a withdrawal are you moving your own capital across the
+        boundary, and calling either a profit would be a lie. A sweep is the
+        opposite: the balance is reduced precisely because the bot earned more
+        than it was told to keep, so the amount leaving the trading account is
+        the profit. Labelling it "capital, not profit" contradicted the label
+        two words earlier on the same line and made the YOUR MONEY split
+        unreadable."""
+        kind = flow.get("kind", "")
+        amount = float(flow.get("amount", 0.0) or 0.0)
+        venue = f.venue_name(flow.get("venue")) if flow.get("venue") else "account"
+        if kind == "deposit":
+            icon, label = "📥", "DEPOSITED BY YOU"
+            footnote = "<i>your capital in, not profit</i>"
+        elif kind == "withdrawal":
+            icon, label = "📤", "WITHDRAWN BY YOU"
+            footnote = "<i>your capital out, not profit</i>"
+        else:
+            icon, label = "🏦", "PROFIT SWEPT TO STAKE"
+            footnote = "<i>earned profit, moved out of trading</i>"
+        note = f"  <i>{flow['note']}</i>" if flow.get("note") else ""
+        return (f"{icon} <b>{label}</b>  {f.arrow(amount)} <code>{f.money(amount)} USD</code> "
+                f"→ {venue}{note}  {footnote}")
+
+    def _send_digest_discord(self, digest, net, gross, fees, wins, losses,
+                             count, accuracy, efficiency, verdict, verdict_icon):
+        color = COLOR_RED if net < 0 else (COLOR_GREEN if net > 0 else COLOR_GRAY)
+        bal_now = float(digest.get("balance_now", 0.0))
+        # None means the digest could not reconstruct the window start; it is
+        # carried through as None rather than coerced to 0.0, because 0.0 is
+        # a real balance and would print as a confident wrong figure.
+        bal_before = digest.get("balance_before")
+        bal_before = float(bal_before) if bal_before is not None else None
+        cash = digest.get("cash", {}) or {}
+        all_time = digest.get("all_time", {}) or {}
+        total_trades = int(all_time.get("total", 0) or 0)
+
+        # Same rule as Telegram, because the constraint is the same one: the
+        # movers get the detail, the tail is aggregated, and the result is
+        # chunked to fit. Discord's limit is 1024 characters per field value and
+        # an embed allows at most 25 fields, so a window with enough trades to
+        # breach either would have the whole embed rejected — losing the balance
+        # and the verdict along with the trade list, when the balance is the part
+        # that actually matters.
+        ranked = sorted(digest.get("trades") or [],
+                        key=lambda t: abs(t["pnl"]), reverse=True)
+        detailed, rest = ranked[:f.MAX_DETAILED_TRADES], ranked[f.MAX_DETAILED_TRADES:]
+        trade_lines = [
+            f"{'🟢' if t['pnl'] > 0 else '🔴'} **{t['symbol']}** "
+            f"{'LONG' if t['side'] == 'buy' else 'SHORT'} · {f.class_label(t['symbol'])} · "
+            f"{f.venue_name(t['exchange'])}\n"
+            f"`{f.price(t['entry_price'])}` ➜ `{f.price(t['exit_price'])}` · "
+            f"net **{f.signed_money(t['pnl'])} USD** · held {f.holding_time(t.get('held_seconds', 0))}"
+            + (f" · {t['reason']}" if t.get("reason") else "")
+            for t in detailed
+        ]
+        for key, agg in _aggregate_trades(rest).items():
+            trade_lines.append(
+                f"{f.arrow(agg['net'])} **{key}** `×{agg['count']}` ➜ "
+                f"**{f.signed_money(agg['net'])} USD** · smaller movers"
+            )
+
+        fields = [
+            {"name": "🧾 Window net", "value": f"{f.arrow(net)} `{f.signed_money(net)} USD`", "inline": True},
+            {"name": "💰 Gross → cost", "value": f"`{f.signed_money(gross)}` ➜ `−{f.money(fees, 4)}`", "inline": True},
+            {"name": "📊 Record", "value": f"`{count}` · {wins}W/{losses}L · {accuracy:.0f}%", "inline": True},
+            {"name": "💼 Balance", "value": (f"`{f.money(bal_before)}` ➜ `{f.money(bal_now)}`"
+                                             if bal_before is not None else
+                                             f"`{f.money(bal_now)}`\n⚠️ start of window not derivable"),
+             "inline": True},
+            {"name": "⛽ Efficiency", "value": f"`{efficiency:.0f}%` of gross survived cost", "inline": True},
+            {"name": "💎 Total income", "value": f"`{f.signed_money(all_time.get('net_pnl', 0))} USD` all time, net of costs · "
+                                                f"`{total_trades}` trades", "inline": True},
+        ]
+        if cash.get("entries"):
+            money_value = (f"funded `{f.money(cash.get('funding', 0))}` · "
+                           f"returned `{f.money(cash.get('returned', 0))}` · "
+                           f"profit `{f.signed_money(cash.get('profit', 0))} USD`")
+            if float(cash.get("swept", 0.0) or 0.0):
+                money_value += (f"\nof which swept to safety "
+                                f"`{f.money(cash.get('swept', 0))}` — earned, "
+                                f"not capital returned")
+            fields.append({
+                "name": "🏦 Your money (capital, not profit)",
+                "value": money_value,
+                "inline": False,
+            })
+        by_class = digest.get("open_by_class") or {}
+        by_venue = digest.get("open_by_venue") or {}
+        if int(digest.get("open_positions", 0) or 0):
+            fields.append({
+                "name": "📂 Open exposure",
+                "value": (f"`{digest['open_positions']}` positions · "
+                          f"`${f.money(digest.get('open_notional', 0))}` notional"
+                          + (f"\nclass: {_exposure_line(by_class, bal_now)}" if by_class else "")
+                          + (f"\nvenue: {_exposure_line(by_venue, bal_now)}" if by_venue else "")),
+                "inline": False,
+            })
+        if trade_lines:
+            # Split across as many fields as the text needs, so a long window
+            # loses nothing. Discord stops at 25 fields total, so the count is
+            # reported when it would be silently dropped at the cap.
+            chunks = _chunk_lines(trade_lines, DISCORD_FIELD_MAX)
+            for i, chunk in enumerate(chunks, 1):
+                name = "📒 Trades this window" if i == 1 else f"📒 Trades (cont.) {i}"
+                fields.append({"name": name, "value": chunk, "inline": False})
+            if len(fields) + 1 > DISCORD_FIELD_MAX_COUNT:
+                logger.warning(
+                    f"discord digest needed {len(fields) + 1} fields, over the "
+                    f"{DISCORD_FIELD_MAX_COUNT} cap; the tail was dropped")
+        fields.append({"name": f"{verdict_icon} Verdict", "value": verdict, "inline": False})
+
+        self._send_discord_embed(
+            title=f"🕐 5-Min Trade Digest · {f.arrow(net)} {f.signed_money(net)} USD · {count} trade(s)",
+            description=f"{f.utc_stamp(digest.get('epoch'))} · "
+                        f"classes: {', '.join(_group_by(digest.get('trades') or [], lambda t: f.class_label(t['symbol'])).keys()) or 'none'}",
+            color=color,
+            fields=fields,
+            footer=((f"balance {f.money(bal_before)} ➜ " if bal_before is not None
+                     else "balance ") + f"{f.money(bal_now)} USD · "
+                    f"fees {f.money(fees, 4)} USD"),
+            webhook_url=self.discord_webhook_trades,
+        )
 
     # ── 6-hour report ─────────────────────────────────────────────────────
 
@@ -942,8 +1459,8 @@ class Notifier:
         """The mid-session report. It exists to answer one question — 'is this
         working?' — using the numbers that decide it: net result AFTER costs,
         the win rate, and what execution has cost so far. Deliberately not a
-        trade-by-trade recap; every trade was already messaged the moment it
-        closed, and repeating them here is how a report becomes noise."""
+        trade-by-trade recap; the 5-minute digest already carried those, and
+        repeating them at a third scale is how a report becomes noise."""
         window = report.get("window_hours", 6)
         pnl = float(report.get("pnl", 0.0))
         gross = float(report.get("gross_pnl", pnl))
@@ -1188,40 +1705,100 @@ class Notifier:
             handle.write(json.dumps(entry, default=str) + "\n")
 
     def _send_telegram(self, event_type, message, priority, trade_data=None):
+        """Non-trade events, in the same visual language as the trade logs.
+
+        The old form was 'ℹ️ [circuit_breaker_triggered]' followed by prose.
+        That is a debug string: it names an internal event identifier instead
+        of telling the reader what happened, and the ℹ️ marker makes a
+        halted trading bot look like a passing note. Severity now comes from
+        an icon and a colour that match the meaning, and the event name is
+        kept only as small-caps context at the end."""
         if not (self.telegram_token and self.telegram_chat_id):
             return
-        if event_type in ("trade_opened", "trade_closed", "hourly_summary"):
+        if event_type in ("trade_opened", "trade_closed", "hourly_summary",
+                          "trade_digest"):
             return  # handled by dedicated methods
-        prefix = "🚨 " if priority == "high" else "ℹ️ "
+
+        icon, headline, body = _event_style(event_type, message, priority)
+        title = f"{icon} <b>{headline}</b>"
+        tail = f"   <i>{_esc(event_type)}</i>"
+        text = f"{title}{tail}\n{body}" if body else f"{title}{tail}"
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         requests.post(url, json={
             "chat_id": self.telegram_chat_id,
-            "text": f"{prefix}<b>[{event_type}]</b>\n{message}",
+            "text": text,
             "parse_mode": "HTML",
         }, timeout=10)
 
     def _send_telegram_styled(self, html_message: str):
         if not (self.telegram_token and self.telegram_chat_id):
             return
+        self._send_telegram_chunked(html_message)
+
+    def _send_telegram_chunked(self, html_message: str):
+        """Send, splitting on line boundaries if the message is over Telegram's
+        4096-character limit.
+
+        Splitting is a last resort, not the design: a message that needed
+        splitting means the digest was built too long, and every extra part
+        costs the reader another notification to dismiss. The renderers cap
+        their output so this normally never fires — but a bot that silently
+        fails to deliver a trade report because it exceeded a character count
+        is worse than one that sends a second part, so the guarantee is here
+        rather than assumed."""
+        limit = 3900
+        if len(html_message) <= limit:
+            parts = [html_message]
+        else:
+            parts, part = [], ""
+            for line in html_message.split("\n"):
+                if part and len(part) + len(line) + 1 > limit:
+                    parts.append(part)
+                    part = ""
+                # A single line longer than the limit on its own (a single
+                # pathological trade line) still has to be broken, or it fails
+                # the send and takes the rest of the digest with it.
+                while len(line) > limit:
+                    parts.append(line[:limit])
+                    line = line[limit:]
+                part += line + "\n"
+            if part.strip():
+                parts.append(part)
+
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        requests.post(url, json={
-            "chat_id": self.telegram_chat_id,
-            "text": html_message,
-            "parse_mode": "HTML",
-        }, timeout=10)
+        for i, part in enumerate(parts, 1):
+            body = part
+            if len(parts) > 1:
+                body = f"<i>({i}/{len(parts)})</i>\n{part}"
+            try:
+                resp = requests.post(url, json={
+                    "chat_id": self.telegram_chat_id,
+                    "text": body,
+                    "parse_mode": "HTML",
+                }, timeout=10)
+                if not resp.ok:
+                    logger.error(f"Telegram send failed: {resp.text[:200]}")
+            except Exception as e:
+                logger.error(f"Telegram send error: {e}")
 
     def _send_discord(self, event_type, message, priority, trade_data=None):
         if not self.discord_webhook_url:
             return
-        if event_type in ("trade_opened", "trade_closed", "hourly_summary"):
+        if event_type in ("trade_opened", "trade_closed", "hourly_summary",
+                          "trade_digest"):
             return  # handled by dedicated methods
-        prefix = "🚨 " if priority == "high" else "ℹ️ "
+        icon, headline, _ = _event_style(event_type, message, priority)
+        color = COLOR_RED if priority == "high" else COLOR_BLUE
         try:
-            from discord_webhook import DiscordWebhook
-            DiscordWebhook(
-                url=self.discord_webhook_url,
-                content=f"{prefix}**{event_type}**: {message}",
-            ).execute()
+            from discord_webhook import DiscordWebhook, DiscordEmbed
+            embed = DiscordEmbed(
+                title=f"{icon} {headline}",
+                description=message,
+                color=color,
+            )
+            embed.set_footer(text=event_type)
+            embed.set_timestamp(datetime.now(timezone.utc))
+            DiscordWebhook(url=self.discord_webhook_url).add_embed(embed).execute()
         except ImportError:
             pass
 
@@ -1244,7 +1821,7 @@ class Notifier:
                     )
             if footer:
                 embed.set_footer(text=footer)
-            embed.set_timestamp(datetime.now(timezone.utc).isoformat())
+            embed.set_timestamp(datetime.now(timezone.utc))
             webhook.add_embed(embed)
             webhook.execute()
         except ImportError:

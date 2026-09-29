@@ -91,7 +91,7 @@ class FeedRouter:
         self.feeds["nse"] = NSEFeed()
 
         # MT5 feed for MetaTrader 5 symbols
-        mt5_login = int(os.environ.get("MT5_LOGIN", "0"))
+        mt5_login = int(os.environ.get("MT5_LOGIN", "0") or "0")
         mt5_password = os.environ.get("MT5_PASSWORD", "")
         mt5_server = os.environ.get("MT5_SERVER", "")
         if mt5_login:

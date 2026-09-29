@@ -37,6 +37,11 @@ from core.structured_logger import (
     heartbeat,
 )
 from alerts.notifier import Notifier
+# Imported as `fm`, not `f`: this module already binds `f` to a file handle
+# (the config load below, and the retrain stamp), and because both are
+# module-scope that second binding silently replaces this one. The engine then
+# died at start-up with "'TextIOWrapper' object has no attribute 'venue_name'".
+from alerts import formatting as fm
 from data_feeds.feed_router import FeedRouter
 from strategy.technical_strategy import (
     detect_cross_exchange_arbitrage, detect_triangular_arbitrage,
@@ -50,6 +55,7 @@ from core.position_monitor import check_and_close_positions
 from core.market_hours import market_is_open
 from reporting.hourly_report import HourlyReporter
 from reporting.session_report import SessionReporter
+from reporting.trade_digest import TradeDigest
 from long_term.market_intelligence import MarketIntelligence
 from control.telegram_bot import TelegramControlBot
 from control.discord_bot import DiscordControlBot
@@ -376,7 +382,7 @@ def main():
     # MT5 executor. The server name decides whether this is demo or live:
     # "MetaQuotes-Demo" is a demo server, so capital cannot reach it, but a
     # real broker server name would be live with no separate flag to check.
-    mt5_login = int(os.environ.get("MT5_LOGIN", "0"))
+    mt5_login = int(os.environ.get("MT5_LOGIN", "0") or "0")
     mt5_password = os.environ.get("MT5_PASSWORD", "")
     mt5_server = os.environ.get("MT5_SERVER", "")
     if mt5_login and venue_enabled("mt5"):
@@ -433,12 +439,21 @@ def main():
     # time the operator learns which mode, which venues and which cost model
     # the process actually came up with — all three of which can differ from
     # what the .env appears to say.
-    venues = ", ".join(f"{v.upper()}{'' if getattr(x, 'dry_run', True) else ' (LIVE)'}"
-                       for v, x in executors.items()) or "none"
+    # Startup is the one message where the reader has no other source: it is
+    # the only time they learn which mode, which venues and which cost model
+    # the process actually came up with, and all three can differ from what
+    # the .env appears to say. So it says the real balance, the real venue
+    # count, and what the money is already committed to — not a summary of
+    # settings the operator set deliberately.
+    venue_lines = []
+    for v, x in executors.items():
+        live = not getattr(x, "dry_run", True)
+        venue_lines.append(
+            f"{fm.venue_name(v)} ({'LIVE' if live else 'paper'})")
     notifier.notify(
         "startup",
-        f"🟢 {mode_str}\n"
-        f"🏦 Venues: {venues}\n"
+        f"{'🟢' if LIVE_TRADING else '🟡'} {mode_str}\n"
+        f"🏦 Venues: {', '.join(venue_lines) or 'none'}\n"
         f"📊 Markets: {len(all_markets)}\n"
         f"⛽ Cost model: {fee_model.taker_bps:.0f}bps taker base · gas ~"
         f"{fee_model.network_fee_for():.2f} USD on {fee_model.network}\n"
@@ -470,6 +485,16 @@ def main():
         state, notifier, risk_manager=risk,
         window_hours=CONFIG.get("reporting", {}).get("window_report_hours", 6),
         day_hours=CONFIG.get("reporting", {}).get("day_report_hours", 24),
+    )
+
+    # The 5-minute trade digest. Trades are batched into it rather than
+    # messaged one at a time, and a window with no closed trades sends
+    # nothing at all — see reporting/trade_digest.py for why that silence is
+    # the feature and not a gap.
+    trade_digest = TradeDigest(
+        state, notifier,
+        interval_seconds=CONFIG.get("reporting", {}).get("digest_interval_seconds", 300),
+        risk_manager=risk,
     )
 
     # Record the run start before anything else can fail. Without this the
@@ -531,6 +556,10 @@ def main():
             session_reporter.maybe_report()
         except Exception as e:
             print(f"Session reporter error: {e}")
+        try:
+            trade_digest.maybe_digest()
+        except Exception as e:
+            print(f"Trade digest error: {e}")
 
         if risk_state["trading_halted"]:
             time.sleep(30)

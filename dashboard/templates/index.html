@@ -600,7 +600,10 @@ function updateDashboard(data) {
   // Net PnL
   document.getElementById('netPnl').textContent = `$${(stats.net_pnl||0).toFixed(2)}`;
   document.getElementById('netPnl').className = 'card-value ' + ((stats.net_pnl||0) >= 0 ? 'green' : 'red');
-  document.getElementById('profitFactor').textContent = `PF: ${(stats.profit_factor||0).toFixed(2)} | Best: $${(stats.best_trade||0).toFixed(2)}`;
+  // Net of execution costs, which is the figure that decides whether to keep
+  // running. The gross ratio sits beside it so the fee drag between them is
+  // visible rather than hidden inside an unexplained difference.
+  document.getElementById('profitFactor').textContent = `PF: ${(stats.profit_factor_net||0).toFixed(2)} net (${(stats.profit_factor||0).toFixed(2)} before costs) | Best: $${(stats.best_trade||0).toFixed(2)}`;
 
   // Market Intelligence
   const fng = regime.fear_greed;
@@ -902,7 +905,7 @@ async function loadAllTimeStats() {
       <div>Win Rate: <b>${(stats.win_rate||0).toFixed(1)}%</b></div>
       <div>W/L: <b>${stats.wins||0} / ${stats.losses||0}</b></div>
       <div class="${(stats.net_pnl||0)>=0?'trade-win':'trade-loss'}">Net PnL: <b>$${(stats.net_pnl||0).toFixed(2)}</b></div>
-      <div>Profit Factor: <b>${(stats.profit_factor||0).toFixed(2)}</b></div>
+      <div>Profit Factor (net of costs): <b>${(stats.profit_factor_net||0).toFixed(2)}</b> <i>(${(stats.profit_factor||0).toFixed(2)} before costs)</i></div>
       <div class="trade-win">Best: <b>$${(stats.best_trade||0).toFixed(2)}</b></div>
       <div class="trade-loss">Worst: <b>$${(stats.worst_trade||0).toFixed(2)}</b></div>
     </div>

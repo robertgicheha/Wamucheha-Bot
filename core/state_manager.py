@@ -8,6 +8,7 @@ Extended with:
 - Trade history queries with filtering
 """
 import json
+import os
 import shutil
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
@@ -18,9 +19,19 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 
-DB_PATH = Path(__file__).parent.parent / "data" / "state.db"
-SNAPSHOT_PATH = Path(__file__).parent.parent / "data" / "state_snapshot.json"
-BACKUP_DIR = Path(__file__).parent.parent / "data" / "backups"
+# The database location. Overridable so a test run cannot point at the live
+# file: this module's tests truncate TradeRow, OpenPositionRow and
+# CashFlowRow, and running those against the operator's real state.db would
+# delete the trade history and cash ledger the reports are built from. The
+# default is unchanged, so nothing in normal operation is affected.
+DB_PATH = Path(os.environ.get("WAMUCHEHA_DB_PATH")
+               or Path(__file__).parent.parent / "data" / "state.db")
+# The snapshot and backup follow the database, so pointing the DB elsewhere
+# moves its side effects with it. A test run that wrote the live risk-state
+# snapshot would overwrite the real one with test figures, and a test run
+# calling backup_now would drop a junk .db into the operator's backup folder.
+SNAPSHOT_PATH = DB_PATH.parent / "state_snapshot.json"
+BACKUP_DIR = DB_PATH.parent / "backups"
 
 engine = create_engine(
     f"sqlite:///{DB_PATH}",
@@ -171,6 +182,43 @@ class DailyEconomicsRow(Base):
             "trades": self.trades or 0,
             "wins": self.wins or 0,
             "losses": self.losses or 0,
+        }
+
+
+# ── Cash-flow ledger ─────────────────────────────────────────────────────
+# Trading profit and your own money are different quantities and adding them
+# together is how a report ends up claiming a 300% return. When you deposit
+# 100 USDT, the balance goes up but you have not earned anything; when the bot
+# sweeps profit to your stake wallet, capital leaves the trading balance but
+# only the profit earned is a gain. Without a record of both directions, a
+# balance change cannot be decomposed into "the bot made this" and "this came
+# back to you", and 'money returned' is not a number anyone can compute.
+#
+# Every row is a movement the operator performed or the bot was instructed to
+# record. The bot never moves funds itself — it has no withdrawal rights by
+# design — so these are declarations, and the honest ones matter.
+
+
+class CashFlowRow(Base):
+    __tablename__ = "cash_flows"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    kind = Column(String, nullable=False)   # deposit | withdrawal | sweep
+    amount = Column(Float, nullable=False, default=0.0)
+    venue = Column(String, nullable=True)
+    asset_class = Column(String, nullable=True)
+    note = Column(Text, nullable=True)
+    created_at = Column(String, nullable=False)
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "kind": self.kind,
+            "amount": self.amount or 0.0,
+            "venue": self.venue,
+            "asset_class": self.asset_class,
+            "note": self.note,
+            "created_at": self.created_at,
         }
 
 
@@ -387,6 +435,95 @@ class StateManager:
             ).order_by(DailyEconomicsRow.day.asc()).all()
             return [r.to_dict() for r in rows]
 
+    # ---------- cash-flow ledger ----------
+
+    def record_cash_flow(self, kind: str, amount: float, venue: str = None,
+                         asset_class: str = None, note: str = ""):
+        """Log a deposit, a withdrawal, or an instructed profit sweep.
+
+        Does NOT move the trading balance. The balance is the venue's, and only
+        a real transfer against the venue's own deposit/withdrawal screen
+        changes it — a row here is a record of what you told the bot you did,
+        which is what lets a later report tell profit from returned capital.
+        """
+        if kind not in ("deposit", "withdrawal", "sweep"):
+            raise ValueError(f"unknown cash-flow kind: {kind}")
+        with Session(engine) as session:
+            with session.begin():
+                session.add(CashFlowRow(
+                    kind=kind,
+                    amount=abs(float(amount or 0.0)),
+                    venue=(venue or "").lower() or None,
+                    asset_class=asset_class,
+                    note=note or None,
+                    created_at=self._now(),
+                ))
+        return True
+
+    def get_cash_flows(self, n: int = 50) -> list:
+        with Session(engine) as session:
+            rows = session.query(CashFlowRow).order_by(
+                CashFlowRow.id.desc()
+            ).limit(n).all()
+            return [r.to_dict() for r in rows]
+
+    def get_cash_flow_totals(self) -> dict:
+        """Money in, money out, and what is genuinely yours.
+
+        `returned` is your own capital that came back — withdrawals. `swept` is
+        earned profit the bot moved out of the trading account. `profit` is
+        what the bot earned. `funding` is what you put in.
+
+        Sweeps are reported apart from `returned` rather than added into it,
+        because the two are different claims on the same pot: a withdrawal is
+        your capital coming home and does not count as a win, while a sweep is
+        the bot's profit, already inside `profit`, being parked somewhere
+        safer. Folding them together let a 25 USD sweep print as "25 USD of
+        capital returned, 0.22 USD profit" on the same screen — the money was
+        real, but it was the bot's money, not yours.
+        """
+        with Session(engine) as session:
+            rows = session.query(CashFlowRow).all()
+        totals = {"deposit": 0.0, "withdrawal": 0.0, "sweep": 0.0}
+        by_venue = defaultdict(lambda: {"deposit": 0.0, "withdrawal": 0.0, "sweep": 0.0})
+        for r in rows:
+            amt = float(r.amount or 0.0)
+            totals[r.kind] = totals.get(r.kind, 0.0) + amt
+            if r.venue:
+                by_venue[r.venue][r.kind] = by_venue[r.venue].get(r.kind, 0.0) + amt
+        funding = totals["deposit"]
+        returned = totals["withdrawal"]
+        swept = totals["sweep"]
+        all_time = self.get_all_time_stats()
+        profit = float(all_time.get("net_pnl", 0.0))
+        return {
+            "deposited": round(totals["deposit"], 4),
+            "withdrawn": round(totals["withdrawal"], 4),
+            "swept": round(swept, 4),
+            "returned": round(returned, 4),
+            "funding": round(funding, 4),
+            # Capital still working for you: what you put in, plus what the bot
+            # earned, minus what you have taken back out and minus profit that
+            # has been swept to safety. `profit` is the all-time total, which
+            # already includes the swept portion, so subtracting the sweep again
+            # here would count the same dollars as both earned and removed.
+            "capital_deployed": round(funding + profit - returned - swept, 4),
+            "profit": round(profit, 4),
+            "entries": len(rows),
+            "by_venue": {k: {kk: round(vv, 4) for kk, vv in v.items()}
+                         for k, v in sorted(by_venue.items())},
+        }
+
+    def get_cash_flows_since(self, since_iso: str) -> list:
+        """Cash movements inside a reporting window, oldest first. A digest
+        that shows a balance change without showing the transfer that caused
+        it is a digest that will be misread."""
+        with Session(engine) as session:
+            rows = session.query(CashFlowRow).filter(
+                CashFlowRow.created_at >= since_iso
+            ).order_by(CashFlowRow.id.asc()).all()
+            return [r.to_dict() for r in rows]
+
     def get_fee_totals(self) -> dict:
         """All-time venue fees. The number that answers 'what has execution
         cost me so far', which no other stat in the system does."""
@@ -461,7 +598,8 @@ class StateManager:
         with Session(engine) as session:
             rows = session.query(TradeRow).filter_by(
                 status="closed"
-            ).order_by(TradeRow.id.asc()).limit(n).all()
+            ).order_by(TradeRow.id.desc()).limit(n).all()
+            rows = list(reversed(rows))
             cumulative = 0
             curve = []
             for r in rows:
@@ -469,6 +607,7 @@ class StateManager:
                 curve.append({
                     "trade_id": r.id,
                     "symbol": r.symbol,
+                    "exchange": r.exchange,
                     "pnl": r.pnl,
                     "cumulative_pnl": cumulative,
                     "closed_at": r.closed_at,
@@ -499,6 +638,16 @@ class StateManager:
                 TradeRow.status == "closed"
             ).scalar() or 0
             gross_pnl = float(net_pnl) + float(total_fees)
+            # Gross side of each half, i.e. with the execution cost of those
+            # trades added back. `pnl` is already net — the executors subtract
+            # fees before storing it — so the gross figures have to be rebuilt
+            # rather than read.
+            won_gross = session.query(
+                func.sum(TradeRow.pnl + TradeRow.fees)
+            ).filter(TradeRow.status == "closed", TradeRow.pnl > 0).scalar() or 0
+            lost_gross = session.query(
+                func.sum(TradeRow.pnl + TradeRow.fees)
+            ).filter(TradeRow.status == "closed", TradeRow.pnl <= 0).scalar() or 0
             avg_pnl = (net_pnl / total) if total > 0 else 0
 
             # Best and worst trades
@@ -523,10 +672,27 @@ class StateManager:
             "avg_pnl": avg_pnl,
             "best_trade": best,
             "worst_trade": worst,
-            "profit_factor": (total_won / abs(total_lost)) if total_lost else 0,
-            # Profit factor measured AFTER costs. The gross version is the one
-            # that makes a fee-dragging system look profitable.
-            "profit_factor_net": (gross_pnl / abs(total_lost)) if total_lost else 0,
+            # Two profit factors, and the names have to be right because the
+            # whole point of showing the second one is that the first flatters.
+            #
+            # `pnl` is stored net of fees — the executors subtract before it is
+            # written — so `total_won` and `total_lost` are both net, and their
+            # ratio is the after-costs answer. The gross figures add each
+            # trade's own fees back, which is the flattering version: it credits
+            # the system with money it never kept.
+            #
+            # The earlier version of this had the two the other way round, with
+            # the net label on a gross numerator, and a third variant dividing
+            # net P&L by the losing side — one total divided by part of itself,
+            # which scored a book up 0.22 on 0.50 of losers at 0.44 and got
+            # labelled "losing money overall" on the same screen as its own
+            # positive total income.
+            "profit_factor": (float(won_gross) / abs(float(lost_gross))
+                              if lost_gross else 0),
+            "profit_factor_net": (float(total_won) / abs(float(total_lost))
+                                  if total_lost else 0),
+            "total_won_gross": float(won_gross),
+            "total_lost_gross": float(lost_gross),
         }
 
     def is_duplicate_order(self, client_order_id) -> bool:
