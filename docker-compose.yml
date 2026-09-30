@@ -1,5 +1,53 @@
 version: '3.8'
 services:
+  # MT5 terminal under Wine. The engine's MT5_RPC_HOST points at this service
+  # name (see below), so the service MUST be called `mt5` — renaming it to
+  # something cosmetic silently breaks the bridge, and the symptom is a startup
+  # log line that says "MT5 connection failed" with no other clue.
+  #
+  # Deliberately NOT in the engine's depends_on: a dead or slow MT5 bridge must
+  # not stop the crypto venues from starting. The engine logs one warning and
+  # trades the venues that did come up.
+  mt5:
+    image: lprett/mt5linux:latest
+    container_name: trading-mt5
+    # Alpine + Wine is x86_64 only. On an ARM VPS this service cannot run and
+    # MT5 has to move to a Windows box (MT5_RPC_HOST pointing at its LAN IP).
+    platform: linux/amd64
+    cpus: ${MT5_CPU:-1.0}
+    mem_limit: ${MT5_MEM:-1g}
+    restart: unless-stopped
+    # NOT `env_file: .env`. The terminal exposes a VNC/noVNC UI and runs a
+    # Windows compatibility layer — a far bigger attack surface than the engine,
+    # and it has no use for the exchange API keys, the dashboard secret or the
+    # Telegram/Discord tokens. Compose interpolates just the three broker
+    # credentials out of .env at parse time, so that is all this container ever
+    # sees. Empty values start the terminal without auto-login; log in once
+    # through the noVNC tunnel and it remembers the account.
+    environment:
+      # The server binds inside the container. 0.0.0.0 is what lets the engine
+      # reach it over the trading-net bridge; the default (localhost) would
+      # refuse every connection from another container.
+      MT5_HOST: 0.0.0.0
+      MT5_LOGIN: ${MT5_LOGIN:-}
+      MT5_PASSWORD: ${MT5_PASSWORD:-}
+      MT5_SERVER: ${MT5_SERVER:-}
+      # The image calls it VNC_PASSWORD; .env keeps the MT5_ prefix so the
+      # broker block stays together. Absent -> the noVNC page is open, which is
+      # why the ports below are bound to loopback and not published.
+      VNC_PASSWORD: ${MT5_VNC_PASSWORD:-}
+      NOVNC_HOST: 127.0.0.1
+    ports:
+    # noVNC, so the terminal can be inspected once through an SSH tunnel.
+    - 127.0.0.1:8080:8080
+    - 127.0.0.1:5901:5901
+    # RPyC. Published on loopback only so a systemd-run bot on the host can use
+    # MT5_RPC_HOST=127.0.0.1 (see deploy/DEPLOYMENT.md). Never 0.0.0.0 — this
+    # port hands full terminal control to anything that can reach it.
+    - 127.0.0.1:18812:18812
+    networks:
+    - trading-net
+
   engine:
     build:
       context: .
@@ -14,7 +62,10 @@ services:
     - engine-data:/app/data
     - ml-models:/app/ml/saved_models
     environment:
+      # Resolves to the `mt5` service above. Leave this empty on Windows, where
+      # the MetaTrader5 package is imported directly instead.
       MT5_RPC_HOST: mt5
+      MT5_RPC_PORT: 18812
       PYTHONUNBUFFERED: '1'
     networks:
     - trading-net

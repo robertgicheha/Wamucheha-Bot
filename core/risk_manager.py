@@ -354,6 +354,14 @@ class RiskManager:
         )
 
     def resume_trading(self, actor: str):
+        """Clear a halt and reset the loss counter.
+
+        Always goes through the risk manager rather than writing risk state
+        directly, so the resume is notified and attributed. Writing
+        `trading_halted=0` to the state store from a command handler looks
+        equivalent but silently skips the audit notification, which is the one
+        record of who re-armed a halted bot.
+        """
         self.state.update_risk_state(trading_halted=0, halt_reason=None, consecutive_losses=0)
         self.notifier.notify("circuit_breaker_reset", f"Trading resumed by {actor}.")
 

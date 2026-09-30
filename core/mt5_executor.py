@@ -15,8 +15,14 @@ import logging
 from datetime import datetime, timezone
 
 from core.mt5_client import get_mt5
+from core.fee_manager import FeeModel
 
 logger = logging.getLogger("mt5_executor")
+
+# Fallback contract size when the broker has not published symbol_info yet.
+# 100,000 units/lot is the standard for FX majors; gold is 100. Used only for
+# notional estimates, never to place an order.
+_DEFAULT_CONTRACT_SIZE = 100000.0
 
 
 class MT5Executor:
@@ -24,7 +30,7 @@ class MT5Executor:
                  login: int = 0, password: str = "", server: str = "",
                  dry_run: bool = True, allow_min_lot: bool = False,
                  max_lot: float = 0, max_open_trades: int = 0,
-                 max_daily_loss_pct: float = 0):
+                 max_daily_loss_pct: float = 0, fee_model=None):
         self.state = state_manager
         # Bridge-side hard guards. The engine already runs a risk manager, but
         # it lives on the Ubuntu host — if that host is compromised, misbehaves,
@@ -43,6 +49,14 @@ class MT5Executor:
         self.risk = risk_manager
         self.notifier = notifier
         self.dry_run = dry_run
+        # One cost model for the whole process, shared with the ccxt
+        # executors. MT5 charges no separate commission — its cost is in the
+        # spread, which is already inside the fill prices — so the configured
+        # rate is 0. It still goes through FeeModel so that a broker that DOES
+        # levy a commission (or an operator who models spread as a bps cost) is
+        # priced, and so the reported $0.00 is a stated zero rather than an
+        # argument nobody passed.
+        self.fees = fee_model or FeeModel()
         self.login = login
         self.password = password
         self.server = server
@@ -141,6 +155,28 @@ class MT5Executor:
         except Exception as e:
             logger.error(f"Failed to calculate lot size: {e}")
             return 0.0
+
+    def _contract_size(self, symbol: str) -> float:
+        """Units per lot for this symbol, as the broker publishes it."""
+        try:
+            mt5 = get_mt5()
+            info = mt5.symbol_info(symbol)
+            size = float(getattr(info, "trade_contract_size", 0) or 0) if info else 0.0
+            return size or _DEFAULT_CONTRACT_SIZE
+        except Exception:
+            return _DEFAULT_CONTRACT_SIZE
+
+    def _notional_usd(self, symbol: str, lots: float, price: float) -> float:
+        """USD value of a lot-denominated position.
+
+        MT5 sizes in lots, so price x amount is meaningless on its own: 0.1
+        lots of XAUUSD moving $10 is $100 of profit, not $1. Every notional
+        figure the reports show (size, fee, P&L) has to go through here or it
+        is off by the contract size.
+        """
+        if not lots or not price:
+            return 0.0
+        return float(lots) * self._contract_size(symbol) * float(price)
 
     def _bridge_guard(self, symbol: str, lots: float) -> str:
         """Hard limits enforced independently of the engine's risk manager.
@@ -246,10 +282,18 @@ class MT5Executor:
                 self.notifier.notify("trade_rejected", f"MT5 error: {e}")
                 return None
 
+        # The cost of getting in, priced on the USD notional the lot size
+        # actually represents. Stored so the close can subtract the real round
+        # trip instead of reporting this venue as free.
+        entry_notional = self._notional_usd(symbol, lots, fill_price)
+        entry_fee = self.fees.cost_for_fill("mt5", symbol, entry_notional)["cost"]
+        fee_rate = self.fees.rate_for("mt5", symbol)
+
         self.state.record_trade_open(
             client_order_id, "mt5", symbol, side, lots,
             fill_price, sl_price, tp_price,
             strategies=strategies, score=score, regime=regime,
+            entry_fee=entry_fee, fee_rate=fee_rate,
         )
         self.notifier.notify_trade_opened(
             symbol=symbol, side=side, amount=lots,
@@ -257,6 +301,8 @@ class MT5Executor:
             take_profit=tp_price, exchange="mt5",
             dry_run=self.dry_run, strategies=strategies,
             score=score, regime=regime,
+            entry_fee=entry_fee,
+            round_trip_fee=self.fees.cost_estimate("mt5", symbol, entry_notional),
         )
         return client_order_id
 
@@ -301,18 +347,47 @@ class MT5Executor:
                                      priority="high")
                 return
 
+        # ── Gross vs net ───────────────────────────────────────────────
+        # `amount` is lots, so a raw (exit - entry) * amount is wrong by the
+        # contract size — 0.1 lots of gold moving $10 is $100, not $1. Gross is
+        # the price move on the real notional; the broker's own calculation is
+        # the authority on what actually landed in the account, because it also
+        # applies contract size, currency conversion and the spread.
         direction = 1 if pos["side"] == "buy" else -1
-        pnl = direction * (exit_price - pos["entry_price"]) * pos["amount"]
+        lots = float(pos["amount"])
+        contract_size = self._contract_size(pos["symbol"])
+        gross_pnl = direction * (exit_price - pos["entry_price"]) * lots * contract_size
+        exit_notional = self._notional_usd(pos["symbol"], lots, exit_price)
+
+        entry_fee = float(pos.get("entry_fee") or 0.0)
+        exit_fee_info = self.fees.cost_for_fill("mt5", pos["symbol"], exit_notional)
+        exit_fee = exit_fee_info["cost"]
+
+        broker_pnl = None
         try:
-            # amount is in lots; let MT5 apply contract size + currency conversion.
             mt5 = get_mt5()
             open_type = mt5.ORDER_TYPE_BUY if pos["side"] == "buy" else mt5.ORDER_TYPE_SELL
-            calc = mt5.order_calc_profit(open_type, pos["symbol"], pos["amount"],
+            calc = mt5.order_calc_profit(open_type, pos["symbol"], lots,
                                          pos["entry_price"], exit_price)
             if calc is not None:
-                pnl = calc
+                broker_pnl = float(calc)
         except Exception as e:
-            logger.warning(f"MT5 order_calc_profit failed, using raw estimate: {e}")
+            logger.warning(f"MT5 order_calc_profit failed, using modelled P&L: {e}")
+
+        if broker_pnl is not None:
+            # The broker's realized figure is already net of the spread and any
+            # commission it charged, so it is the number the balance, the daily
+            # P&L and the circuit breakers must run on. Report the gap between
+            # it and the price move as the cost actually taken, floored at zero
+            # (a favourable fill is a better price, not a negative fee).
+            pnl = broker_pnl
+            measured_cost = gross_pnl - broker_pnl
+            if measured_cost > 0:
+                gross_pnl = broker_pnl + measured_cost
+                exit_fee = measured_cost
+        else:
+            pnl = gross_pnl - entry_fee - exit_fee
+        total_fees = entry_fee + exit_fee
 
         # Get trade metadata
         from sqlalchemy.orm import Session
@@ -324,7 +399,9 @@ class MT5Executor:
                 import json
                 strategies = json.loads(trade.strategies)
 
-        self.state.record_trade_close(client_order_id, exit_price, pnl, reason)
+        self.state.record_trade_close(client_order_id, exit_price, pnl, reason,
+                                      exit_fee=exit_fee,
+                                      fees_are_estimated=exit_fee_info["estimated"])
         self.risk.on_trade_closed(pnl)
 
         self.notifier.notify_trade_closed(
@@ -332,7 +409,12 @@ class MT5Executor:
             entry_price=pos["entry_price"], exit_price=exit_price,
             pnl=pnl, exchange="mt5", reason=reason,
             strategies=strategies,
+            gross_pnl=gross_pnl, entry_fee=entry_fee, exit_fee=exit_fee,
+            fees_are_estimated=exit_fee_info["estimated"],
+            opened_at=pos.get("opened_at"),
         )
+        logger.info(f"MT5 {pos['symbol']} closed: gross {gross_pnl:.2f}, fees {total_fees:.2f}, "
+                    f"net {pnl:.2f}")
 
     def _find_position_ticket(self, symbol: str, client_order_id: str = "") -> int:
         """Find the ticket of the position this bot order opened (matched by comment)."""

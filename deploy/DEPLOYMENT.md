@@ -39,27 +39,43 @@ sudo ufw enable
 ## Part 1a — MetaTrader 5 on the Linux VPS
 
 MT5 and its `MetaTrader5` Python package are Windows-only. On the VPS the
-terminal runs under Wine in the `mt5` Docker container (`lprett/mt5linux`,
-x86_64 only), which logs in from `MT5_LOGIN`/`MT5_PASSWORD`/`MT5_SERVER`,
-restarts the terminal if it crashes, and serves the MetaTrader5 module over
-RPyC on `127.0.0.1:18812`. The bot talks to it via `core/mt5_client.py` when
-`MT5_RPC_HOST` is set.
+terminal runs under Wine in the `mt5` Docker service in `docker-compose.yml`
+(`lprett/mt5linux`, x86_64 only), which logs in from
+`MT5_LOGIN`/`MT5_PASSWORD`/`MT5_SERVER`, restarts the terminal if it crashes,
+and serves the MetaTrader5 module over RPyC on port 18812. The bot talks to it
+via `core/mt5_client.py` when `MT5_RPC_HOST` is set.
+
+The service name is `mt5` and the container name is `trading-mt5`. Do not
+rename the service: the engine resolves it by that name, and a rename produces
+nothing more informative than "MT5 connection failed" at startup.
 
 ```bash
 # Once: install Docker
 curl -fsSL https://get.docker.com | sudo sh
 sudo usermod -aG docker tradingbot    # log out/in afterwards
 
-# In /opt/trading_bot, with .env filled in (MT5_* and MT5_RPC_HOST=127.0.0.1)
-docker compose up -d mt5              # only the MT5 container; the bot stays on systemd
-docker logs -f trading-mt5            # first start takes a few minutes
+# In /opt/trading_bot, with .env filled in (MT5_* and MT5_VNC_PASSWORD)
+docker compose up -d mt5              # only the MT5 service; the bot stays on systemd
+docker logs -f trading-mt5            # first start downloads/installs the terminal
 pip install -r requirements.txt       # adds rpyc
 python scripts/check_connections.py   # the MT5 line should show your account + a XAUUSD price
 sudo systemctl restart tradingbot
 ```
 
+**The service reads only the three broker credentials out of `.env`** — login,
+password, server. The exchange API keys, dashboard secret and chat tokens are
+deliberately not passed into it: it exposes a VNC/noVNC UI and runs a Windows
+compatibility layer, so it is not a place to keep the keys to your money. If
+you leave the credentials blank the terminal still starts, without auto-login;
+log in once through the tunnel below and it remembers the account.
+
+**On an ARM VPS this service cannot run** (Alpine + Wine is x86_64 only).
+Either use an x86_64 VPS, or point `MT5_RPC_HOST` at a Windows machine on your
+network running the terminal with the same RPyC server. Everything else about
+the bot is unchanged.
+
 **Look at the terminal once** through an SSH tunnel (the ports are bound to
-localhost only, never expose them publicly):
+localhost only, never exposed publicly):
 ```bash
 ssh -L 8080:localhost:8080 -L 5901:localhost:5901 tradingbot@YOUR_VPS_IP
 # then open http://localhost:8080 (password = MT5_VNC_PASSWORD)
@@ -86,11 +102,13 @@ sudo systemctl enable --now tradingbot-telegram tradingbot-discord
 ```
 
 Before starting them, fill in `.env`:
-- `TELEGRAM_ALLOWED_USER_IDS` — your numeric Telegram user ID (message
+- `TELEGRAM_ALLOWED_USERS` — your numeric Telegram user ID (message
   [@userinfobot](https://t.me/userinfobot) to get it), comma-separated if more
   than one person should have control. **Leave this blank and the bot refuses
   every command from everyone** — it fails closed on purpose since these
-  commands can halt/resume/restart something trading real money.
+  commands can halt/resume/restart something trading real money. The engine
+  also refuses to start the control bot at all when a token is set but this is
+  blank, so a half-configured bot looks unconfigured rather than broken.
 - `DISCORD_BOT_TOKEN` — a real bot token from the
   [Discord Developer Portal](https://discord.com/developers/applications)
   (New Application → Bot → Reset Token). This is different from
@@ -98,10 +116,12 @@ Before starting them, fill in `.env`:
   Enable "Message Content Intent" under Bot settings, then invite it to your
   server via OAuth2 → URL Generator (scope: `bot`, permissions: Send Messages
   + Read Message History).
-- `DISCORD_ALLOWED_USER_IDS` — same fail-closed logic as Telegram. Get your
-  Discord user ID via User Settings → Advanced → Enable Developer Mode, then
-  right-click your name → Copy User ID.
-- `DISCORD_CONTROL_CHANNEL_ID` (optional) — restrict commands to one channel.
+- `DISCORD_ALLOWED_ROLES` — comma-separated **role names**, matched
+  case-insensitively against the sender's roles, with the same fail-closed
+  logic as Telegram. Create the role in your server first (Server Settings →
+  Roles), grant it to yourself, and use the exact name. Using a role rather
+  than a user ID means revoking someone's access is one permission change
+  instead of a redeploy. An empty value denies everyone.
 
 **`/restart` needs one narrowly-scoped sudo rule.** The `tradingbot` OS user
 normally can't restart systemd services. Grant it permission for exactly this

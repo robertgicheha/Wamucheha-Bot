@@ -56,6 +56,7 @@ def build_watchlist(config: dict) -> dict:
         "us_stocks": universe.get("us_stocks", []),
         "etfs": universe.get("etfs", []),
         "nse_kenya": universe.get("nse_kenya", []),
+        "nse_etfs": universe.get("nse_etfs", []),
     }
 
 
@@ -136,15 +137,30 @@ def _nse_gainers_losers(nse_feed, top_n: int) -> tuple[list, list]:
     if not snapshot:
         return [], []
     moves = []
-    for row in snapshot["universe"]:
-        price, change = row.get("price"), row.get("change")
-        if price is None or change is None:
+    for row in snapshot.get("universe", []):
+        price = row.get("price")
+        if price is None:
             continue
-        prev = price - change
-        if prev <= 0:
-            continue
-        pct = change / prev * 100
-        moves.append({"ticker": row["ticker"], "name": row["name"], "price": price, "change_pct": round(pct, 2)})
+        # The two sources spell the daily move differently, and reading the
+        # wrong one yields an EMPTY result rather than an error:
+        #   persisted RapidAPI /stocks   -> `change_pct` (already a percentage)
+        #   free afx.kwayisi.org scrape  -> `change` (an absolute price delta)
+        # get_market_snapshot() prefers the persisted file whenever one exists,
+        # so `change` is absent on the path actually used in production, every
+        # row was skipped, and the whole NSE movers section silently vanished
+        # from the digest. Prefer the percentage and derive it from the delta
+        # only when that is all the source gave us.
+        pct = row.get("change_pct")
+        if pct is None:
+            delta = row.get("change")
+            if delta is None:
+                continue
+            prev = price - delta
+            if prev <= 0:
+                continue
+            pct = delta / prev * 100
+        moves.append({"ticker": row["ticker"], "name": row.get("name"),
+                      "price": price, "change_pct": round(pct, 2)})
     moves.sort(key=lambda m: m["change_pct"], reverse=True)
     gainers = [m for m in moves if m["change_pct"] > 0][:top_n]
     losers = sorted([m for m in moves if m["change_pct"] < 0], key=lambda m: m["change_pct"])[:top_n]
@@ -303,14 +319,24 @@ def format_digest(analysis: dict, outlook: dict, sell: list, movers: dict) -> st
         else:
             lines.append("  none rated Buy today")
 
-    etfs = [e for e in analysis.get("etfs", []) if e["recommendation"] in ("Strong Buy", "Buy")][:4]
+    us_etfs = [e for e in analysis.get("etfs", []) if e.get("market") != "nse"]
+    etfs = [e for e in us_etfs if e["recommendation"] in ("Strong Buy", "Buy")][:4]
     if etfs:
-        lines.append("\n<b>🧺 ETFs</b>")
+        lines.append("\n<b>🧺 US ETFs</b>")
         for e in etfs:
             m = e["metrics"]
             lines.append(f"  • <b>{e['ticker']}</b> {e['recommendation']} ({e['score']:.0f}/100) — "
                          f"fee {_num(m['expense_ratio_pct'], '{:.2f}', '%')} | "
                          f"5y {_num(m['return_5y_avg'], '{:.1f}', '%/yr')}")
+
+    nse_etfs = [e for e in analysis.get("etfs", []) if e.get("market") == "nse"]
+    if nse_etfs:
+        lines.append("\n<b>🇰🇪 NSE Kenya ETFs</b>")
+        for e in nse_etfs[:4]:
+            m = e["metrics"]
+            lines.append(f"  • <b>{e['ticker']}</b> {e['recommendation']} ({e['score']:.0f}/100) — "
+                         f"KES {_num(e.get('price'), '{:,.2f}')} | "
+                         f"1y {_num(m.get('return_1y'), '{:+.0f}', '%')}")
 
     avoid = [s for s in analysis.get("stocks", []) if s["recommendation"] == "Avoid"][:5]
     if avoid:
@@ -333,13 +359,22 @@ def format_digest(analysis: dict, outlook: dict, sell: list, movers: dict) -> st
             lines.append(f"  • <b>{c['ticker']}</b> — {c['reasons'][0]}")
 
     us, nse = movers.get("us", {}), movers.get("nse", {})
-    for label, mv in (("US/ETF", us), ("NSE", nse)):
-        if mv.get("gainers") or mv.get("losers"):
-            lines.append(f"\n<b>📈 {label} movers today</b>")
-            if mv.get("gainers"):
-                lines.append("  Gainers: " + ", ".join(f"{m['ticker']} {m['change_pct']:+.1f}%" for m in mv["gainers"]))
-            if mv.get("losers"):
-                lines.append("  Losers: " + ", ".join(f"{m['ticker']} {m['change_pct']:+.1f}%" for m in mv["losers"]))
+    for label, mv in (("US/ETF", us), ("NSE Kenya", nse)):
+        gainers, losers = mv.get("gainers", []), mv.get("losers", [])
+        if not gainers and not losers:
+            # Say so, rather than dropping the heading. A section that is
+            # absent reads as "nothing happened" and a section that says
+            # "no data" reads as "the feed is broken" — and the reader cannot
+            # tell which is true, which is exactly how a broken feed goes
+            # unnoticed for weeks.
+            lines.append(f"\n<b>📈 {label} movers today</b>\n  <i>No move data available "
+                         f"— the exchange feed returned no rows.</i>")
+            continue
+        lines.append(f"\n<b>📈 {label} movers today</b>")
+        if gainers:
+            lines.append("  Gainers: " + ", ".join(f"{m['ticker']} {m['change_pct']:+.1f}%" for m in gainers))
+        if losers:
+            lines.append("  Losers: " + ", ".join(f"{m['ticker']} {m['change_pct']:+.1f}%" for m in losers))
 
     lines.append("\n<i>Rules-based scores from public data (yfinance, afx.kwayisi.org) — "
                  "not financial advice or a price prediction. Full table on the dashboard.</i>")
@@ -493,19 +528,44 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
                            ["Stock", "Call", "Score", "P/E", "Div", "ROE" if market == "us" else "1Y",
                             "Mkt cap", "Why"], table_rows))
 
+    # ETFs are split by market because the two sets do not share a single
+    # honest column set. A US ETF has a published expense ratio, a 5-year
+    # return series and an AUM figure. A Kenyan ETF listed on the NSE has
+    # none of those from any free source — only a KES price and the return
+    # series built up from the same quote pages as the Kenyan equities. Using
+    # one table for both meant every Kenyan ETF row was four "n/a" cells wide,
+    # which reads as a bug and, worse, hides the two real numbers it does have.
+    us_etfs = [e for e in etfs if e.get("market") != "nse"]
+    nse_etfs = [e for e in etfs if e.get("market") == "nse"]
+
     etf_rows = []
-    for e in sorted(etfs, key=lambda e: (e["score"] or 0), reverse=True):
+    for e in sorted(us_etfs, key=lambda e: (e["score"] or 0), reverse=True):
         m = e["metrics"]
         etf_rows.append([
-            f'<b style="color:#fff;">{_esc(e["ticker"])}</b>'
-            f'<br><span style="color:#7b7d90;font-size:10px;">{_esc((e.get("name") or "")[:30])}</span>',
+            f'<b style="color:{C["text_primary"]};">{_esc(e["ticker"])}</b>'
+            f'<br><span style="color:{C["text_secondary"]};font-size:10px;">{_esc((e.get("name") or "")[:30])}</span>',
             rec(e["recommendation"]),
             _score_bar(e["score"], width=42),
             _num(m["expense_ratio_pct"], "{:.2f}", "%"),
             _num(m["return_5y_avg"], "{:.1f}", "%/yr"),
             _money(m.get("total_assets")),
         ])
-    parts.append(table("🧺 ETFs", ["ETF", "Call", "Score", "Fee", "5y avg", "Assets"], etf_rows))
+    parts.append(table("🧺 US ETFs", ["ETF", "Call", "Score", "Fee", "5y avg", "Assets"], etf_rows))
+
+    nse_etf_rows = []
+    for e in sorted(nse_etfs, key=lambda e: (e["score"] or 0), reverse=True):
+        m = e["metrics"]
+        nse_etf_rows.append([
+            f'<b style="color:{C["text_primary"]};">{_esc(e["ticker"])}</b>'
+            f'<br><span style="color:{C["text_secondary"]};font-size:10px;">{_esc((e.get("name") or "")[:30])}</span>',
+            rec(e["recommendation"]),
+            _score_bar(e["score"], width=42),
+            f'KES {_num(e.get("price"), "{:,.2f}")}',
+            pct_cell(m.get("return_1y"), "{:+.0f}"),
+            pct_cell(m.get("return_3m"), "{:+.1f}"),
+        ])
+    parts.append(table("🇰🇪 NSE KENYA ETFs",
+                       ["ETF", "Call", "Score", "Price", "1Y", "3M"], nse_etf_rows))
 
     # ── Macro: adds RSI state and 1m alongside the existing 1w ────────────
     out_rows = []

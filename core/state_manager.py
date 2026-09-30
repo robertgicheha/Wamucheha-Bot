@@ -329,7 +329,12 @@ class StateManager:
                     score=score,
                     regime=regime,
                     entry_fee=float(entry_fee or 0.0),
-                    fee_rate=float(fee_rate or 0.0),
+                    # `fee_rate` belongs to the OPEN position only — it is the
+                    # rate used to price the way out. TradeRow has no such
+                    # column, and passing one to the ORM constructor raises
+                    # TypeError, which aborts the open AFTER the order has
+                    # already been sent: an exchange position the bot then has
+                    # no record of, and no stop. Do not add it here.
                     opened_at=now,
                 ))
                 session.add(OpenPositionRow(

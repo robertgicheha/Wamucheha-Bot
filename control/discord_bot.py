@@ -31,7 +31,12 @@ except ImportError:
 
 logger = logging.getLogger("discord_bot")
 
-ALLOWED_ROLES = os.environ.get("DISCORD_ALLOWED_ROLES", "")
+def _allowed_role_names() -> set:
+    raw = os.environ.get("DISCORD_ALLOWED_ROLES", "")
+    return {r.strip().lower() for r in raw.split(",") if r.strip()}
+
+
+ALLOWED_ROLES = _allowed_role_names()
 
 COLOR_GREEN = 0x4CAF50
 COLOR_RED = 0xF44336
@@ -45,10 +50,26 @@ from alerts import formatting as f
 
 
 def _is_authorized(ctx) -> bool:
+    """Is this user allowed to run control commands?
+
+    Empty allowlist means DENY, for the same reason as the Telegram bot: these
+    commands can clear a risk-manager circuit breaker and can forge the
+    cash-flow ledger, and on a public bot anyone can invoke them. Discord's
+    default `!` prefix plus `message_content` intent means any member of any
+    server the bot was invited to can type them, so the allowlist is the only
+    thing standing between a public server and your trading controls.
+    """
     if not ALLOWED_ROLES:
-        return True
-    allowed = [r.strip().lower() for r in ALLOWED_ROLES.split(",") if r.strip()]
-    return any(role.name.lower() in allowed for role in ctx.author.roles)
+        logger.error(
+            "DISCORD_ALLOWED_ROLES is empty, so every command is denied. Set it "
+            "to the role names permitted to control the bot (comma-separated, "
+            "case-insensitive). Trading is unaffected.")
+        return False
+    try:
+        names = {r.name.lower() for r in ctx.author.roles}
+    except AttributeError:
+        return False
+    return bool(names & ALLOWED_ROLES)
 
 
 def _parse_amount(ctx) -> tuple:
@@ -362,15 +383,19 @@ class DiscordControlBot:
             if not _is_authorized(ctx):
                 await ctx.reply("Unauthorized.")
                 return
-            state = self._get_state()
-            state.update_risk_state(
-                trading_halted=0,
-                halt_reason=None,
-                consecutive_losses=0,
-            )
+            # Through the risk manager, not straight to the state store, so the
+            # circuit_breaker_reset notification records who re-armed trading.
+            risk = self._get_risk()
+            actor = f"Discord user {ctx.author.id}"
+            if risk is None:
+                self._get_state().update_risk_state(
+                    trading_halted=0, halt_reason=None, consecutive_losses=0)
+            else:
+                risk.resume_trading(actor)
             embed = discord.Embed(
                 title="✅ Trading Resumed",
-                description="Bot is now actively trading again.",
+                description=("Bot is now actively trading again.\n"
+                             f"_Resumed by Discord user {ctx.author.id}._"),
                 color=COLOR_GREEN,
             )
             await ctx.reply(embed=embed)
@@ -448,11 +473,15 @@ class DiscordControlBot:
                 await ctx.reply("Usage: `!deposit 250 binance`")
                 return
             value, venue = amount
+            # A declared amount is a note, not a transfer: the trading balance is
+            # untouched, but this ledger is what separates returned capital from
+            # profit, so the actor is recorded for audit.
             self._get_state().record_cash_flow(
-                "deposit", value, venue=venue, note="declared via Discord")
+                "deposit", value, venue=venue,
+                note=f"declared via Discord by {ctx.author.id}")
             await ctx.reply(
                 f"📥 **DEPOSIT LOGGED** — `+{value:,.2f} USD` ➜ {venue or 'the account'}\n"
-                f"_Counted as capital in, not profit._")
+                f"_Counted as capital in, not profit. Nothing was moved._")
 
         @self._bot.command(name="withdraw")
         async def cmd_withdraw(ctx):
@@ -465,11 +494,13 @@ class DiscordControlBot:
                 return
             value, venue = amount
             self._get_state().record_cash_flow(
-                "withdrawal", value, venue=venue, note="declared via Discord")
+                "withdrawal", value, venue=venue,
+                note=f"declared via Discord by {ctx.author.id}")
             await ctx.reply(
                 f"📤 **WITHDRAWAL LOGGED** — `−{value:,.2f} USD` ➜ "
                 f"{venue or 'from the account'}\n"
-                f"_Your capital leaving, not a loss. The bot does not move funds._")
+                f"_Your capital leaving, not a loss. The bot does not move funds — "
+                f"this records what you did._")
 
         @self._bot.command(name="help")
         async def cmd_help(ctx):
@@ -517,6 +548,10 @@ class DiscordControlBot:
         token = os.environ.get("DISCORD_BOT_TOKEN", "")
         if token:
             loop.run_until_complete(self._bot.start(token))
+
+    @staticmethod
+    def authorized_count() -> int:
+        return len(ALLOWED_ROLES)
 
     def _get_state(self):
         if self.state is None:

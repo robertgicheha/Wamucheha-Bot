@@ -457,12 +457,25 @@ class NSEFeed:
                 if not ticker:
                     continue
                 change_cls = tds[4].get("class") or []
+                price = _parse_number_suffix(tds[3].get_text(strip=True))
+                change = _parse_number_suffix(tds[4].get_text(strip=True))
+                # The RapidAPI path publishes `change_pct`; the digest and the
+                # dashboard both read that key. Publish it here too so the two
+                # sources are interchangeable — previously each path carried
+                # only the key the other one wanted, so a consumer written
+                # against one silently produced empty output on the other.
+                change_pct = None
+                if price is not None and change is not None:
+                    prev = price - change
+                    if prev > 0:
+                        change_pct = change / prev * 100
                 out.append({
                     "ticker": ticker,
                     "name": tds[1].get_text(strip=True),
                     "volume": _parse_number_suffix(tds[2].get_text(strip=True)),
-                    "price": _parse_number_suffix(tds[3].get_text(strip=True)),
-                    "change": _parse_number_suffix(tds[4].get_text(strip=True)),
+                    "price": price,
+                    "change": change,
+                    "change_pct": change_pct,
                     "direction": "up" if "hi" in change_cls else ("down" if "lo" in change_cls else "flat"),
                 })
             return out

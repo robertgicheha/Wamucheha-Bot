@@ -14,10 +14,12 @@ import uuid
 import requests
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
+from core.fee_manager import FeeModel
+
 
 class OandaExecutor:
     def __init__(self, api_key: str, account_id: str, state_manager, risk_manager,
-                 notifier, practice: bool = False, dry_run: bool = True):
+                 notifier, practice: bool = False, dry_run: bool = True, fee_model=None):
         self.state = state_manager
         self.risk = risk_manager
         self.notifier = notifier
@@ -26,6 +28,11 @@ class OandaExecutor:
         self.account_id = account_id
         self.base_url = ("https://api-fxpractice.oanda.com" if practice
                          else "https://api-fxtrade.oanda.com")
+        # OANDA's cost is the spread, already inside the fill price, and it
+        # charges no separate commission — so the configured rate is 0. Wiring
+        # it through FeeModel keeps the reported zero a stated figure and lets
+        # an operator who models spread as a bps cost have it deducted.
+        self.fees = fee_model or FeeModel()
         self._instrument_info = None
 
     def _precision(self, instrument: str) -> int:
@@ -181,10 +188,15 @@ class OandaExecutor:
             fill_price = float(fill_str.get("price", entry_price))
             filled_units = abs(int(float(fill_str.get("units", units))))
 
+        entry_notional = float(filled_units) * float(usd_per_unit or 0.0)
+        entry_fee = self.fees.cost_for_fill("oanda", symbol, entry_notional)["cost"]
+        fee_rate = self.fees.rate_for("oanda", symbol)
+
         self.state.record_trade_open(
             order_id, "oanda", symbol, side, filled_units,
             fill_price, sl_price, tp_price,
             strategies=strategies, score=score, regime=regime,
+            entry_fee=entry_fee, fee_rate=fee_rate,
         )
         self.notifier.notify_trade_opened(
             symbol=symbol, side=side, amount=filled_units,
@@ -192,6 +204,8 @@ class OandaExecutor:
             take_profit=tp_price, exchange="oanda",
             dry_run=self.dry_run, strategies=strategies,
             score=score, regime=regime,
+            entry_fee=entry_fee,
+            round_trip_fee=self.fees.cost_estimate("oanda", symbol, entry_notional),
         )
         return order_id
 
@@ -203,21 +217,36 @@ class OandaExecutor:
 
         instrument = self._normalize_instrument(pos["symbol"])
         direction = 1 if pos["side"] == "buy" else -1
-        pnl = self._quote_to_usd(instrument, direction * (exit_price - pos["entry_price"]) * pos["amount"],
-                                 exit_price)
+
+        # ── Gross vs net ───────────────────────────────────────────────
+        # `amount` is units of the base currency, so the price move is already
+        # in the quote currency and only needs converting to the USD the
+        # balance is tracked in.
+        usd_per_unit = self._usd_per_base(instrument, exit_price) or 0.0
+        exit_notional = float(pos["amount"]) * usd_per_unit
+        gross_pnl = self._quote_to_usd(
+            instrument,
+            direction * (exit_price - pos["entry_price"]) * pos["amount"],
+            exit_price,
+        )
+
+        entry_fee = float(pos.get("entry_fee") or 0.0)
+        exit_fee_info = self.fees.cost_for_fill("oanda", pos["symbol"], exit_notional)
+        exit_fee = exit_fee_info["cost"]
 
         if not self.dry_run:
             try:
                 # Closing the trade also cancels its attached SL/TP orders.
                 url = f"{self.base_url}/v3/accounts/{self.account_id}/trades/{client_order_id}/close"
                 resp = requests.put(url, headers=self._headers(), timeout=15)
+                broker_pnl = None
                 if resp.status_code >= 400:
                     # Already closed at the broker by its SL/TP? Then use OANDA's realized P&L.
                     trade = requests.get(f"{self.base_url}/v3/accounts/{self.account_id}/trades/{client_order_id}",
                                          headers=self._headers(), timeout=15).json().get("trade", {})
                     if trade.get("state") != "CLOSED":
                         raise ValueError(resp.text[:200])
-                    pnl = float(trade.get("realizedPL", pnl))
+                    broker_pnl = float(trade.get("realizedPL", gross_pnl))
                     exit_price = float(trade.get("averageClosePrice", exit_price))
                 else:
                     resp.raise_for_status()
@@ -225,13 +254,27 @@ class OandaExecutor:
                     if not fill:
                         reason = (resp.json().get("orderCancelTransaction") or {}).get("reason", "no fill")
                         raise ValueError(f"close cancelled: {reason}")
-                    pnl = float(fill.get("pl", pnl))  # account currency (USD)
+                    broker_pnl = float(fill.get("pl", gross_pnl))  # account currency (USD)
                     exit_price = float(fill.get("price", exit_price))
+
+                if broker_pnl is not None:
+                    # OANDA's realized figure is already net of the spread, so
+                    # it drives the balance and the risk state. The gap to the
+                    # price move is the cost actually taken, floored at zero.
+                    measured_cost = gross_pnl - broker_pnl
+                    if measured_cost > 0:
+                        gross_pnl = broker_pnl + measured_cost
+                        exit_fee = measured_cost
+                    pnl = broker_pnl
+                else:
+                    pnl = gross_pnl - entry_fee - exit_fee
             except Exception as e:
                 # Leave the position open so the monitor retries next tick.
                 self.notifier.notify("warning", f"Failed to close {pos['symbol']} on OANDA: {e}",
                                      priority="high")
                 return
+        else:
+            pnl = gross_pnl - entry_fee - exit_fee
 
         # Get trade metadata
         from sqlalchemy.orm import Session
@@ -243,7 +286,9 @@ class OandaExecutor:
                 import json
                 strategies = json.loads(trade.strategies)
 
-        self.state.record_trade_close(client_order_id, exit_price, pnl, reason)
+        self.state.record_trade_close(client_order_id, exit_price, pnl, reason,
+                                      exit_fee=exit_fee,
+                                      fees_are_estimated=exit_fee_info["estimated"])
         self.risk.on_trade_closed(pnl)
 
         self.notifier.notify_trade_closed(
@@ -251,4 +296,7 @@ class OandaExecutor:
             entry_price=pos["entry_price"], exit_price=exit_price,
             pnl=pnl, exchange="oanda", reason=reason,
             strategies=strategies,
+            gross_pnl=gross_pnl, entry_fee=entry_fee, exit_fee=exit_fee,
+            fees_are_estimated=exit_fee_info["estimated"],
+            opened_at=pos.get("opened_at"),
         )

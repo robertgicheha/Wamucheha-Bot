@@ -87,21 +87,35 @@ DISCORD_FIELD_MAX = 1024
 DISCORD_FIELD_MAX_COUNT = 25
 
 # ── Email color palette ──────────────────────────────────────────────────
+# Deliberately light. Email is read on a white page in a mail client, usually
+# in daylight, usually on a laptop screen, and often printed or forwarded. A
+# dark-theme message is legible in a dark-mode mail client and then completely
+# broken in a light one, and a reader who cannot read the digest does not
+# report it — they just stop opening it. Light-on-white is the boring default
+# for good reasons: it is the only scheme that is legible in every client,
+# in both dark and light mode, and on paper.
+#
+# The accents are darkened from the previous neon values because the old ones
+# were tuned for a near-black background. On white they fell below the 4.5:1
+# contrast ratio that makes small text readable, so "green for profit" was
+# rendering as a pale mint that a reader with mild colour-vision deficiency
+# could not separate from the grey. Each value below clears 4.5:1 on white;
+# anything brighter belongs on the dark Discord/Telegram side, not here.
 EMAIL_COLORS = {
-    "bg_body":      "#0f1117",
-    "bg_card":      "#1a1d2e",
-    "bg_header":    "#6c5ce7",
-    "bg_footer":    "#12141f",
-    "bg_tile":      "#22263a",
-    "text_primary": "#ffffff",
-    "text_secondary":"#a0a0b0",
-    "accent_green": "#00d68f",
-    "accent_red":   "#ff4757",
-    "accent_blue":  "#3b82f6",
-    "accent_orange":"#ff9f43",
-    "accent_purple":"#a855f7",
-    "accent_cyan":  "#22d3ee",
-    "border":       "#2d2f3e",
+    "bg_body":      "#f4f6f9",   # page, one step off white so the card lifts
+    "bg_card":      "#ffffff",   # the message itself
+    "bg_header":    "#1f3a5f",   # corporate navy band, white text on top
+    "bg_footer":    "#eef1f5",
+    "bg_tile":      "#f7f9fc",
+    "text_primary": "#1a1f2b",   # near-black, not pure black (less glare on print)
+    "text_secondary":"#5a6472",  # was #a0a0b0 — 2.0:1 on white, unreadable
+    "accent_green": "#0f7a4d",   # profit / Buy
+    "accent_red":   "#c02b2b",   # loss / Avoid
+    "accent_blue":  "#1d5fa8",
+    "accent_orange":"#a35a00",   # Hold / warning
+    "accent_purple":"#5b3a9e",
+    "accent_cyan":  "#0d6f7d",   # neutral-high
+    "border":       "#d8dee6",   # hairlines and card outline
 }
 
 BRAND = "Wamucheha"
@@ -249,37 +263,38 @@ def _preheader(text: str) -> str:
 def _email_header(title: str, subtitle: str = "", color: str = None,
                   badge: str = "") -> str:
     color = color or EMAIL_COLORS["bg_header"]
-    subtitle_html = (f'<p style="margin:6px 0 0;color:#c9c9d6;font-size:14px;line-height:1.5;">{subtitle}</p>'
+    subtitle_html = (f'<p style="margin:8px 0 0;color:#d8e2ee;font-size:14px;line-height:1.5;">{subtitle}</p>'
                      if subtitle else "")
     badge_html = (
-        f'<div style="display:inline-block;margin-bottom:10px;padding:4px 12px;'
-        f'background:rgba(255,255,255,0.18);border-radius:20px;color:#ffffff;'
-        f'font-size:11px;font-weight:700;letter-spacing:1.2px;">{_esc(badge.upper())}</div>'
+        f'<div style="display:inline-block;margin-bottom:12px;padding:4px 12px;'
+        f'background:rgba(255,255,255,0.16);border:1px solid rgba(255,255,255,0.35);'
+        f'border-radius:3px;color:#ffffff;'
+        f'font-size:10px;font-weight:700;letter-spacing:1.2px;">{_esc(badge.upper())}</div>'
         if badge else "")
+    # A plain navy band with a left-aligned wordmark. The previous version put a
+    # glow-gradient icon, a centred layout and large rounded corners, which is a
+    # template signature rather than a company one — the sort of thing that
+    # makes a reader think "this was generated" and distrust the numbers in it.
     return f"""
-    <div style="background:{color};padding:30px 32px 26px;border-radius:14px 14px 0 0;text-align:center;">
-      <img src="https://img.icons8.com/fluency/48/chart-upward.png" width="42" height="42"
-           style="margin-bottom:10px;filter:brightness(0) invert(1);" alt="{_esc(BRAND)} logo"/>
+    <div style="background:{color};padding:26px 32px 24px;border-bottom:3px solid {EMAIL_COLORS['accent_blue']};">
+      <div style="font-size:11px;font-weight:700;letter-spacing:2.4px;color:#ffffff;opacity:0.72;text-transform:uppercase;margin-bottom:10px;">{_esc(BRAND)}</div>
       {badge_html}
-      <h1 style="margin:0;color:#ffffff;font-size:23px;font-weight:800;letter-spacing:0.3px;line-height:1.3;">{_esc(title)}</h1>
+      <h1 style="margin:0;color:#ffffff;font-size:20px;font-weight:700;letter-spacing:0.2px;line-height:1.35;">{_esc(title)}</h1>
       {subtitle_html}
     </div>"""
 
 
 def _email_footer(note: str = "") -> str:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    note_html = (f'<p style="margin:8px 0 0;color:#4b5563;font-size:11px;line-height:1.6;">{note}</p>'
+    note_html = (f'<p style="margin:10px 0 0;color:{EMAIL_COLORS["text_secondary"]};font-size:11px;line-height:1.6;">{note}</p>'
                  if note else "")
     return f"""
-    <div style="background:{EMAIL_COLORS['bg_footer']};padding:20px 32px;border-radius:0 0 14px 14px;text-align:center;border-top:1px solid {EMAIL_COLORS['border']};">
-      <img src="https://img.icons8.com/fluency/20/chart-upward.png" width="18" height="18"
-           style="vertical-align:middle;margin-right:6px;filter:brightness(0) invert(0.7);" alt="logo"/>
-      <span style="color:#6b7280;font-size:12px;font-weight:600;">{_esc(BRAND)} Trading Bot</span>
-      <span style="color:#3d3f50;font-size:12px;margin:0 8px;">|</span>
-      <span style="color:#6b7280;font-size:12px;">{now}</span>
+    <div style="background:{EMAIL_COLORS['bg_footer']};padding:18px 32px;border-radius:0 0 6px 6px;text-align:left;border-top:1px solid {EMAIL_COLORS['border']};">
+      <div style="font-size:11px;font-weight:700;letter-spacing:1.2px;color:{EMAIL_COLORS['text_secondary']};text-transform:uppercase;">{_esc(BRAND)} Trading Bot</div>
+      <div style="font-size:11px;color:{EMAIL_COLORS['text_secondary']};margin-top:3px;">Generated {now}</div>
       {note_html}
-      <p style="margin:8px 0 0;color:#4b5563;font-size:11px;">
-        Automated alerts &mdash; Do not reply directly to this email.
+      <p style="margin:8px 0 0;color:{EMAIL_COLORS['text_secondary']};font-size:11px;">
+        Automated report &mdash; generated from public data. Do not reply to this email.
       </p>
     </div>"""
 
@@ -317,7 +332,7 @@ def _stat_tiles(tiles: list) -> str:
     for value, label, color in tiles:
         cells += f"""
         <td width="25%" align="center" style="padding:0 5px;vertical-align:top;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="background:{EMAIL_COLORS['bg_tile']};border:1px solid {EMAIL_COLORS['border']};border-radius:10px;">
+          <table width="100%" cellpadding="0" cellspacing="0"               style="background:{EMAIL_COLORS['bg_tile']};border:1px solid {EMAIL_COLORS['border']};border-radius:6px;">
             <tr><td align="center" style="padding:12px 6px 10px;">
               <div style="color:{color};font-size:20px;font-weight:800;line-height:1.2;letter-spacing:-0.4px;">{value}</div>
             </td></tr>
@@ -345,7 +360,7 @@ def _score_bar(score, color: str = None, width: int = 56) -> str:
     <table width="{width}" cellpadding="0" cellspacing="0" style="display:inline-table;vertical-align:middle;">
       <tr>
         <td width="{width}" style="padding:0;">
-          <table width="100%" cellpadding="0" cellspacing="0" style="background:#2d2f3e;border-radius:4px;">
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:{EMAIL_COLORS['border']};border-radius:3px;">
             <tr><td width="{pct}%" style="height:7px;line-height:7px;font-size:0;background:{color};border-radius:4px;">&nbsp;</td>
                 <td style="height:7px;line-height:7px;font-size:0;">&nbsp;</td></tr>
           </table>

@@ -689,32 +689,101 @@ def test_paper_flags_are_documented_as_independent_of_live_trading():
 
 
 def test_metamask_private_key_is_not_in_env():
-    """The treasury wallet is public-only. A private key or seed phrase in .env
-    would hand the process custody of the funds, so only these names may exist
-    and none may look like a 64-hex-char key."""
+    """No wallet, and no custody of any kind, may be reintroduced through .env.
+
+    Funding was redesigned to draw from one exchange and settle on one exchange,
+    so the MetaMask treasury block was removed. This test locks that in two
+    ways: the old variable names must not come back, and no variable of any name
+    may carry a value shaped like a key.
+
+    The old version of this test was weaker in a way that mattered. It only
+    rejected keys containing METAMASK/WALLET/MNEMONIC/PRIVATE_KEY/SEED, so a
+    variable called ETH_KEY, SIGNING_KEY or EXCHANGE_SECRET would have passed
+    straight through — and a real 32-byte key is 64 hex chars, which only the
+    length check would have caught, and only if it were the whole value. The
+    check below is name-agnostic and shape-based instead.
+    """
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
-    allowed = ("METAMASK_WALLET_ADDRESS", "METAMASK_NETWORK", "ETHEREUM_RPC_URL",
-               "TRON_RPC_URL", "BSC_RPC_URL", "ETHERSCAN_API_KEY",
+
+    # The retired treasury variables. Reintroducing any of these means the
+    # design was reverted without updating the docs or preflight.
+    retired = ("METAMASK_WALLET_ADDRESS", "METAMASK_NETWORK", "ETHEREUM_RPC_URL",
+               "TRON_RPC_URL", "BSC_RPC_URL", "ETHERSCAN_API_KEY")
+
+    # Everything the funding design is allowed to contain. Deliberately
+    # address-shaped and venue-shaped only.
+    allowed = ("FUNDING_SOURCE_VENUE", "SETTLEMENT_VENUE", "TRANSFER_NETWORK",
                "FUNDING_BINANCE_USDT", "FUNDING_OKX_USDT", "FUNDING_BYBIT_USDT")
+
+    key_like = ("metamask", "wallet", "mnemonic", "private_key", "seed",
+                "signing", "signer", "eth_key")
+
+    # Names that contain a key-like substring but are not custody of funds.
+    # DASHBOARD_SECRET_KEY is an HTTP auth token for our own dashboard; the
+    # exchange *_API_SECRET values are ccxt trading keys that cannot withdraw
+    # (see the API-permission section of docs/FUNDING.md). Neither is a signing
+    # key, so matching on the substring alone would only produce noise.
+    known_non_custody = ("DASHBOARD_SECRET_KEY", "BINANCE_API_SECRET",
+                         "OKX_API_SECRET", "BYBIT_API_SECRET", "OANDA_API_KEY",
+                         "ALPACA_API_SECRET")
+
     for name in (".env", ".env.example"):
-        for line in (root / name).read_text(encoding="utf-8").splitlines():
-            line = line.strip()
+        for lineno, raw in enumerate((root / name).read_text(encoding="utf-8").splitlines(), 1):
+            line = raw.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
-            key = line.split("=", 1)[0].strip()
-            if "METAMASK" in key or "WALLET" in key or "MNEMONIC" in key \
-               or "PRIVATE_KEY" in key or "SEED" in key:
-                assert key in allowed, f"{name}: unexpected wallet/key var {key}"
-            # No bare 64-hex-char value, which is what an Ethereum private key
-            # looks like.
-            val = line.split("=", 1)[1].split("#")[0].strip()
-            if len(val) == 64:
+            key, val = line.split("=", 1)
+            key, val = key.strip(), val.split("#")[0].strip()
+
+            assert key not in retired, (
+                f"{name}:{lineno}: {key} is from the retired MetaMask funding "
+                f"design. Funding is one-funder/one-settlement across exchanges "
+                f"now — use {allowed} instead.")
+
+            low = key.lower()
+            if any(t in low for t in key_like) and key not in known_non_custody:
+                assert key in allowed, (
+                    f"{name}:{lineno}: {key} looks like a custody variable. The "
+                    f"bot must never hold keys; allowed funding vars are {allowed}.")
+
+            # Shape check: a 32-byte key is 64 hex chars, optionally 0x-prefixed.
+            bare = val[2:] if val.lower().startswith("0x") else val
+            if len(bare) == 64:
                 try:
-                    int(val, 16)
-                    raise AssertionError(f"{name}: {key} looks like a private key")
+                    int(bare, 16)
                 except ValueError:
                     pass
+                else:
+                    raise AssertionError(
+                        f"{name}:{lineno}: {key} holds a 64-hex-char value, which "
+                        f"is the shape of a private key. This process must not "
+                        f"hold custody of funds.")
+
+
+def test_funding_addresses_are_checked_against_the_declared_network():
+    """A deposit address is only credited on the chain it was issued for. The
+    old check accepted any 0x string regardless of the configured network,
+    which meant a TRC20/Tron configuration silently passed a BEP20 address — the
+    exact combination that loses a deposit irrecoverably."""
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location("pf", root / "scripts" / "preflight.py")
+    pf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pf)
+
+    trc20 = "TQn9Y2khEsLJW1ChVWFMSMeRDow5KcbLSE"
+    bep20 = "0x488bb1eb4dde2dd6eeb82cdd2ee9959cdf1485a4"
+
+    assert pf.validate_usdt_address(trc20, "TRC20") is None
+    assert pf.validate_usdt_address(bep20, "BEP20") is None
+    assert pf.validate_usdt_address(bep20, "ERC20") is None
+    # The failure that used to go unnoticed: right format, wrong chain.
+    assert pf.validate_usdt_address(bep20, "TRC20") is not None
+    assert pf.validate_usdt_address(trc20, "BEP20") is not None
+    assert pf.validate_usdt_address("0xnothex", "BEP20") is not None
+    assert pf.validate_usdt_address(bep20, "NOPE") is not None
 
 
 def test_preflight_script_runs_and_reports_cleanly():

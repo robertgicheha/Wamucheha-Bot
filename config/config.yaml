@@ -5,7 +5,10 @@ account:
   trading_balance: 100.0       # capital the bot may trade; seeds a fresh state DB only
                                # (overridden by TRADING_BALANCE env var)
   currency: USD
-  stake_wallet_address: ""     # cold wallet / separate account, bot has no access
+  # No wallet. Capital lives on the exchange named by FUNDING_SOURCE_VENUE and
+  # profits settle on SETTLEMENT_VENUE (both in .env). This key is retained
+  # only so an existing config does not fail to parse; it is read by nothing.
+  stake_wallet_address: ""
 
 # Real cost of trading, used to report P&L NET of what it cost to execute.
 # Two distinct costs — see core/fee_manager.py for why they are not mixed:
@@ -27,12 +30,19 @@ fees:
     alpaca: 0                    # commission-free equities
     oanda: 0                     # cost is in the spread, not a commission line
     mt5: 0                       # cost is in the spread
-  network: TRC20                 # network you actually fund the venues over
+  network: BEP20                 # must match TRANSFER_NETWORK in .env. The two
+                                 # are kept in step because this drives the
+                                 # cumulative transfer-cost figure in reports;
+                                 # if they disagree, that number is fiction.
   network_fee_usdt:             # typical cost per transfer, in USDT
     TRC20: 1.0
     BEP20: 0.30
     ERC20: 5.0
     SOL: 0.01
+  # When settlement is a single venue, every venue's profit is withdrawn to
+  # one account, so that account is a single point of failure for all capital.
+  # Surfaced in daily reports so it is not forgotten after setup.
+  single_settlement_venue_risk: true
 
 risk:
   max_consecutive_losses: 8          # hard stop, per your spec
@@ -260,6 +270,12 @@ long_term:
     nse_kenya: ["SCOM", "EQTY", "KCB", "EABL", "BAT", "COOP", "ABSA", "SCBK",
                 "NCBA", "DTK", "BAMB", "JUB", "KEGN", "KPLC", "BRIT", "SASN",
                 "CTUM", "NMG", "UMME", "IMH"]
+    # Kenya's own exchange-traded funds, listed on the NSE. These are separate
+    # from the US ETFs above and are scored on the same NSE data as the Kenyan
+    # equities (quoted in KES, no free expense-ratio or AUM series exists), so
+    # the digest shows price and 1-year return for them and "n/a" for the
+    # US-only fee/5-year/AUM columns rather than borrowing a US number.
+    nse_etfs: ["GLD", "SMWF"]
   screens:
     min_dividend_years_growth: 5
     max_payout_ratio: 70

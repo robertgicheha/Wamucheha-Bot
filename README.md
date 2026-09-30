@@ -45,10 +45,16 @@ Edit `.env` with your API keys. At minimum, fill in:
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (for alerts)
 
 ### Fund your exchange accounts (manual, one-time)
-The bot **never moves money on-chain**. You deposit USDT from MetaMask to each
-exchange's deposit address, and withdraw profits back to MetaMask.
+The bot **never moves money**. Funding is **one funder, one settlement, no
+wallet**: capital is drawn from one exchange (OKX) and every venue's profit is
+withdrawn back to it. There is no MetaMask, no self-custody wallet, and no
+seed phrase anywhere in the design — you perform every transfer yourself in the
+exchange UIs.
+Note that cross-venue funding is an on-chain withdrawal (exchange-internal
+transfers only work within one exchange), so each hop costs a network fee and
+takes settlement time.
 See **[DEPOSIT_WITHDRAWAL.md](DEPOSIT_WITHDRAWAL.md)** for the exact addresses,
-networks (TRC20/BEP20), fees, and step-by-step checklist.
+networks (BEP20/TRC20), fees, and step-by-step checklist.
 Run `python scripts/preflight.py` to validate your setup before going live.
 
 ### 3. Set your stake amount
@@ -247,8 +253,11 @@ python control/discord_bot.py      # real Discord bot, not the webhook above
 
 Commands: `/status /positions /profit /trades /logs [n] /kill /resume /restart /refresh`
 
-Both fail closed: nobody can issue a command until you list their user ID in
-`TELEGRAM_ALLOWED_USER_IDS` / `DISCORD_ALLOWED_USER_IDS` in `.env`. Full setup
+Both fail closed: nobody can issue a command until you allowlist them in `.env`
+— `TELEGRAM_ALLOWED_USERS` (numeric Telegram user IDs) or
+`DISCORD_ALLOWED_ROLES` (role names). An empty allowlist denies every command
+from everyone, and the engine refuses to start a control bot with no allowlist
+at all. Full setup
 (bot tokens, intents, the sudoers rule `/restart` needs) is in
 `deploy/DEPLOYMENT.md` Part 1b. For 24/7 use, install them as systemd services
 just like the engine — units are in `deploy/tradingbot-telegram.service` and

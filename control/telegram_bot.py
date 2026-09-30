@@ -43,14 +43,55 @@ except ImportError:
 logger = logging.getLogger("telegram_bot")
 
 DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET_KEY", "change_me")
-ALLOWED_USERS = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
+
+
+def _allowed_user_ids() -> set:
+    """Parse TELEGRAM_ALLOWED_USERS into a set of ints.
+
+    Unparseable entries are dropped with a warning rather than raising, so one
+    typo in a comma-separated list cannot stop the bot from booting. A typo also
+    cannot widen access: the entry simply never matches, and the ID that was
+    meant to be allowed gets no access — which fails safe, not open."""
+    raw = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            logger.warning(
+                "TELEGRAM_ALLOWED_USERS contains %r, which is not a numeric "
+                "Telegram user ID. It is ignored. Get your ID from @userinfobot.",
+                part)
+    return ids
+
+
+ALLOWED_USERS = _allowed_user_ids()
 
 
 def _is_authorized(user_id: int) -> bool:
+    """Is this user allowed to run control commands?
+
+    Empty allowlist means DENY. It used to mean allow-everyone, on the theory
+    that the bot token was itself the secret — but a bot token is not a user
+    identity, and these commands include /resume (which clears a risk-manager
+    circuit breaker) and /deposit (which forges the cash-flow ledger that every
+    ROI and win-rate figure is derived from). Anyone who can DM the bot could
+    run them. An unconfigured allowlist is a setup mistake, and the safe
+    response to a setup mistake on an auth boundary is to refuse, not to open.
+    """
     if not ALLOWED_USERS:
-        return True
-    allowed = [int(uid.strip()) for uid in ALLOWED_USERS.split(",") if uid.strip()]
-    return user_id in allowed
+        logger.error(
+            "TELEGRAM_ALLOWED_USERS is empty, so every command is denied. Set it "
+            "to your numeric Telegram user ID to use the control bot. Trading is "
+            "unaffected — this only disables chat commands.")
+        return False
+    try:
+        return int(user_id) in ALLOWED_USERS
+    except (TypeError, ValueError):
+        return False
 
 
 def _esc_html(value) -> str:
@@ -127,6 +168,10 @@ class TelegramControlBot:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(self._app.run_polling(drop_pending_updates=True, stop_signals=None))
+
+    @staticmethod
+    def authorized_count() -> int:
+        return len(ALLOWED_USERS)
 
     def _get_state(self):
         if self.state is None:
@@ -406,12 +451,18 @@ class TelegramControlBot:
             return
         amount, venue = parsed
         state = self._get_state()
+        # A declared amount is the operator's word, and the ledger it feeds is
+        # what separates returned capital from profit in every report. The
+        # trading balance is deliberately not touched — record_cash_flow is a
+        # note, not a transfer — so a wrong number here corrupts the reporting,
+        # not the account. Recorded with the actor so a later audit can see it.
         state.record_cash_flow("deposit", amount, venue=venue,
                                note=f"declared via Telegram by {update.effective_user.id}")
         await update.message.reply_text(
             f"📥 <b>DEPOSIT LOGGED</b>\n\n"
             f"<code>+{amount:,.2f} USD</code> ➜ {venue or 'the account'}\n\n"
-            f"<i>Counted as capital in, not profit. Use /cash to see the split.</i>",
+            f"<i>Counted as capital in, not profit. Use /cash to see the split. "
+            f"Nothing was moved — record your real transfer separately.</i>",
             parse_mode="HTML")
 
     async def _cmd_withdraw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -540,14 +591,20 @@ class TelegramControlBot:
         if not _is_authorized(update.effective_user.id):
             await update.message.reply_text("Unauthorized.")
             return
-        state = self._get_state()
-        state.update_risk_state(
-            trading_halted=0,
-            halt_reason=None,
-            consecutive_losses=0,
-        )
+        # Route through the risk manager rather than writing risk state here.
+        # It is the same state, but going around it skips the
+        # circuit_breaker_reset notification, so the only evidence of who
+        # re-armed a halted bot would be the state row changing.
+        risk = self._get_risk()
+        actor = f"Telegram user {update.effective_user.id}"
+        if risk is None:
+            self._get_state().update_risk_state(
+                trading_halted=0, halt_reason=None, consecutive_losses=0)
+        else:
+            risk.resume_trading(actor)
         await update.message.reply_text(
-            "<b>✅ Trading Resumed</b>\n\nBot is now actively trading again.",
+            f"<b>✅ Trading Resumed</b>\n\nBot is now actively trading again.\n"
+            f"<i>Resumed by Telegram user {update.effective_user.id}.</i>",
             parse_mode="HTML",
         )
 

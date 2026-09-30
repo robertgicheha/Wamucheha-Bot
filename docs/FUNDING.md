@@ -5,11 +5,11 @@ How to get money into each venue and take it back out.
 **The bot never moves funds.** There is no withdrawal API call anywhere in the
 codebase, no exchange withdrawal permission is ever used, and no wallet signing
 key exists. Every transfer below is something **you** do, by hand, in the
-MetaMask UI or the venue's own screen. That is deliberate: a compromised VPS
-can lose trades, but it cannot drain your account.
+exchange's own UI. That is deliberate: a compromised VPS can lose trades, but
+it cannot drain your account.
 
 > **Quick reference:** [DEPOSIT_WITHDRAWAL.md](../DEPOSIT_WITHDRAWAL.md) —
-> one-page cheat sheet with addresses, networks (TRC20/BEP20), fees and the
+> one-page cheat sheet with addresses, networks (BEP20/TRC20), fees and the
 > preflight command.
 
 `core/risk_manager.py` watches the balance and, when it crosses
@@ -20,21 +20,34 @@ is due. It does not transfer.
 
 ## The shape of it
 
+Funding is **one funder, one settlement, no wallet**. There is no self-custody
+wallet in the design at all.
+
 ```
-  MetaMask (treasury)              the source. Holds the stake + swept profit.
+  OKX  (FUNDING_SOURCE_VENUE)      the funder. Draws the capital.
         |
-        |  USDT, on the network the venue asks for
+        |  USDT on-chain, on the network the destination venue asks for
+        |  (each hop costs a network fee and takes settlement time)
         |
         +--> Binance deposit address   -> bot trades here
         +--> OKX deposit address       -> bot trades here
         +--> Bybit deposit address     -> bot trades here
 
-  MT5 broker   <-> funded by the BROKER (card / bank / M-Pesa). Not MetaMask.
-  Alpaca       <-> funded by BANK / WIRE. Not MetaMask.
+  profit from all three withdraws back to OKX (SETTLEMENT_VENUE)
+
+  MT5 broker   <-> funded by the BROKER (card / bank / M-Pesa). No USDT.
+  Alpaca       <-> funded by BANK / WIRE. No USDT.
 ```
 
-Each venue holds its own balance and has its own deposit address. They are
-never funded by each other.
+Two consequences of this design, both intentional:
+
+- **Cross-venue funding is always an on-chain withdrawal.** Exchange-internal
+  transfers only work between accounts on the *same* exchange, so OKX → Binance
+  is a real withdrawal: network fee, plus settlement delay before the balance
+  is usable. A venue cannot be topped up instantly from another venue.
+- **The settlement venue is a single point of failure.** Every balance the bot
+  can reach ultimately rests on one OKX account. Keep a withdrawal allowlist and
+  withdrawal 2FA on it.
 
 ---
 
@@ -48,48 +61,59 @@ cause lost funds.
 
 ### 2. Pick the network — this is the whole game
 
-| Network | Fee per transfer | Use for |
-|---|---|---|
-| **TRC20** (Tron) | ~1 USDT | Default. Cheap, works on all three venues. |
-| **BEP20** (BNB Smart Chain) | ~0.1–1 USDT | Cheapest, if every venue in the path supports it. |
-| **ERC20** (Ethereum) | ~5–20 USDT | **Avoid** for bulk. Only if a venue offers nothing else. |
+| Network | Address starts | Fee per transfer | Use for |
+|---|---|---|---|
+| **BEP20** (BNB Smart Chain) | `0x` | ~0.1–1 USDT | Default here. Cheapest EVM option. |
+| **TRC20** (Tron) | `T` | ~1 USDT | Cheap, but Tron addresses are `T...` not `0x`. |
+| **ERC20** (Ethereum) | `0x` | ~5–20 USDT | **Avoid** for bulk. Only if a venue offers nothing else. |
 
-**The network must match what the venue shows you.** MetaMask cannot detect
-this for you: sending TRC20 to an address expecting ERC20 usually means the
-funds are unrecoverable. Check the deposit screen after every first transfer to
-a new venue.
+**The network must match what the venue shows you**, and nothing in the tool
+chain can detect a mismatch for you. Sending USDT to an address on the wrong
+network usually means the funds are unrecoverable.
 
-Set the intended network in `.env` so the pre-flight check can warn you:
+> **TRC20 is not `0x`.** TRC20 is Tron, whose addresses begin with `T`. A `0x`
+> address is an EVM (BEP20/ERC20) address and will not be credited to a TRC20
+> deposit. `preflight.py` validates every deposit address against the declared
+> network and raises a **BLOCKER** on a mismatch — if you see one, do not send.
+
+Set the intended network in `.env` so the pre-flight check can verify addresses
+against it:
 
 ```
-METAMASK_NETWORK=TRC20
+TRANSFER_NETWORK=BEP20
 ```
 
 ### 3. Send
 
-In MetaMask: pick the network, choose USDT, paste the venue's address, send.
-Start with a **small test amount** on a new venue, confirm it credits, then
-send the rest.
+On the funder exchange: **Assets → Withdraw → USDT** → the destination venue's
+address, on the network the destination lists. Start with a **small test
+amount** on a new venue, confirm it credits, then send the rest.
 
-Target amounts are recorded in `.env` (documentation only, the bot never
-sends anything):
+Deposit addresses are recorded in `.env` (they are addresses, not amounts; the
+bot never sends anything):
 
 ```
-FUNDING_BINANCE_USDT=
 FUNDING_OKX_USDT=
+FUNDING_BINANCE_USDT=
 FUNDING_BYBIT_USDT=
 ```
+
+Copy each one from that exchange's Deposit screen at the time you fund —
+deposit addresses are per-account and the exchange can rotate them. An address
+from an old email or chat may be stale.
 
 ### 4. Confirm before trading
 
 The deposit must be **credited and settled** before the bot trades that venue
-— an order against an uncredited balance just fails. `ETHERSCAN_API_KEY=` lets
-you verify on-chain if you want an independent check.
+— an order against an uncredited balance just fails. A transfer leaves your
+account the moment you confirm it, so the balance is unusable for the whole
+network-confirmation window. Check the exchange's balance, not the transaction
+hash, before trading.
 
 ### 5. Withdraw profits
 
-Venue **Assets → Withdraw → USDT** → your MetaMask address, same network you
-deposited on. MetaMask must be on that network to receive.
+Venue **Assets → Withdraw → USDT** → the settlement venue's deposit address
+(`FUNDING_<SETTLEMENT_VENUE>_USDT`), on the same network you deposited on.
 
 Keep a small buffer at each venue for open positions; sweeping everything out
 leaves nothing to close a losing trade with.
@@ -98,7 +122,9 @@ leaves nothing to close a losing trade with.
 
 ## MT5 (forex, gold, silver)
 
-**Not funded from MetaMask.** The broker does not take USDT.
+**Not funded by USDT transfer.** MT5 is a forex/CFD broker, not an exchange —
+it holds no crypto and has no deposit address, so it is entirely outside the
+OKX funder/settlement loop.
 
 1. Broker's own deposit methods: card, bank transfer, or M-Pesa if offered.
 2. Your `.env` must point at the matching server. `MT5_SERVER=MetaQuotes-Demo`
@@ -115,7 +141,7 @@ server name is not a demo server.
 
 ## Alpaca (US stocks)
 
-**Not funded from MetaMask.**
+**Not funded by USDT transfer.**
 
 1. Bank transfer or wire to your Alpaca account.
 2. Kenya-resident eligibility for your account type is unconfirmed in this
@@ -137,8 +163,9 @@ Then, on **every** venue:
 
 - [ ] API key is **trade-only** — withdrawal permission **disabled**
 - [ ] VPS IP is whitelisted
-- [ ] Treasury wallet is the only whitelisted withdrawal address
+- [ ] Settlement venue has a withdrawal allowlist and withdrawal 2FA enabled
 - [ ] Deposit credited and settled, on the network you intended
+- [ ] `TRANSFER_NETWORK` in `.env` matches the network of every deposit address
 - [ ] `scripts/check_connections.py` passes for that venue
 - [ ] `scripts/preflight.py` reports no blockers
 

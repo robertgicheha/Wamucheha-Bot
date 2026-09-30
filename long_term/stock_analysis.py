@@ -50,8 +50,12 @@ def _weighted(scores: dict, weights: dict):
     return round(score, 1), round(total / sum(weights.values()), 2)
 
 
-def _rating(score, coverage):
-    if score is None or coverage < 0.35:
+def _rating(score, coverage, gate: float = 0.35):
+    """Map a score onto a recommendation. `gate` is the minimum fraction of the
+    applicable weight set that must be measured before a rating is issued —
+    a low-coverage score is a guess, and printing it as "Buy" is worse than
+    printing nothing."""
+    if score is None or coverage < gate:
         return "Insufficient data"
     if score >= 70:
         return "Strong Buy"
@@ -205,41 +209,82 @@ def analyze_stock(profile: dict, trend: dict | None) -> dict:
 # ---------- ETFs ----------
 
 def analyze_etf(profile: dict, trend: dict | None) -> dict:
+    """Score an ETF, on whatever data its market actually publishes.
+
+    A US ETF has all four cost/return inputs: expense ratio, 3- and 5-year
+    average returns, AUM. An ETF listed on the Nairobi exchange has none of
+    them from any free source — no published TER, no 5-year series, no AUM —
+    so the same weights leave it at ~30% coverage and the generic 35% gate
+    returns "Insufficient data" for every Kenyan ETF, every single day. That
+    is not a display bug: the table row was being suppressed by a rating, so
+    the answer to "what happened to the Kenyan ETFs" was nothing at all.
+
+    Kenyan ETFs are therefore scored on the return series and dividend yield
+    that DO exist for them, using a weight set that only names fields the NSE
+    data can fill. Nothing is imputed: a factor with no source stays out of
+    the weighting rather than being guessed, and `coverage` still reports how
+    much of the applicable set was actually measured, so a thin score says so.
+    """
     p = profile
     pos, neg = [], []
     er, dy, aum = p.get("expense_ratio_pct"), p.get("dividend_yield"), p.get("total_assets")
-    r3, r5 = p.get("return_3y_avg"), p.get("return_5y_avg")
+    r1, r3, r5 = p.get("return_1y"), p.get("return_3y_avg"), p.get("return_5y_avg")
+    r3m, ytd = p.get("return_3m"), p.get("return_ytd")
     momentum = None
     if trend and trend.get("mode") == "full":
         momentum = _avg([100.0 if trend["above_200dma"] else 0.0,
                          _scale(trend.get("momentum_30d_pct"), -8, 8)])
         (pos if trend["above_200dma"] else neg).append(
             f"Price {'above' if trend['above_200dma'] else 'below'} its 200-day average")
+
+    # Only factors with a real source count toward the weighting. A Kenyan ETF
+    # has no TER and no AUM, so including them would let None either dilute the
+    # denominator or, worse, be read as a zero.
+    has_ter = er is not None
+    has_aum = bool(aum)
+    has_long_returns = r3 is not None or r5 is not None
     scores = {
-        "cost": _scale(er, 0.75, 0.03),
-        "returns": _avg([_scale(r3, 0, 15), _scale(r5, 0, 15)]),
+        "cost": _scale(er, 0.75, 0.03) if has_ter else None,
+        "returns": _avg([_scale(r3, 0, 15), _scale(r5, 0, 15)]) if has_long_returns
+                    else _avg([_scale(r1, -20, 40), _scale(ytd, -25, 35), _scale(r3m, -15, 15)]),
         "income": _scale(dy, 0, 5) if dy else None,
-        "size": None if not aum else _scale(aum, 1e8, 5e10),
+        "size": _scale(aum, 1e8, 5e10) if has_aum else None,
         "momentum": momentum,
     }
+    weights = dict(ETF_WEIGHTS)
+    if not has_ter:
+        weights.pop("cost", None)
+    if not has_aum:
+        weights.pop("size", None)
+    # The gate is relative to the weight set actually in play, so a market with
+    # three measurable factors is not held to the coverage bar of one with five.
+    gate = 0.35 if has_ter and has_aum and has_long_returns else 0.25
+
     if er is not None:
         (pos if er <= 0.2 else neg if er > 0.5 else []).append(f"Expense ratio {er:.2f}%")
-    for label, r in (("3-yr", r3), ("5-yr", r5)):
+    for label, r in (("1-year", r1), ("YTD", ytd), ("3-yr", r3), ("5-yr", r5)):
         if r is not None:
-            (pos if r >= 8 else neg if r < 0 else []).append(f"{label} avg return {r:.1f}%/yr")
-    score, coverage = _weighted(scores, ETF_WEIGHTS)
-    rating = _rating(score, coverage)
+            (pos if r >= 8 else neg if r < 0 else []).append(f"{label} return {r:.1f}%")
+
+    score, coverage = _weighted(scores, weights)
+    rating = _rating(score, coverage, gate=gate)
     if rating in ("Strong Buy", "Buy") and momentum is not None and momentum < 30:
         rating = _downgrade(rating)
         neg.append("Weak price trend — rating lowered one notch until it turns")
+    if not has_ter and not has_long_returns:
+        # Say what the rating is and is not based on, so a Buy on a Kenyan ETF
+        # is not read as a cost-and-trailing-returns verdict it never was.
+        neg.append("Scored on price trend and yield only — no published TER or "
+                   "multi-year return series for NSE-listed ETFs")
     return {
         "ticker": p["ticker"], "name": p.get("name"), "market": p.get("market"), "type": "etf",
         "currency": p.get("currency"), "price": p.get("price"), "price_usd": p.get("price_usd"),
         "metrics": {"expense_ratio_pct": er, "dividend_yield": dy, "total_assets": aum,
-                    "return_ytd": p.get("return_ytd"), "return_3y_avg": r3, "return_5y_avg": r5,
+                    "return_ytd": ytd, "return_3y_avg": r3, "return_5y_avg": r5,
                     "week52_high": p.get("week52_high"), "week52_low": p.get("week52_low"),
-                    "return_1y": p.get("return_1y"), "return_3m": p.get("return_3m")},
+                    "return_1y": r1, "return_3m": r3m},
         "trend": trend, "scores": scores, "score": score, "coverage": coverage,
+        "weight_basis": "full" if (has_ter and has_aum and has_long_returns) else "partial",
         "recommendation": rating, "positives": pos, "negatives": neg, "source": p.get("source"),
     }
 
@@ -250,8 +295,14 @@ def analyze_universe(screener, watchlist: dict) -> dict:
     """Analyse every configured ticker. Uses screener.fundamentals (cached
     profiles) and screener.trend_context so nothing is fetched twice."""
     stocks, etfs, failed = [], [], []
+    # Kenyan ETFs are analysed on NSE data but scored with the ETF weights, so
+    # they are tagged market="nse" AND forced into the etf bucket. Without the
+    # explicit "etf" marker they would be scored with equity weights against
+    # data that has no P/E, and end up in the Kenyan equity table as a row of
+    # n/a columns.
     entries = ([(t, "us") for t in watchlist["us_stocks"]] +
                [(t, "nse") for t in watchlist["nse_kenya"]] +
+               [(t, "nse", "etf") for t in watchlist.get("nse_etfs", [])] +
                [(t, "us", "etf") for t in watchlist["etfs"]])
     for entry in entries:
         ticker, market = entry[0], entry[1]

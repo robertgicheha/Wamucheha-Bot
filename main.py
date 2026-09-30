@@ -358,6 +358,7 @@ def main():
             notifier=notifier,
             practice=practice,
             dry_run=not LIVE_TRADING,
+            fee_model=fee_model,
         )
         print("  OANDA executor initialized")
 
@@ -376,6 +377,7 @@ def main():
             notifier=notifier,
             paper=paper,
             dry_run=not LIVE_TRADING,
+            fee_model=fee_model,
         )
         print("  Alpaca executor initialized")
 
@@ -404,6 +406,7 @@ def main():
             max_lot=CONFIG.get("risk", {}).get("mt5_max_lot", 0),
             max_open_trades=CONFIG.get("risk", {}).get("mt5_max_open_trades", 0),
             max_daily_loss_pct=CONFIG.get("risk", {}).get("mt5_max_daily_loss_pct", 0),
+            fee_model=fee_model,
         )
         if mt5_exec.connect():
             executors["mt5"] = mt5_exec
@@ -462,19 +465,45 @@ def main():
     )
 
     # --- Interactive control bots ---
+    # A token without an allowlist is a bot that accepts commands from anyone who
+    # can reach it, because both control bots treat an empty allowlist as "deny
+    # everything". Starting it anyway would be a bot that looks live and silently
+    # rejects every command, which reads as "the commands are broken" rather than
+    # "the bot is unconfigured". So refuse to start and say exactly what to set.
+    # Trading is entirely unaffected by this — the control bots are an
+    # observability and emergency-stop convenience, not a dependency.
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    if tg_token:
+    tg_allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip()
+    if tg_token and not tg_allowed:
+        print("  Telegram control bot: NOT STARTED — TELEGRAM_ALLOWED_USERS is "
+              "empty.\n"
+              "    Every command would be denied, so it is better not to run. Get "
+              "your numeric user ID from @userinfobot, set\n"
+              "    TELEGRAM_ALLOWED_USERS=<your_id> in .env, and restart. "
+              "Trading is unaffected.")
+    elif tg_token:
         tg_bot = TelegramControlBot(state_manager=state, risk_manager=risk)
         tg_bot.start(tg_token)
-        print("  Telegram control bot started")
+        print(f"  Telegram control bot started "
+              f"({len(tg_bot.authorized_count())} authorized user(s))")
     else:
         print("  Telegram control bot: no token configured (skipped)")
 
     dc_token = os.environ.get("DISCORD_BOT_TOKEN", "")
-    if dc_token:
+    dc_allowed = os.environ.get("DISCORD_ALLOWED_ROLES", "").strip()
+    if dc_token and not dc_allowed:
+        print("  Discord control bot: NOT STARTED — DISCORD_ALLOWED_ROLES is "
+              "empty.\n"
+              "    Every command would be denied, so it is better not to run. Set "
+              "it to the\n"
+              "    comma-separated role names allowed to control the bot "
+              "(e.g. trader,admin) and restart.\n"
+              "    Trading is unaffected.")
+    elif dc_token:
         dc_bot = DiscordControlBot(state_manager=state, risk_manager=risk)
         dc_bot.start(dc_token)
-        print("  Discord control bot started")
+        print(f"  Discord control bot started "
+              f"({len(dc_bot.authorized_count())} authorized role(s))")
     else:
         print("  Discord control bot: no token configured (skipped)")
 

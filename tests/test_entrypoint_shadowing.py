@@ -53,7 +53,11 @@ def _module_level_bindings(tree):
 
 class EntrypointShadowingTest(unittest.TestCase):
     def setUp(self):
-        self.tree = ast.parse(MAIN.read_text())
+        # encoding is explicit: without it Python uses the locale default, which
+        # is cp1252 on Windows and raises UnicodeDecodeError on the em-dashes and
+        # box-drawing characters main.py uses in its log messages. The test then
+        # fails for a reason that has nothing to do with what it checks.
+        self.tree = ast.parse(MAIN.read_text(encoding="utf-8"))
         self.bound = _module_level_bindings(self.tree)
 
     def test_no_import_alias_is_reused_as_a_file_handle(self):

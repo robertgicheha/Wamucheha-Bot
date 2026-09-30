@@ -48,14 +48,42 @@ VENUE_RULES = {
 }
 
 # Venues whose funds are NOT USDT-in-a-wallet. Flagged so nobody tries to fund
-# an MT5 account from MetaMask.
+# an MT5 account from an exchange.
 NON_CRYPTO_FUNDING = {
-    "mt5": "broker deposit (card / bank / M-Pesa), NOT from MetaMask",
-    "alpaca": "bank or wire transfer, NOT from MetaMask",
+    "mt5": "broker deposit (card / bank / M-Pesa) — cannot be funded by USDT transfer",
+    "alpaca": "bank or wire transfer — cannot be funded by USDT transfer",
+}
+
+# Networks this bot can settle USDT over, with the shape of a valid address on
+# each. The distinction matters: TRC20 is Tron, which uses base58 "T..." strings,
+# while BEP20/ERC20 are EVM chains that use 0x-prefixed hex. Treating them as
+# interchangeable is how people send real money to an address on the wrong chain,
+# where no one — not the exchange, not the chain — can recover it.
+USDT_NETWORKS = {
+    "TRC20":  ("tron",     "T + 33 base58 chars", "^T[1-9A-HJ-NP-Za-km-z]{33}$"),
+    "BEP20":  ("evm",      "0x + 40 hex",  "^0x[0-9a-fA-F]{40}$"),
+    "ERC20":  ("evm",      "0x + 40 hex",  "^0x[0-9a-fA-F]{40}$"),
+    "SOL":    ("solana",   "base58 32-44", "^[1-9A-HJ-NP-Za-km-z]{32,44}$"),
 }
 
 BLOCKERS: list[str] = []
 WARNINGS: list[str] = []
+
+
+def validate_usdt_address(addr: str, network: str) -> str | None:
+    """Return a human problem string for a deposit address on `network`, or
+    None if it is well-formed. Kept separate from the printing so it is
+    testable and so the same check can be reused for every venue's address."""
+    import re
+    net = (network or "").upper()
+    spec = USDT_NETWORKS.get(net)
+    if not spec:
+        return f"unknown network '{network}' (expected one of {', '.join(USDT_NETWORKS)})"
+    _, shape, pattern = spec
+    if not re.match(pattern, addr):
+        return (f"does not look like a {net} address (a {net}/{spec[0]} address is "
+                f"{shape})")
+    return None
 
 
 def blocker(msg: str):
@@ -174,54 +202,101 @@ def main() -> int:
             ok(f"{label}: {len(syms)} symbols")
 
     # ---------- 4. funding ----------
-    print("\n[4] Funding (manual — the bot never moves money)")
+    print("\n[4] Funding (manual — you move money in the exchange UIs; the bot "
+          "has no withdrawal rights)")
+
     # A .env value can carry a trailing "# comment". Strip it, or a placeholder
-    # like "# your 0x... treasury address" reads back as a real address.
+    # like "# your OKX deposit address" reads back as a real address.
     def clean(var: str) -> str:
         v = E(var)
         if "#" in v:
             v = v.split("#", 1)[0].strip()
         return v
 
-    wallet = clean("METAMASK_WALLET_ADDRESS")
-    network = clean("METAMASK_NETWORK").upper()
-    if not wallet:
-        warn("METAMASK_WALLET_ADDRESS is empty — set your treasury 0x... address "
-             "for the funding checklist. Not required for trading.")
+    # ── Funder + settlement, per the single-address design ──
+    # FUNDING_SOURCE_VENUE is where capital is drawn from. SETTLEMENT_VENUE is
+    # whose deposit address receives profit. They are usually the same venue
+    # (one hub), and the two only diverge if you want capital to sit somewhere
+    # other than where it is consolidated.
+    src = clean("FUNDING_SOURCE_VENUE").lower()
+    settle = clean("SETTLEMENT_VENUE").lower()
+    network = clean("TRANSFER_NETWORK").upper()
+
+    if not src:
+        warn("FUNDING_SOURCE_VENUE is empty — set it to the exchange you fund "
+             "from (e.g. okx). Documentation only; the bot never moves money.")
     else:
-        if wallet.startswith("0x") and len(wallet) == 42:
-            ok(f"treasury wallet recorded: {wallet[:10]}...{wallet[-6:]}")
-        else:
-            warn(f"METAMASK_WALLET_ADDRESS is not a valid 0x address: '{wallet}'")
+        ok(f"funder venue: {src}")
+
+    if not settle:
+        warn("SETTLEMENT_VENUE is empty — set it to the venue that receives "
+             "profit withdrawals (e.g. okx).")
+    else:
+        ok(f"settlement venue: {settle}")
+        if src and settle == src:
+            # Not an error — it is the intended design — but it concentrates
+            # risk, so state it once where the operator will read it.
+            warn(f"funder and settlement are both {settle.upper()}: every venue's "
+                 f"profit returns to {settle.upper()}, and capital is "
+                 f"re-balanced by on-chain withdrawal. That is the design you "
+                 f"asked for, but it makes {settle.upper()} a single point of "
+                 f"failure — an account freeze or outage locks every balance. "
+                 f"Keep withdraw-only 2FA and a withdrawal allowlist on it.")
+
     if network:
-        fees = {"TRC20": "~1 USDT", "BEP20": "~0.1-1 USDT",
-                "ERC20": "~5-20 USDT (avoid for bulk)"}
-        if network in fees:
-            ok(f"deposit network: {network} ({fees[network]})")
+        if network in USDT_NETWORKS:
+            fee_hint = {"TRC20": "~1 USDT", "BEP20": "~0.1-1 USDT",
+                        "ERC20": "~5-20 USDT (avoid for bulk)", "SOL": "~0.01 USDT"}
+            ok(f"transfer network: {network} ({fee_hint.get(network, '')})")
             if network == "ERC20":
-                warn("ERC20 is expensive; TRC20 or BEP20 is usual for bulk USDT transfers")
+                warn("ERC20 is expensive; TRC20 or BEP20 is usual for bulk USDT")
         else:
-            warn(f"METAMASK_NETWORK='{network}' is not a known USDT network "
-                 f"(expected TRC20, BEP20 or ERC20)")
+            warn(f"TRANSFER_NETWORK='{network}' is not a known USDT network "
+                 f"(expected {', '.join(USDT_NETWORKS)})")
+    else:
+        warn("TRANSFER_NETWORK is empty — set it (TRC20 recommended). Every "
+             "address below is checked against it, so a mismatch is what "
+             "loses funds.")
+
+    # ── Per-venue deposit addresses ──
     # FUNDING_<VENUE>_USDT predates this check and its name is misleading: it
     # holds the venue's DEPOSIT ADDRESS, not a target amount. It was printed as
     # "... USDT", which made a 0x address look like a dollar figure and hid the
     # fact that no amount is stored anywhere — the bot never moves money, so
-    # there is nothing to compare an amount against anyway.
+    # there is nothing to compare an amount against anyway. The name is kept
+    # because renaming it would break existing .env files for no benefit.
     for name in ("binance", "okx", "bybit"):
         v = clean(f"FUNDING_{name.upper()}_USDT")
-        if v:
-            if v.startswith("0x") and len(v) == 42:
-                ok(f"{name} deposit address: {v[:10]}...{v[-6:]}")
-            else:
-                warn(f"FUNDING_{name.upper()}_USDT does not look like a deposit "
-                     f"address (expected 0x followed by 40 hex chars): '{v}'")
+        if not v:
+            continue
+        problem = validate_usdt_address(v, network) if network else \
+            "no TRANSFER_NETWORK set, so the address cannot be verified"
+        if problem is None:
+            ok(f"{name} deposit address: {v[:8]}...{v[-6:]}")
+        else:
+            # Wrong chain is the one funding error that is unrecoverable, so it
+            # blocks rather than warns.
+            blocker(f"FUNDING_{name.upper()}_USDT {problem}: '{v}'. Sending on "
+                    f"the wrong network destroys the deposit — verify the address "
+                    f"and network on the exchange's Deposit screen before sending.")
+
     unfunded = [n for n in ("binance", "okx", "bybit")
                 if not clean(f"FUNDING_{n.upper()}_USDT")]
     if unfunded:
         warn(f"no deposit address recorded for: {', '.join(unfunded)} "
-             f"(set FUNDING_<VENUE>_USDT in .env). Documentation only — you "
-             f"move money in MetaMask and the bot never holds withdrawal rights.")
+             f"(set FUNDING_<VENUE>_USDT in .env). Documentation only — the bot "
+             f"never holds withdrawal rights.")
+
+    # The hub venue's own address doubles as the settlement address, so a
+    # mismatch between them is a silent misconfiguration: profit would be
+    # withdrawn somewhere the operator did not intend.
+    hub = settle or src
+    if hub and hub in ("binance", "okx", "bybit"):
+        hub_addr = clean(f"FUNDING_{hub.upper()}_USDT")
+        if not hub_addr:
+            warn(f"settlement venue is {hub.upper()} but FUNDING_{hub.upper()}_USDT "
+                 f"is empty — that is the address profit would be withdrawn to. "
+                 f"Set it from the {hub.upper()} Deposit screen.")
 
     # ---------- 5. IP allowlist ----------
     # Both Binance and OKX reject any request from an address that is not on
