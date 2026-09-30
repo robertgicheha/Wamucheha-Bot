@@ -36,6 +36,8 @@ REPORT_LOG = Path(__file__).parent.parent / "data" / "session_reports.jsonl"
 # this file through read_hourly_log(). Historical entries stay readable and
 # new reports land alongside them.
 LEGACY_HOURLY_LOG = Path(__file__).parent.parent / "data" / "hourly_log.jsonl"
+# Persisted timer state so report schedules survive restarts.
+TIMER_STATE_FILE = Path(__file__).parent.parent / "data" / "report_timers.json"
 
 
 class SessionReporter:
@@ -50,35 +52,59 @@ class SessionReporter:
         self.heartbeat_path = heartbeat_path or (
             Path(__file__).parent.parent / "data" / "engine_heartbeat.json")
         REPORT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        # Both timers start at construction, so the first report lands one
-        # full window after the bot comes up rather than instantly at boot
-        # with an empty ledger.
-        self._last_window = time.time()
-        self._last_day = time.time()
+        # Load persisted timer state; if missing, start at now so the first
+        # report lands one full window after boot (not instantly with an
+        # empty ledger).
+        saved = {}
+        try:
+            if TIMER_STATE_FILE.exists():
+                saved = json.loads(TIMER_STATE_FILE.read_text())
+        except Exception as e:
+            logger.warning(f"Could not load report timer state: {e}")
+        now = time.time()
+        self._last_window = saved.get("last_window", now)
+        self._last_day = saved.get("last_day", now)
 
     # ---------- entry point, called once per main loop tick ----------
 
     def maybe_report(self):
         now = time.time()
+        changed = False
         if now - self._last_window >= self.window_hours * 3600:
             self._last_window = now
+            changed = True
             try:
                 self._emit_window(now)
             except Exception as e:
                 logger.error(f"window report failed: {e}")
         if now - self._last_day >= self.day_hours * 3600:
             self._last_day = now
+            changed = True
             try:
                 self._emit_day(now)
             except Exception as e:
                 logger.error(f"daily report failed: {e}")
+        if changed:
+            self._save_timer_state()
+
+    def _save_timer_state(self):
+        try:
+            TIMER_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TIMER_STATE_FILE.write_text(json.dumps({
+                "last_window": self._last_window,
+                "last_day": self._last_day,
+            }))
+        except Exception as e:
+            logger.warning(f"Could not save report timer state: {e}")
 
     # ---------- 6-hour ----------
 
     def _emit_window(self, epoch: float):
         report = self.build_window_report(epoch)
         self._append(REPORT_LOG, report)
-        self._append(LEGACY_HOURLY_LOG, report)
+        # Do NOT write to LEGACY_HOURLY_LOG — that file is for historical
+        # hourly reports only. Writing the new 6-hour window reports there
+        # duplicates them in read_hourly_log() (which reads both files).
         self.notifier.notify_window_report(report)
 
     def build_window_report(self, epoch: float = None) -> dict:

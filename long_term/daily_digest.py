@@ -419,7 +419,7 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
         """Coloured change. Absent data stays neutral grey rather than
         borrowing the wrong direction's colour."""
         if v is None:
-            return '<span style="color:#6b7280;">n/a</span>'
+            return f'<span style="color:{C["text_secondary"]};">n/a</span>'
         color = C["accent_green"] if v > 0 else C["accent_red"] if v < 0 else C["text_secondary"]
         return f'<span style="color:{color};font-weight:600;">{fmt.format(v)}</span>'
 
@@ -461,7 +461,7 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
         <tr><td style="padding:16px 18px;">
           <div style="color:{C['accent_purple']};font-size:10px;font-weight:700;letter-spacing:1.4px;">TOP CONVICTION PICK</div>
           <div style="padding:5px 0 3px;">
-            <span style="color:#fff;font-size:21px;font-weight:800;letter-spacing:-0.3px;">{_esc(best['ticker'])}</span>
+            <span style="color:{C['text_primary']};font-size:21px;font-weight:800;letter-spacing:-0.3px;">{_esc(best['ticker'])}</span>
             <span style="color:{C['text_secondary']};font-size:13px;padding-left:8px;">{_esc((best.get('name') or '')[:38])}</span>
           </div>
           <div style="padding:0 0 9px;">
@@ -490,7 +490,7 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
         <tr><td style="padding:9px 0;border-bottom:1px solid {C['border']};">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>
             <td style="padding-right:12px;vertical-align:middle;width:78px;">
-              <span style="color:#fff;font-size:14px;font-weight:700;">{_esc(s['ticker'])}</span>
+              <span style="color:{C['text_primary']};font-size:14px;font-weight:700;">{_esc(s['ticker'])}</span>
             </td>
             <td style="vertical-align:middle;width:74px;">{rec(s['recommendation'])}</td>
             <td style="vertical-align:middle;width:64px;">{_score_bar(s['score'], width=40)}</td>
@@ -513,7 +513,7 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
         for s in ranked:
             m = s["metrics"]
             table_rows.append([
-                f'<b style="color:#fff;">{_esc(s["ticker"])}</b>'
+                f'<b style="color:{C["text_primary"]};">{_esc(s["ticker"])}</b>'
                 f'<br><span style="color:#7b7d90;font-size:10px;">{_esc((s.get("name") or "")[:30])}</span>',
                 rec(s["recommendation"]),
                 _score_bar(s["score"], width=42),
@@ -577,7 +577,7 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
         outlook_color = {"Bullish": C["accent_green"], "Bearish": C["accent_red"]}.get(
             r.get("outlook"), C["accent_orange"])
         out_rows.append([
-            f'<b style="color:#fff;">{_esc(r["name"])}</b>',
+            f'<b style="color:{C["text_primary"]};">{_esc(r["name"])}</b>',
             f'{r["price"]:,}' if r.get("price") is not None else "n/a",
             pct_cell(r.get("change_1w")),
             pct_cell(r.get("change_1m")),
@@ -599,13 +599,13 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
         mover_rows = []
         for m in list(mv.get("gainers", []))[:5]:
             mover_rows.append([
-                f'<b style="color:#fff;">{_esc(m["ticker"])}</b>',
+                f'<b style="color:{C["text_primary"]};">{_esc(m["ticker"])}</b>',
                 pct_cell(m.get("change_pct")),
                 f'<span style="color:{C["accent_green"]};font-size:11px;font-weight:600;">GAINER</span>',
             ])
         for m in list(mv.get("losers", []))[:5]:
             mover_rows.append([
-                f'<b style="color:#fff;">{_esc(m["ticker"])}</b>',
+                f'<b style="color:{C["text_primary"]};">{_esc(m["ticker"])}</b>',
                 pct_cell(m.get("change_pct")),
                 f'<span style="color:{C["accent_red"]};font-size:11px;font-weight:600;">LOSER</span>',
             ])
@@ -613,13 +613,13 @@ def format_digest_email(analysis: dict, outlook: dict, sell: list,
 
     if avoid:
         parts.append(table("⛔ AVOID FOR NOW", ["Ticker", "Why"],
-                           [[f'<b style="color:#fff;">{_esc(s["ticker"])}</b>',
+                           [[f'<b style="color:{C["text_primary"]};">{_esc(s["ticker"])}</b>',
                              _esc(s["negatives"][0] if s.get("negatives") else "weak score")]
                             for s in avoid[:6]]))
 
     if parts:
         rows += ('<tr><td colspan="2" style="padding:0;">'
-                 + '<h3 style="color:#6b7280;font-size:11px;font-weight:700;letter-spacing:1.6px;'
+                 + f'<h3 style="color:{C["text_secondary"]};font-size:11px;font-weight:700;letter-spacing:1.6px;'
                    'margin:24px 0 0;padding-top:20px;border-top:1px solid '
                  + C["border"] + ';">FULL RANKED UNIVERSE</h3>'
                  + "".join(parts)
