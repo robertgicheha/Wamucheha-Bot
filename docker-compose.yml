@@ -9,7 +9,7 @@ services:
   # not stop the crypto venues from starting. The engine logs one warning and
   # trades the venues that did come up.
   mt5:
-    image: lprett/mt5linux:latest
+    image: lprett/mt5linux:mt5-installed
     container_name: trading-mt5
     # Alpine + Wine is x86_64 only. On an ARM VPS this service cannot run and
     # MT5 has to move to a Windows box (MT5_RPC_HOST pointing at its LAN IP).
@@ -17,6 +17,10 @@ services:
     cpus: ${MT5_CPU:-1.0}
     mem_limit: ${MT5_MEM:-1g}
     restart: unless-stopped
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     # NOT `env_file: .env`. The terminal exposes a VNC/noVNC UI and runs a
     # Windows compatibility layer — a far bigger attack surface than the engine,
     # and it has no use for the exchange API keys, the dashboard secret or the
@@ -37,6 +41,9 @@ services:
       # why the ports below are bound to loopback and not published.
       VNC_PASSWORD: ${MT5_VNC_PASSWORD:-}
       NOVNC_HOST: 127.0.0.1
+    volumes:
+      - ./docker/mt5-entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: ["/bin/sh", "/entrypoint.sh"]
     ports:
     # noVNC, so the terminal can be inspected once through an SSH tunnel.
     - 127.0.0.1:8080:8080
