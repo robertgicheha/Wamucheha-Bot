@@ -15,6 +15,7 @@ Portfolio-level controls added:
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from core.structured_logger import log_risk_event, log_system_event
 
 # Asset class mapping for portfolio-level caps
 ASSET_CLASS_MAP = {
@@ -113,10 +114,18 @@ class RiskManager:
         risk_state = self.state.get_risk_state()
 
         if risk_state["trading_halted"]:
+            log_risk_event("trading_halted", f"Trade blocked: {risk_state['halt_reason']}",
+                           priority="high", trading_balance=risk_state["trading_balance"],
+                           daily_pnl=risk_state["daily_pnl"],
+                           consecutive_losses=risk_state["consecutive_losses"],
+                           proposed_action=f"open {symbol} on {venue}")
             return RiskDecision(False, f"Trading halted: {risk_state['halt_reason']}")
 
         # Venue kill switch, ahead of every other check.
         if venue and venue.lower() in self.disabled_venues:
+            log_risk_event("venue_disabled", f"Trade blocked: venue '{venue}' is disabled",
+                           priority="normal", trading_balance=risk_state["trading_balance"],
+                           proposed_action=f"open {symbol} on {venue}")
             return RiskDecision(False, f"Venue '{venue}' is disabled")
 
         self._maybe_reset_daily(risk_state)
@@ -124,11 +133,23 @@ class RiskManager:
 
         if risk_state["consecutive_losses"] >= self.cfg["max_consecutive_losses"]:
             self._halt(f"{self.cfg['max_consecutive_losses']} consecutive losses reached")
+            log_risk_event("consecutive_loss_limit", 
+                           f"Max consecutive losses ({self.cfg['max_consecutive_losses']}) reached",
+                           priority="high", trading_balance=risk_state["trading_balance"],
+                           daily_pnl=risk_state["daily_pnl"],
+                           consecutive_losses=risk_state["consecutive_losses"],
+                           proposed_action=f"open {symbol} on {venue}")
             return RiskDecision(False, "Consecutive loss limit hit")
 
         daily_loss_limit = -abs(risk_state["trading_balance"] * self.cfg["max_daily_loss_pct"] / 100)
         if risk_state["daily_pnl"] <= daily_loss_limit:
             self._halt("Daily loss limit reached", until_tomorrow=True)
+            log_risk_event("daily_loss_limit", 
+                           f"Daily loss limit hit: {risk_state['daily_pnl']:.2f} <= {daily_loss_limit:.2f}",
+                           priority="high", trading_balance=risk_state["trading_balance"],
+                           daily_pnl=risk_state["daily_pnl"],
+                           consecutive_losses=risk_state["consecutive_losses"],
+                           proposed_action=f"open {symbol} on {venue}")
             return RiskDecision(False, "Daily loss limit hit")
 
         peak = risk_state.get("peak_balance", risk_state["trading_balance"])
@@ -137,9 +158,21 @@ class RiskManager:
             max_dd = self.cfg.get("max_drawdown_pct", 5)
             if drawdown_pct >= max_dd:
                 self._halt(f"Max drawdown {drawdown_pct:.1f}% exceeded limit {max_dd}%")
+                log_risk_event("max_drawdown", 
+                               f"Max drawdown {drawdown_pct:.1f}% exceeded limit {max_dd}%",
+                               priority="high", trading_balance=risk_state["trading_balance"],
+                               daily_pnl=risk_state["daily_pnl"],
+                               consecutive_losses=risk_state["consecutive_losses"],
+                               proposed_action=f"open {symbol} on {venue}")
                 return RiskDecision(False, f"Max drawdown limit hit ({drawdown_pct:.1f}%)")
 
         if risk_state["trading_balance"] <= 0:
+            log_risk_event("zero_balance", 
+                           "No trading balance — profit buffer exhausted",
+                           priority="high", trading_balance=risk_state["trading_balance"],
+                           daily_pnl=risk_state["daily_pnl"],
+                           consecutive_losses=risk_state["consecutive_losses"],
+                           proposed_action=f"open {symbol} on {venue}")
             return RiskDecision(False, "No trading balance — profit buffer exhausted. "
                                         "Stake is protected and untouched.")
 
@@ -149,18 +182,24 @@ class RiskManager:
 
             # Max open positions
             if len(open_positions) >= self.max_open_positions:
+                log_risk_event("max_positions", 
+                               f"Max open positions ({self.max_open_positions}) reached",
+                               priority="normal", trading_balance=risk_state["trading_balance"],
+                               daily_pnl=risk_state["daily_pnl"],
+                               consecutive_losses=risk_state["consecutive_losses"],
+                               proposed_action=f"open {symbol} on {venue}")
                 return RiskDecision(False, f"Max open positions ({self.max_open_positions}) reached")
 
-            # Per-venue exposure cap: a single exchange freezing, freezing
-            # withdrawals, or being compromised must not be able to take the
-            # whole account, so venue notional is capped independently of the
-            # asset-class cap. Checked first so that when both limits are
-            # breached the rejection names the venue, rather than reporting a
-            # generic asset-class breach that hides where the exposure sits.
+            # Per-venue exposure cap
             if venue:
                 venue_check = self._check_venue_exposure(
                     venue, open_positions, risk_state["trading_balance"])
                 if not venue_check.allowed:
+                    log_risk_event("venue_exposure", venue_check.reason,
+                                   priority="normal", trading_balance=risk_state["trading_balance"],
+                                   daily_pnl=risk_state["daily_pnl"],
+                                   consecutive_losses=risk_state["consecutive_losses"],
+                                   proposed_action=f"open {symbol} on {venue}")
                     return venue_check
 
             # Per-asset-class exposure cap
@@ -169,6 +208,12 @@ class RiskManager:
                 open_positions, asset_class, risk_state["trading_balance"]
             )
             if class_exposure >= self.max_asset_class_exposure_pct:
+                log_risk_event("asset_class_exposure", 
+                               f"Asset class '{asset_class}' exposure ({class_exposure:.1f}%) exceeds cap ({self.max_asset_class_exposure_pct}%)",
+                               priority="normal", trading_balance=risk_state["trading_balance"],
+                               daily_pnl=risk_state["daily_pnl"],
+                               consecutive_losses=risk_state["consecutive_losses"],
+                               proposed_action=f"open {symbol} on {venue}")
                 return RiskDecision(False,
                     f"Asset class '{asset_class}' exposure ({class_exposure:.1f}%) "
                     f"exceeds cap ({self.max_asset_class_exposure_pct}%)")
@@ -176,12 +221,22 @@ class RiskManager:
             # Correlation check: don't over-concentrate in correlated assets
             corr_check = self._check_correlation(symbol, open_positions)
             if not corr_check.allowed:
+                log_risk_event("correlation_limit", corr_check.reason,
+                               priority="normal", trading_balance=risk_state["trading_balance"],
+                               daily_pnl=risk_state["daily_pnl"],
+                               consecutive_losses=risk_state["consecutive_losses"],
+                               proposed_action=f"open {symbol} on {venue}")
                 return corr_check
 
         # Position sizing
         max_size = risk_state["trading_balance"] * self.cfg["max_position_pct"] / 100
         size = min(proposed_amount, max_size)
         if size <= 0:
+            log_risk_event("zero_position_size", "Computed position size is zero",
+                           priority="normal", trading_balance=risk_state["trading_balance"],
+                           daily_pnl=risk_state["daily_pnl"],
+                           consecutive_losses=risk_state["consecutive_losses"],
+                           proposed_action=f"open {symbol} on {venue}")
             return RiskDecision(False, "Computed position size is zero")
 
         return RiskDecision(True, "OK", position_size=size)

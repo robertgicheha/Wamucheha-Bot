@@ -1,9 +1,9 @@
 # All risk parameters live here so you never have to touch code to change them.
 
 account:
-  stake_amount: 10.0           # overridden by STAKE_AMOUNT env var if set
-  trading_balance: 100.0       # capital the bot may trade; seeds a fresh state DB only
-                               # (overridden by TRADING_BALANCE env var)
+  stake_amount: 1.0            # overridden by STAKE_AMOUNT env var if set
+  trading_balance: 1.0         # capital the bot may trade; seeds a fresh state DB only
+                                # (overridden by TRADING_BALANCE env var)
   currency: USD
   # No wallet. Capital lives on the exchange named by FUNDING_SOURCE_VENUE and
   # profits settle on SETTLEMENT_VENUE (both in .env). This key is retained

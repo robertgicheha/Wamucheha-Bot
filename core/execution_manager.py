@@ -6,6 +6,7 @@ notification system for rich trade logging. Tracks slippage between
 signal price and actual fill price.
 """
 import uuid
+import time
 import ccxt
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from core.fee_manager import FeeModel
@@ -197,7 +198,12 @@ class ExecutionManager:
         # Structured log
         log_trade_open(symbol, side, filled_amount, fill_price,
                        self.exchange_id, strategies, score,
-                       entry_fee=entry_fee["cost"])
+                       entry_fee=entry_fee["cost"],
+                       order_id=client_order_id,
+                       stop_loss=stop_price,
+                       take_profit=target_price,
+                       risk_pct=CONFIG["risk"]["max_position_pct"],
+                       proposed_amount=proposed_amount)
 
         # Rich notification
         self.notifier.notify_trade_opened(
@@ -290,7 +296,11 @@ class ExecutionManager:
         # Structured logging
         log_trade_close(pos["symbol"], pos["side"], pos["entry_price"],
                         exit_price, pnl, reason, self.exchange_id,
-                        gross_pnl=gross_pnl, fees=total_fees)
+                        gross_pnl=gross_pnl, fees=total_fees,
+                        entry_fee=entry_fee, exit_fee=exit_fee,
+                        order_id=client_order_id,
+                        held_seconds=time.time() - opened_at if opened_at else 0,
+                        amount=pos["amount"])
 
         # Track per-strategy performance
         if strategies:

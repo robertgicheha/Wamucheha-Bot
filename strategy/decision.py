@@ -21,6 +21,7 @@ shrink it), never invent one on its own:
 """
 from strategy.technical_strategy import generate_signal_ex
 from strategy.signal_aggregator import SignalAggregator
+from core.structured_logger import log_signal
 
 
 def evaluate(df, risk_fraction_of_balance: float, trading_balance: float,
@@ -28,7 +29,8 @@ def evaluate(df, risk_fraction_of_balance: float, trading_balance: float,
              lstm_predictor=None, ml_min_confidence: float = 0.6,
              aggregator: SignalAggregator = None,
              min_aggregator_confidence: float = 0.3,
-             _df_has_indicators: bool = False) -> dict | None:
+             _df_has_indicators: bool = False,
+             symbol: str = "") -> dict | None:
     """Decide whether to trade this bar. Returns a signal dict or None.
 
     aggregator: pass a SignalAggregator instance to enable category-level
@@ -49,9 +51,15 @@ def evaluate(df, risk_fraction_of_balance: float, trading_balance: float,
     if signal is None:
         return None
 
+    strategies = [k for k, v in raw_scores.items() if v > 0]
+    min_score = cfg.get("min_signal_score", 0.18)
+    
     if lstm_predictor is not None and ml_prob is not None:
         confidence = ml_prob if signal["side"] == "buy" else (1 - ml_prob)
         if confidence < ml_min_confidence:
+            log_signal(symbol, signal["side"], confidence,
+                       [], regime, strategies,
+                       score=signal.get("score", 0), min_score=min_score, passed=False)
             return None
         signal["ml_confidence"] = round(confidence, 3)
 
@@ -59,8 +67,15 @@ def evaluate(df, risk_fraction_of_balance: float, trading_balance: float,
         agg = aggregator.aggregate(raw_scores, regime=regime,
                                     min_confidence=min_aggregator_confidence)
         if agg.action != signal["side"]:
+            log_signal(symbol, signal["side"], agg.confidence,
+                       agg.conflicts, regime, strategies,
+                       score=signal.get("score", 0), min_score=min_score, passed=False)
             return None
         signal["aggregator_confidence"] = agg.confidence
         signal["conflicts"] = agg.conflicts
 
+    signal["symbol"] = symbol
+    log_signal(symbol, signal["side"], signal.get("score", 0),
+               signal.get("conflicts", []), regime, strategies,
+               score=signal.get("score", 0), min_score=min_score, passed=True)
     return signal

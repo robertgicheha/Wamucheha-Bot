@@ -69,6 +69,7 @@ def run_backtest(df: pd.DataFrame, initial_balance: float = 1000.0,
                 aggregator=aggregator,
                 min_aggregator_confidence=min_aggregator_confidence,
                 _df_has_indicators=True,
+                symbol=symbol if 'symbol' in locals() else "",
             )
             if signal:
                 side = signal["side"]

@@ -228,6 +228,7 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
         aggregator=signal_aggregator,
         min_aggregator_confidence=min_aggregator_confidence,
         _df_has_indicators=has_indicators,
+        symbol=symbol,
     )
 
     if signal is None:

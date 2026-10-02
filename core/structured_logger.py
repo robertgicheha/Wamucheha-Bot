@@ -12,10 +12,12 @@ Features:
   - API failure rate monitoring per exchange
   - Strategy performance tracking
   - Circuit breaker event logging
+  - Verbose console output for live trading monitoring
 """
 import json
 import time
 import logging
+import os
 from pathlib import Path
 from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
@@ -27,6 +29,9 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 # JSON log file (rotated daily)
 _log_file = None
 _current_date = None
+
+# Verbose mode for live trading - controlled by VERBOSE_LOGGING env var
+VERBOSE_LOGGING = os.environ.get("VERBOSE_LOGGING", "false").lower() == "true"
 
 
 def _get_log_file() -> Path:
@@ -45,6 +50,14 @@ def _write_entry(entry: dict):
             f.write(json.dumps(entry, default=str) + "\n")
     except Exception:
         pass
+
+
+def _verbose_print(msg: str, level: str = "INFO"):
+    """Print to console if verbose logging is enabled."""
+    if VERBOSE_LOGGING:
+        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        prefix = {"INFO": "[INFO]", "TRADE": "[TRADE]", "FEE": "[FEE]", "RISK": "[RISK]", "SLIP": "[SLIP]", "SIGNAL": "[SIGNAL]", "SYS": "[SYS]"}.get(level, "[INFO]")
+        print(f"[{timestamp}] {prefix} {msg}")
 
 
 # ---------- Slippage Tracker ----------
@@ -272,21 +285,40 @@ strategy_perf_tracker = StrategyPerformanceTracker()
 
 def log_trade_open(symbol: str, side: str, amount: float, price: float,
                    exchange: str, strategies: list = None, score: float = 0,
-                   entry_fee: float = 0.0):
+                   entry_fee: float = 0.0, order_id: str = "", stop_loss: float = 0.0,
+                   take_profit: float = 0.0, risk_pct: float = 0.0, proposed_amount: float = 0.0):
+    notional = round(float(price) * float(amount), 4)
     _write_entry({
         "type": "trade_open",
         "symbol": symbol, "side": side, "amount": amount,
         "price": price, "exchange": exchange,
         "strategies": strategies or [], "score": score,
         "entry_fee": entry_fee,
-        "notional": round(float(price) * float(amount), 4),
+        "notional": notional,
+        "order_id": order_id,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "risk_pct": risk_pct,
+        "proposed_amount": proposed_amount,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    
+    _verbose_print(
+        f"TRADE OPENED | {symbol} {side.upper()} | "
+        f"Size: {amount:.6f} @ {price:.4f} | Notional: ${notional:.2f} | "
+        f"Exchange: {exchange} | Fee: ${entry_fee:.4f} | "
+        f"SL: {stop_loss:.4f} | TP: {take_profit:.4f} | "
+        f"Strategies: {', '.join(strategies or [])} | Score: {score:.3f} | "
+        f"OrderID: {order_id}",
+        "TRADE"
+    )
 
 
 def log_trade_close(symbol: str, side: str, entry_price: float, exit_price: float,
                     pnl: float, reason: str, exchange: str,
-                    gross_pnl: float = None, fees: float = 0.0):
+                    gross_pnl: float = None, fees: float = 0.0,
+                    entry_fee: float = 0.0, exit_fee: float = 0.0,
+                    order_id: str = "", held_seconds: float = 0.0, amount: float = 0.0):
     # gross and net are both recorded. A log that only holds the net number
     # cannot answer 'was this trade a good idea that fees ate, or a bad idea
     # outright' — and that is the question you need when the day is red.
@@ -297,8 +329,26 @@ def log_trade_close(symbol: str, side: str, entry_price: float, exit_price: floa
         "pnl": pnl, "reason": reason, "exchange": exchange,
         "gross_pnl": gross_pnl if gross_pnl is not None else pnl,
         "fees": fees,
+        "entry_fee": entry_fee,
+        "exit_fee": exit_fee,
+        "order_id": order_id,
+        "held_seconds": held_seconds,
+        "amount": amount,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    
+    pnl_pct = ((exit_price - entry_price) / entry_price * 100) if side == "buy" \
+        else ((entry_price - exit_price) / entry_price * 100)
+    
+    _verbose_print(
+        f"TRADE CLOSED | {symbol} {side.upper()} | "
+        f"Entry: {entry_price:.4f} -> Exit: {exit_price:.4f} | "
+        f"PnL: ${pnl:.4f} ({pnl_pct:+.2f}%) | Gross: ${gross_pnl:.4f} | "
+        f"Fees: ${fees:.4f} (Entry: ${entry_fee:.4f} + Exit: ${exit_fee:.4f}) | "
+        f"Reason: {reason} | Held: {held_seconds/60:.1f}min | "
+        f"Exchange: {exchange} | OrderID: {order_id}",
+        "TRADE"
+    )
 
 
 def log_fee_event(kind: str, venue: str, amount_usd: float, detail: str = ""):
@@ -308,32 +358,64 @@ def log_fee_event(kind: str, venue: str, amount_usd: float, detail: str = ""):
         "detail": detail,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    _verbose_print(
+        f"FEE EVENT | {kind.upper()} | Venue: {venue} | Amount: ${amount_usd:.4f} | {detail}",
+        "FEE"
+    )
 
 
 def log_signal(symbol: str, action: str, confidence: float,
-               conflicts: list, regime: str, strategies: list):
+               conflicts: list, regime: str, strategies: list,
+               score: float = 0.0, min_score: float = 0.0, passed: bool = True):
     _write_entry({
         "type": "signal",
         "symbol": symbol, "action": action, "confidence": confidence,
         "conflicts": conflicts, "regime": regime, "strategies": strategies,
+        "score": score, "min_score": min_score, "passed": passed,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    if passed or VERBOSE_LOGGING:
+        status = "[PASSED]" if passed else "[BLOCKED]"
+        _verbose_print(
+            f"SIGNAL {status} | {symbol} {action.upper()} | "
+            f"Score: {score:.3f} (min: {min_score:.3f}) | Confidence: {confidence:.3f} | "
+            f"Regime: {regime} | Strategies: {', '.join(strategies)} | "
+            f"Conflicts: {', '.join(conflicts) if conflicts else 'none'}",
+            "SIGNAL"
+        )
 
 
-def log_risk_event(event_type: str, details: str, priority: str = "normal"):
+def log_risk_event(event_type: str, details: str, priority: str = "normal",
+                   trading_balance: float = 0.0, daily_pnl: float = 0.0,
+                   consecutive_losses: int = 0, proposed_action: str = ""):
     _write_entry({
         "type": "risk_event",
         "event": event_type, "details": details, "priority": priority,
+        "trading_balance": trading_balance,
+        "daily_pnl": daily_pnl,
+        "consecutive_losses": consecutive_losses,
+        "proposed_action": proposed_action,
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    _verbose_print(
+        f"RISK EVENT | {event_type.upper()} | Priority: {priority} | "
+        f"Balance: ${trading_balance:.2f} | Daily PnL: ${daily_pnl:.2f} | "
+        f"Loss Streak: {consecutive_losses} | Action: {proposed_action} | {details}",
+        "RISK"
+    )
 
 
-def log_system_event(event_type: str, details: str):
+def log_system_event(event_type: str, details: str, extra: dict = None):
     _write_entry({
         "type": "system",
         "event": event_type, "details": details,
+        "extra": extra or {},
         "ts": datetime.now(timezone.utc).isoformat(),
     })
+    _verbose_print(
+        f"SYSTEM | {event_type.upper()} | {details}" + (f" | {extra}" if extra else ""),
+        "SYS"
+    )
 
 
 # ---------- engine heartbeat ----------
