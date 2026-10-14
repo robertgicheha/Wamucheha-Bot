@@ -464,6 +464,28 @@ def resume(x_dashboard_key: str = Header(None)):
     return {"status": "resumed"}
 
 
+
+# ---------- Bot Control API ----------
+@app.get("/api/bot/status")
+def bot_status():
+    snapshot = _load_snapshot()
+    acc = {
+        "stake_amount": CONFIG.get("account", {}).get("stake_amount", 0.0),
+        "trading_balance": snapshot.get("trading_balance", 0.0),
+        "peak_balance": snapshot.get("peak_balance", 0.0),
+        "trading_halted": bool(snapshot.get("trading_halted", 0)),
+        "halt_reason": snapshot.get("halt_reason"),
+        "daily_pnl": snapshot.get("daily_pnl", 0.0),
+        "consecutive_losses": snapshot.get("consecutive_losses", 0),
+        "updated_at": snapshot.get("updated_at"),
+    }
+    return acc
+
+@app.get("/api/transactions")
+def transactions(n: int = 200):
+    state = _get_state()
+    trades = state.get_recent_trades(n)
+    return {"transactions": trades}
 # ---------- Terminal ----------
 
 @app.post("/api/terminal")

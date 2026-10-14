@@ -79,3 +79,10 @@ def evaluate(df, risk_fraction_of_balance: float, trading_balance: float,
                signal.get("conflicts", []), regime, strategies,
                score=signal.get("score", 0), min_score=min_score, passed=True)
     return signal
+
+# Gold/news filter integration (optional)
+try:
+    from strategy.news_filter import NewsFilter
+    _news_filter = NewsFilter()
+except Exception:
+    _news_filter = None

@@ -48,9 +48,9 @@ risk:
   max_consecutive_losses: 8          # hard stop, per your spec
   max_daily_loss_pct: 5              # % of trading_balance; drawdown limit < 5%
   max_drawdown_pct: 5                # peak-to-trough drawdown halt limit
-  max_position_pct: 2                # % of trading_balance risked on any single trade
-  stop_loss_pct: 1.5                 # per-trade stop loss, always attached at order time
-  take_profit_pct: 3.0               # optional per-trade target
+  max_position_pct: 3                # % of trading_balance risked on any single trade
+  stop_loss_pct: 2.0                 # per-trade stop loss, always attached at order time
+  take_profit_pct: 2.5               # optional per-trade target
   profit_withdrawal_threshold: 500   # when trading_balance hits this, sweep excess to stake wallet
   profit_withdrawal_keep: 200        # amount left in trading_balance after a sweep
   volatility_circuit_breaker_pct: 3  # pause trading if price moves this % in the window below
@@ -93,59 +93,31 @@ execution:
   # is 24h volume, spread, and that volatility comfortably exceeds
   # fees + spread. Thin pairs (QNT) are added last and capped.
   exchanges:
+    # Crypto - disabled as requested
     - name: binance
-      enabled: true
-      markets: ["ETH/USDT", "SOL/USDT", "XRP/USDT", "LINK/USDT"]
+      enabled: false
+      markets: []
     - name: okx
-      enabled: true
-      markets: ["ETH/USDT", "SOL/USDT"]
-    # Bybit needs no new code: the name is already whitelisted in the executor
-    # (main.py), the market-data router (data_feeds/feed_router.py) and the
-    # always-open crypto set (core/market_hours.py), and it resolves through
-    # the same generic ccxt ExecutionManager as Binance and OKX. It reads
-    # BYBIT_API_KEY / BYBIT_API_SECRET from .env.
+      enabled: false
+      markets: []
     - name: bybit
-      enabled: true
-      markets: ["ETH/USDT", "SOL/USDT"]
-    # OANDA overlaps MT5 on both forex and metals. One venue for both keeps
-    # margin and risk in one place. Left disabled; re-enable only if you
-    # deliberately want a second forex venue.
+      enabled: false
+      markets: []
+    # Forex/CFD via OANDA - disabled as requested
     - name: oanda
       enabled: false
       markets: []
-    # US equities stay off until you confirm your Alpaca account type is
-    # available to Kenyan residents.
+    # US equities - disabled for live trading (analysis only via long_term)
     - name: alpaca
       enabled: false
       markets: []
     - name: mt5
       enabled: true
       markets: []
-  # MT5 carries forex AND metals, so all your non-crypto risk is sized in one
-  # place against one broker's margin. BTCUSD is left out on purpose: the same
-  # exposure is available as a spot pair on Binance/OKX with real volume, and
-  # a CFD price feed adds spread for no diversification.
-  # Silver (XAGUSD) is commented out until the broker is confirmed to offer it.
-  oanda_markets:
-    - "GBP/USD"
-    - "EUR/USD"
-    - "AUD/USD"
-    - "EUR/JPY"
-    - "EUR/GBP"
-    - "USD/CAD"
-    - "USD/JPY"
-    - "GBP/JPY"
+  oanda_markets: []
   mt5_markets:
-    - "XAUUSD"
-    - "EURUSD"
-    - "GBPUSD"
-    - "AUDUSD"
-    - "EURJPY"
-    - "EURGBP"
-    - "USDCAD"
-    # - "XAGUSD"     # silver — uncomment once the broker lists it
-    # - "BTCUSD"    # crypto CFD — prefer spot on Binance/OKX (deeper book)
-  alpaca_markets: ["AAPL", "MSFT", "SPY", "QQQ", "GLD", "TLT"]
+    - "XAUUSD"  # Trade Gold only on MT5 via Fusion Markets (Fusion Markets broker)
+  alpaca_markets: []
   # MT5's minimum order is 0.01 lot (~$1,000 EURUSD, ~$4,000 gold) — far above
   # max_position_pct of a small trading balance. false: skip such trades.
   # true: trade the minimum lot anyway (only sensible on a demo account).
@@ -168,7 +140,7 @@ strategy:
   # several strategies agree, so a naive "3 out of 5" (0.6) threshold is
   # unreachable and silently produces zero trades. 0.18 sits near the 95th
   # percentile of observed scores: selective, but not unreachable.
-  min_signal_score: 0.18
+  min_signal_score: 0.12
   min_aggregator_confidence: 0.25   # SignalAggregator conflict-veto gate (0..1)
   # Bars after entry before trend-reversal/MACD-cross/channel-break exits can
   # fire. Without this, a position entered on e.g. an EMA crossover gets
@@ -176,8 +148,8 @@ strategy:
   # measured on real data, this was closing nearly every trade within a few
   # bars at a small loss before the fixed stop-loss/take-profit ever mattered.
   # The fixed stop-loss stays active immediately regardless of this gate.
-  min_bars_before_signal_exit: 2
-  enable_shorts: true
+  min_bars_before_signal_exit: 3
+  enable_shorts: false
 
   # --- Trend-Following ---
   donchian_period: 20            # Donchian channel lookback (turtle trading)
@@ -215,17 +187,17 @@ strategy:
   # Weights are normalized and adapted automatically by market regime
   weights:
     # Trend-Following (6 strategies)
-    ema_crossover: 0.08
-    macd: 0.07
+    ema_crossover: 0.10
+    macd: 0.10
     ichimoku: 0.06
-    supertrend: 0.07
+    supertrend: 0.10
     donchian: 0.04
-    adx_filtered: 0.03
+    adx_filtered: 0.05
     # Mean Reversion (4 strategies)
-    bollinger: 0.05
-    rsi_divergence: 0.05
+    bollinger: 0.03
+    rsi_divergence: 0.03
     vwap_reversion: 0.04
-    zscore_reversion: 0.04
+    zscore_reversion: 0.03
     # Momentum (1 strategy)
     momentum: 0.07
     # Breakout (3 strategies)
