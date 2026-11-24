@@ -310,3 +310,17 @@ reporting:
   # without them cannot be read: red from a bot that was up is an edge
   # problem, red from a bot that was restarting is an infrastructure problem,
   # and they need opposite responses.
+
+# Crypto research modules (backtest only; NOT wired into live execution).
+# Read by scripts/run_crypto_backtest.py. Keys map 1:1 to the dataclass fields in
+# strategy/funding_carry.py (CarryConfig) and strategy/crypto_trend.py (TrendConfig).
+crypto_modules:
+  carry:
+    entry_apr_pct: 12.0
+    exit_apr_pct: 3.0
+    taker_fee_bps: 10.0
+    leverage: 2.0
+  trend:
+    risk_per_trade_pct: 0.75
+    max_leverage: 1.0
+    fee_bps: 10.0
