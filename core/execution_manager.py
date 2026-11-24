@@ -202,7 +202,7 @@ class ExecutionManager:
                        order_id=client_order_id,
                        stop_loss=stop_price,
                        take_profit=target_price,
-                       risk_pct=CONFIG["risk"]["max_position_pct"],
+                       risk_pct=self.risk.cfg.get("max_position_pct", 0.0),
                        proposed_amount=proposed_amount)
 
         # Rich notification

@@ -42,7 +42,8 @@ def run_backtest(df: pd.DataFrame, initial_balance: float = 1000.0,
                   use_aggregator: bool = True,
                   min_aggregator_confidence: float = 0.3,
                   trailing_activate_pct: float = 1.5,
-                  trailing_distance_pct: float = 1.0) -> dict:
+                  trailing_distance_pct: float = 1.0,
+                  symbol: str = "") -> dict:
     cfg = cfg or {}
     aggregator = SignalAggregator(cfg) if use_aggregator else None
 
@@ -69,7 +70,7 @@ def run_backtest(df: pd.DataFrame, initial_balance: float = 1000.0,
                 aggregator=aggregator,
                 min_aggregator_confidence=min_aggregator_confidence,
                 _df_has_indicators=True,
-                symbol=symbol if 'symbol' in locals() else "",
+                symbol=symbol,
             )
             if signal:
                 side = signal["side"]
