@@ -366,7 +366,7 @@ def compute_indicators(df: pd.DataFrame, cfg: dict = None) -> pd.DataFrame:
 
 # --- 1. EMA Crossover (Trend-Following) ---
 def _score_ema_crossover(df: pd.DataFrame) -> tuple[float, float]:
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if prev["ema_fast"] <= prev["ema_slow"] and last["ema_fast"] > last["ema_slow"]:
@@ -389,7 +389,7 @@ def _score_ema_crossover(df: pd.DataFrame) -> tuple[float, float]:
 
 # --- 2. MACD (Trend-Following) ---
 def _score_macd(df: pd.DataFrame) -> tuple[float, float]:
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     prev2 = df.iloc[-3] if len(df) > 2 else prev
     buy, sell = 0.0, 0.0
 
@@ -411,7 +411,7 @@ def _score_macd(df: pd.DataFrame) -> tuple[float, float]:
 
 # --- 3. Ichimoku (Trend-Following) ---
 def _score_ichimoku(df: pd.DataFrame) -> tuple[float, float]:
-    last = df.iloc[-1]
+    last = _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("ichi_tenkan")) or pd.isna(last.get("ichi_senkou_a")):
@@ -432,12 +432,12 @@ def _score_ichimoku(df: pd.DataFrame) -> tuple[float, float]:
 
         if price > cloud_top and cloud_bullish:
             buy = 0.6
-            prev = df.iloc[-2]
+            prev = _row(df, -2)
             if not pd.isna(prev.get("ichi_tenkan")) and prev["ichi_tenkan"] <= prev["ichi_kijun"] and tenkan > kijun:
                 buy = 0.9
         elif price < cloud_bottom and cloud_bearish:
             sell = 0.6
-            prev = df.iloc[-2]
+            prev = _row(df, -2)
             if not pd.isna(prev.get("ichi_tenkan")) and prev["ichi_tenkan"] >= prev["ichi_kijun"] and tenkan < kijun:
                 sell = 0.9
 
@@ -446,8 +446,8 @@ def _score_ichimoku(df: pd.DataFrame) -> tuple[float, float]:
 
 # --- 4. Supertrend (Trend-Following) ---
 def _score_supertrend(df: pd.DataFrame) -> tuple[float, float]:
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last = _row(df, -1)
+    prev = _row(df, -2)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("supertrend_dir")) or pd.isna(prev.get("supertrend_dir")):
@@ -475,7 +475,7 @@ def _score_supertrend(df: pd.DataFrame) -> tuple[float, float]:
 # --- 5. Donchian Channel (Trend-Following / Turtle Trading) ---
 def _score_donchian(df: pd.DataFrame) -> tuple[float, float]:
     """Donchian channel breakout — classic turtle trading entry."""
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("dc_upper")) or pd.isna(prev.get("dc_upper")):
@@ -515,7 +515,7 @@ def _score_donchian(df: pd.DataFrame) -> tuple[float, float]:
 # --- 6. ADX Filtered (Trend-Following) ---
 def _score_adx_filtered(df: pd.DataFrame, adx_threshold: float = 25) -> tuple[float, float]:
     """ADX-filtered trend entries: only trade when ADX > threshold + directional DI confirms."""
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("adx")) or pd.isna(last.get("plus_di")):
@@ -552,7 +552,7 @@ def _score_adx_filtered(df: pd.DataFrame, adx_threshold: float = 25) -> tuple[fl
 
 # --- 7. Bollinger Bands (Mean Reversion) ---
 def _score_bollinger(df: pd.DataFrame) -> tuple[float, float]:
-    last = df.iloc[-1]
+    last = _row(df, -1)
     buy, sell = 0.0, 0.0
 
     bb_width = (last["bb_upper"] - last["bb_lower"]) / last["bb_mid"] if last["bb_mid"] > 0 else 0
@@ -578,7 +578,7 @@ def _score_bollinger(df: pd.DataFrame) -> tuple[float, float]:
 
 # --- 8. RSI Divergence (Mean Reversion) ---
 def _score_rsi(df: pd.DataFrame, overbought: int = 70, oversold: int = 30) -> tuple[float, float]:
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     prev3 = df.iloc[-4] if len(df) > 3 else prev
     buy, sell = 0.0, 0.0
 
@@ -601,7 +601,7 @@ def _score_rsi(df: pd.DataFrame, overbought: int = 70, oversold: int = 30) -> tu
 
 # --- 9. VWAP Reversion (Mean Reversion) ---
 def _score_vwap_reversion(df: pd.DataFrame) -> tuple[float, float]:
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("vwap")) or pd.isna(last.get("ema_50")):
@@ -635,8 +635,8 @@ def _score_vwap_reversion(df: pd.DataFrame) -> tuple[float, float]:
 def _score_zscore_reversion(df: pd.DataFrame, entry_threshold: float = 2.0,
                              exit_threshold: float = 0.5) -> tuple[float, float]:
     """Z-score based mean reversion: buy when z < -entry_threshold, sell when z > entry_threshold."""
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    last = _row(df, -1)
+    prev = _row(df, -2)
     buy, sell = 0.0, 0.0
 
     z = last.get("zscore")
@@ -676,7 +676,7 @@ def _score_zscore_reversion(df: pd.DataFrame, entry_threshold: float = 2.0,
 
 # --- 11. Multi-Factor Momentum (Momentum) ---
 def _score_momentum(df: pd.DataFrame) -> tuple[float, float]:
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     adx_strong = not pd.isna(last["adx"]) and last["adx"] > 25
@@ -701,7 +701,7 @@ def _score_momentum(df: pd.DataFrame) -> tuple[float, float]:
 
 # --- 12. Keltner Channel Breakout (Breakout) ---
 def _score_keltner_breakout(df: pd.DataFrame) -> tuple[float, float]:
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("kc_upper")) or pd.isna(last.get("adx")):
@@ -727,7 +727,7 @@ def _score_keltner_breakout(df: pd.DataFrame) -> tuple[float, float]:
 # --- 13. Opening Range Breakout (Breakout) ---
 def _score_opening_range_breakout(df: pd.DataFrame) -> tuple[float, float]:
     """Opening range breakout: enter when price breaks the first N-bar range."""
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("or_high")) or pd.isna(last.get("or_low")):
@@ -773,7 +773,7 @@ def _score_opening_range_breakout(df: pd.DataFrame) -> tuple[float, float]:
 # --- 14. ATR Volatility Breakout (Breakout) ---
 def _score_atr_volatility_breakout(df: pd.DataFrame, expansion_threshold: float = 1.5) -> tuple[float, float]:
     """ATR expansion triggers entry: volatility is expanding = breakout is real."""
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     atr_exp = last.get("atr_expansion")
@@ -814,7 +814,7 @@ def _score_atr_volatility_breakout(df: pd.DataFrame, expansion_threshold: float 
 # --- 15. Spread Capture / Market Making ---
 def _score_spread_capture(df: pd.DataFrame) -> tuple[float, float]:
     """Market making: identify tight range + low volatility for spread capture."""
-    last = df.iloc[-1]
+    last = _row(df, -1)
     buy, sell = 0.0, 0.0
 
     if pd.isna(last.get("bb_upper")) or pd.isna(last.get("atr")):
@@ -848,7 +848,7 @@ def _score_spread_capture(df: pd.DataFrame) -> tuple[float, float]:
 
 # --- 16. Scalping (Microstructure) ---
 def _score_scalping(df: pd.DataFrame) -> tuple[float, float]:
-    prev, last = df.iloc[-2], df.iloc[-1]
+    prev, last = _row(df, -2), _row(df, -1)
     buy, sell = 0.0, 0.0
 
     signals_buy = 0
@@ -946,7 +946,7 @@ def _score_ml_prediction(df: pd.DataFrame, ml_probability: float = None,
 # --- 19. Volatility Forecast (ML/Statistical) ---
 def _score_volatility_forecast(df: pd.DataFrame) -> tuple[float, float]:
     """GARCH-lite volatility forecast: high predicted vol = avoid/reduce, low = opportunity."""
-    last = df.iloc[-1]
+    last = _row(df, -1)
     buy, sell = 0.0, 0.0
 
     vol_fc = last.get("vol_forecast")
@@ -1100,6 +1100,28 @@ def _all_scorers(cfg: dict, sentiment_score: float = None, ml_probability: float
     ]
 
 
+
+# ---------- per-bar row cache ----------
+# Every scorer reads the last two rows. df.iloc[-1] builds a fresh Series across
+# ~55 indicator columns (~50us), and ~25 scorers x 2 rows x every bar made row
+# lookups ~85% of backtest time. Within one compute_raw_scores() call the frame
+# is read-only, so each row is materialised once and shared. Outside that call
+# _row() is a plain iloc, so behaviour elsewhere is unchanged.
+import threading as _threading
+_row_cache_tls = _threading.local()
+
+
+def _row(df, pos: int):
+    cache = getattr(_row_cache_tls, "cache", None)
+    if cache is None:
+        return df.iloc[pos]
+    key = (id(df), pos)
+    row = cache.get(key)
+    if row is None:
+        row = cache[key] = df.iloc[pos]
+    return row
+
+
 def compute_raw_scores(df: pd.DataFrame, cfg: dict = None, sentiment_score: float = None,
                         ml_probability: float = None) -> tuple[dict[str, tuple[float, float]], str]:
     """Run every sub-strategy scorer against an already-indicator-computed df.
@@ -1112,8 +1134,12 @@ def compute_raw_scores(df: pd.DataFrame, cfg: dict = None, sentiment_score: floa
     """
     cfg = cfg or {}
     raw_scores = {}
-    for name, scorer in _all_scorers(cfg, sentiment_score, ml_probability):
-        raw_scores[name] = scorer(df)
+    _row_cache_tls.cache = {}
+    try:
+        for name, scorer in _all_scorers(cfg, sentiment_score, ml_probability):
+            raw_scores[name] = scorer(df)
+    finally:
+        _row_cache_tls.cache = None
     regime = _current_regime(df, default="unknown")
     return raw_scores, regime
 

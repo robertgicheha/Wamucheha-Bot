@@ -51,9 +51,13 @@ def evaluate(df, risk_fraction_of_balance: float, trading_balance: float,
     if signal is None:
         return None
 
-    strategies = [k for k, v in raw_scores.items() if v > 0]
+    # raw_scores maps strategy -> (buy_score, sell_score). Report the strategies
+    # that actually voted for the side being traded, using the same 0.3
+    # conviction cut-off generate_signal_ex() uses to name them.
+    side_idx = 0 if signal["side"] == "buy" else 1
+    strategies = [k for k, v in raw_scores.items() if v[side_idx] > 0.3]
     min_score = cfg.get("min_signal_score", 0.18)
-    
+
     if lstm_predictor is not None and ml_prob is not None:
         confidence = ml_prob if signal["side"] == "buy" else (1 - ml_prob)
         if confidence < ml_min_confidence:
