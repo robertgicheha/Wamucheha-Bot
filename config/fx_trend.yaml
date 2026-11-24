@@ -1,0 +1,34 @@
+# FX daily trend-following bot. Separate from config.yaml on purpose: this bot
+# is self-contained and does not share the engine's state or risk manager.
+fx_trend:
+  dry_run: true            # true = log intended trades only. Flip after demo validation.
+  magic: 774201            # only positions with this magic are ever touched
+  symbol_suffix: ""        # e.g. "m" or ".r" if your broker names EURUSDm
+  pairs: [EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, USDCHF, EURJPY, GBPJPY]
+
+  strategy:
+    sma_len: 100
+    mom_len: 90
+    atr_len: 14
+    atr_stop_mult: 3.0
+    risk_pct: 0.5          # % of equity lost if a stop is hit
+    allow_short: true
+
+  risk:
+    max_open_positions: 6
+    max_net_per_currency: 3   # blocks e.g. long EURUSD+GBPUSD+AUDUSD+NZDUSD (one USD bet)
+    daily_loss_halt_pct: 2.0
+    weekly_loss_halt_pct: 4.0
+    max_spread_pips: 3.0
+    max_lots_per_order: 1.0
+
+  schedule:
+    # Daily bars close at the broker's rollover. Each poll is cheap: it refreshes
+    # the dashboard snapshot and probes ONE bar; the full analysis only runs when
+    # a new daily bar has closed (idempotent: at most once per bar).
+    poll_seconds: 60
+    heartbeat_file: data/fx_trend_heartbeat.json
+    kill_file: data/fx_trend.KILL
+    state_file: data/fx_trend_state.json
+    snapshot_file: data/fx_trend_snapshot.json
+    journal_file: data/fx_trend.db

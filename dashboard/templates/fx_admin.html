@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FX Trend Bot Admin</title>
+<style>
+:root{
+  --bg:#0e1116;--panel:#161b22;--panel2:#1c232c;--line:#2a323d;--text:#e6edf3;--mute:#8b98a5;
+  --good:#3fb950;--bad:#f85149;--warn:#d29922;--accent:#58a6ff;--accent2:#bc8cff;
+}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){
+  --bg:#f5f7fa;--panel:#fff;--panel2:#eef1f5;--line:#d8dee6;--text:#1b2430;--mute:#5d6b7a;
+  --good:#1a7f37;--bad:#cf222e;--warn:#9a6700;--accent:#0969da;--accent2:#8250df;}}
+:root[data-theme="light"]{--bg:#f5f7fa;--panel:#fff;--panel2:#eef1f5;--line:#d8dee6;--text:#1b2430;--mute:#5d6b7a;--good:#1a7f37;--bad:#cf222e;--warn:#9a6700;--accent:#0969da;--accent2:#8250df}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+h1{font-size:16px;margin:0;font-weight:650}
+.pills{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.pill{padding:3px 10px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid var(--line);background:var(--panel2);color:var(--mute)}
+.pill.good{color:var(--good);border-color:var(--good)}.pill.bad{color:var(--bad);border-color:var(--bad)}.pill.warn{color:var(--warn);border-color:var(--warn)}
+nav{display:flex;gap:2px;overflow-x:auto;padding:0 12px;border-bottom:1px solid var(--line);background:var(--panel)}
+nav button{background:none;border:0;color:var(--mute);padding:10px 14px;cursor:pointer;font:inherit;border-bottom:2px solid transparent;white-space:nowrap}
+nav button.on{color:var(--text);border-bottom-color:var(--accent)}
+main{padding:16px;max-width:1280px;margin:0 auto}
+section{display:none}section.on{display:block}
+.grid{display:grid;gap:12px}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin-bottom:12px}
+.two{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0}
+.card h3{margin:0 0 10px;font-size:12px;font-weight:600;color:var(--mute);text-transform:uppercase;letter-spacing:.04em}
+.kpi .v{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.kpi .s{font-size:12px;color:var(--mute)}
+.pos{color:var(--good)}.neg{color:var(--bad)}.mute{color:var(--mute)}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mute);font-weight:600;font-size:12px}
+tr.click{cursor:pointer}tr.click:hover{background:var(--panel2)}
+.scroll{overflow-x:auto}
+canvas{width:100%;height:240px;display:block}
+pre.log{margin:0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;max-height:560px;overflow:auto;font:12px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:10px}
+input,select,button.btn{background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font:inherit}
+button.btn{cursor:pointer}button.btn:hover{border-color:var(--accent)}
+button.danger{border-color:var(--bad);color:var(--bad)}button.ok{border-color:var(--good);color:var(--good)}
+.bar{height:8px;border-radius:4px;background:var(--panel2);overflow:hidden;min-width:80px}.bar>i{display:block;height:100%;background:var(--accent)}
+.note{font-size:12px;color:var(--mute);margin:8px 0 0}
+.banner{padding:10px 12px;border-radius:8px;border:1px solid var(--warn);color:var(--warn);margin-bottom:12px;font-size:13px}
+#login{max-width:380px;margin:12vh auto;padding:0 16px}
+#login input{width:100%;margin:10px 0}
+#msg{margin-top:10px;min-height:20px}
+.ev{display:flex;gap:8px;padding:5px 0;border-bottom:1px solid var(--line);font-size:13px}.ev time{color:var(--mute);min-width:120px}
+.ev.ERROR b{color:var(--bad)}.ev.WARNING b{color:var(--warn)}
+</style>
+</head>
+<body>
+<div id="login" hidden>
+  <div class="card">
+    <h1>FX Trend Bot Admin</h1>
+    <p class="mute">Enter the admin token (FX_ADMIN_TOKEN).</p>
+    <input id="tok" type="password" autocomplete="current-password" placeholder="Admin token">
+    <button class="btn ok" id="go">Sign in</button>
+    <div id="loginerr" class="neg"></div>
+  </div>
+</div>
+
+<div id="app" hidden>
+<header>
+  <h1>FX Trend Bot &middot; Admin</h1>
+  <div class="pills">
+    <span class="pill" id="p-bot">bot</span><span class="pill" id="p-mode">mode</span>
+    <span class="pill" id="p-halt">entries</span><span class="pill" id="p-err">errors</span>
+    <span class="pill mute" id="p-ref">-</span>
+    <button class="btn" id="theme" title="Toggle theme">&#9680;</button>
+    <button class="btn" id="out">Sign out</button>
+  </div>
+</header>
+<nav id="tabs"></nav>
+<main>
+<section id="t-overview">
+  <div id="banner"></div>
+  <div class="grid kpis" id="k-over"></div>
+  <div class="grid two">
+    <div class="card"><h3>Equity</h3><canvas id="c-eq"></canvas></div>
+    <div class="card"><h3>Drawdown %</h3><canvas id="c-dd"></canvas></div>
+  </div>
+  <div class="grid two" style="margin-top:12px">
+    <div class="card"><h3>Bot health</h3><div id="health"></div></div>
+    <div class="card"><h3>Recent activity</h3><div id="recent"></div></div>
+  </div>
+</section>
+
+<section id="t-positions"><div class="card"><h3>Open positions (this bot only)</h3><div class="scroll" id="tb-pos"></div><p class="note" id="pos-note"></p></div></section>
+
+<section id="t-trades"><div class="card"><h3>Closed trades</h3>
+  <div class="row"><select id="tr-pair"><option value="">All pairs</option></select></div>
+  <div class="scroll" id="tb-trades"></div></div></section>
+
+<section id="t-signals">
+  <div class="card"><h3>Latest signals (closed daily bar)</h3><div class="scroll" id="tb-sig"></div>
+  <p class="note">Click a pair for its close vs SMA history. Signal: long if close &gt; SMA and momentum &gt; 0, short if both &lt; 0, otherwise flat. Strength = distance from SMA in ATRs.</p></div>
+  <div class="card" style="margin-top:12px"><h3 id="sig-title">Select a pair</h3><canvas id="c-sig"></canvas></div>
+</section>
+
+<section id="t-analysis">
+  <div class="grid kpis" id="k-ana"></div>
+  <div class="grid two">
+    <div class="card"><h3>Monthly net P&amp;L</h3><canvas id="c-month"></canvas></div>
+    <div class="card"><h3>By pair</h3><div class="scroll" id="tb-bypair"></div><div id="bysd" class="note"></div></div>
+  </div>
+</section>
+
+<section id="t-predictive">
+  <div class="banner" id="disc"></div>
+  <div class="grid two">
+    <div class="card"><h3>Equity fan: next 60 trades (5th / median / 95th pct)</h3><canvas id="c-proj"></canvas><div id="proj-sum" class="note"></div></div>
+    <div class="card"><h3>Market regime</h3><div id="regime"></div><h3 style="margin-top:14px">Net currency exposure (open positions)</h3><div id="ccy"></div></div>
+  </div>
+  <div class="card" style="margin-top:12px"><h3>Chance each pair changes state</h3><div class="scroll" id="tb-flip"></div>
+    <p class="note">Probability price touches the level that would flip the signal (flat &harr; long/short) within 5 / 20 days, assuming a driftless random walk with volatility from ATR.</p></div>
+</section>
+
+<section id="t-backtest"><div id="bt"></div></section>
+
+<section id="t-logs"><div class="card">
+  <div class="row">
+    <select id="lg-file"><option value="errors">Error log (WARNING+)</option><option value="bot">Bot log (INFO+)</option><option value="console">Console (stdout/stderr)</option></select>
+    <select id="lg-level"><option value="">All levels</option><option>WARNING</option><option>ERROR</option></select>
+    <input id="lg-q" placeholder="filter text"><select id="lg-n"><option>200</option><option>500</option><option>1000</option></select>
+    <label><input type="checkbox" id="lg-auto" checked> auto-refresh</label>
+    <span class="mute" id="lg-info"></span>
+  </div><pre class="log" id="lg-out"></pre></div>
+  <div class="card" style="margin-top:12px"><h3>Event journal</h3><div id="ev-all"></div></div>
+</section>
+
+<section id="t-control">
+  <div class="card"><h3>Process control</h3>
+    <div class="row" id="ctl-status"></div>
+    <div class="row">
+      <button class="btn ok" data-a="start" data-m="dry_run">Start (dry-run)</button>
+      <button class="btn" data-a="start" data-m="orders">Start with orders&hellip;</button>
+      <button class="btn" data-a="stop">Stop (keep positions)</button>
+      <button class="btn" data-a="restart" data-m="dry_run">Restart (dry-run)</button>
+      <button class="btn" data-a="restart" data-m="orders">Restart with orders&hellip;</button>
+    </div>
+    <div class="row">
+      <button class="btn danger" data-a="flatten">Flatten all &amp; stop&hellip;</button>
+      <button class="btn" data-a="clear_kill">Clear kill file</button>
+    </div>
+    <p class="note"><b>Stop</b> exits the bot but leaves open positions; their stop-losses stay at the broker.
+    <b>Flatten</b> closes every position this bot owns, then stops, and leaves a kill file so it does not restart by accident.
+    The dashboard cannot enable trading on a live account: that needs CLI flags on the bot.</p>
+    <div id="msg"></div></div>
+</section>
+
+<section id="t-config"><div class="card"><h3>config/fx_trend.yaml (read-only)</h3><pre class="log" id="cfg"></pre>
+<p class="note">Edit the file on the server, then Restart. Changes are not applied to a running bot.</p></div></section>
+</main>
+</div>
+
+<script>
+"use strict";
+const $ = (s, r=document) => r.querySelector(s);
+const TABS = [["overview","Overview"],["positions","Positions"],["trades","Trades"],["signals","Signals"],
+  ["analysis","Analysis"],["predictive","Predictive"],["backtest","Backtest"],["logs","Logs"],["control","Control"],["config","Config"]];
+let TOKEN = sessionStorage.getItem("fxtok") || "", TAB = "overview", TIMER = null;
+
+// ---------- helpers ----------
+function el(tag, attrs={}, kids=[]) {
+  const e = document.createElement(tag);
+  for (const [k,v] of Object.entries(attrs)) { if (k==="class") e.className=v; else if (k==="text") e.textContent=v; else e.setAttribute(k,v); }
+  for (const c of [].concat(kids)) if (c!=null) e.append(c.nodeType ? c : document.createTextNode(c));
+  return e;
+}
+const fmt = (n, d=2) => n==null || isNaN(n) ? "-" : Number(n).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d});
+const pct = (n, d=2) => n==null ? "-" : (n>0?"+":"")+fmt(n,d)+"%";
+const sgn = n => n>0?"pos":n<0?"neg":"mute";
+const when = s => s ? s.replace("T"," ").slice(0,16) : "-";
+function kpi(label, value, sub, cls="") {
+  return el("div",{class:"card kpi"},[el("h3",{text:label}),el("div",{class:"v "+cls,text:value}),el("div",{class:"s",text:sub||""})]);
+}
+function table(cols, rows, onclick) {
+  const t = el("table"), th = el("tr");
+  cols.forEach(c => th.append(el("th",{text:c.h})));
+  t.append(el("thead",{},th));
+  const tb = el("tbody");
+  rows.forEach(r => {
+    const tr = el("tr", onclick ? {class:"click"} : {});
+    cols.forEach(c => { const v = c.f(r); tr.append(v && v.nodeType ? v : el("td",{class:c.cls?c.cls(r):"",text:v==null?"-":String(v)})); });
+    if (onclick) tr.onclick = () => onclick(r);
+    tb.append(tr);
+  });
+  t.append(tb);
+  if (!rows.length) return el("p",{class:"mute",text:"Nothing yet."});
+  return t;
+}
+function cell(text, cls="") { return el("td",{class:cls,text}); }
+function colors() { const s = getComputedStyle(document.documentElement); const g = n => s.getPropertyValue(n).trim();
+  return {text:g("--text"),mute:g("--mute"),line:g("--line"),good:g("--good"),bad:g("--bad"),accent:g("--accent"),accent2:g("--accent2"),warn:g("--warn")}; }
+
+// ---------- tiny canvas charts ----------
+function setup(cv) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w*dpr; cv.height = h*dpr;
+  const g = cv.getContext("2d"); g.setTransform(dpr,0,0,dpr,0,0); g.clearRect(0,0,w,h);
+  return {g,w,h};
+}
+function lineChart(cv, labels, series, opts={}) {
+  const {g,w,h} = setup(cv), C = colors(), pad = {l:52,r:10,t:8,b:22};
+  const all = series.flatMap(s => s.values).filter(v => v!=null && isFinite(v));
+  if (!all.length) { g.fillStyle=C.mute; g.fillText("No data yet",12,24); return; }
+  let lo = Math.min(...all), hi = Math.max(...all); if (lo===hi) { lo-=1; hi+=1; }
+  const padv = (hi-lo)*0.06; lo -= padv; hi += padv;
+  const n = labels.length, X = i => pad.l + (n<2?0:i/(n-1))*(w-pad.l-pad.r), Y = v => pad.t + (1-(v-lo)/(hi-lo))*(h-pad.t-pad.b);
+  g.strokeStyle = C.line; g.fillStyle = C.mute; g.font = "11px system-ui"; g.lineWidth = 1;
+  for (let k=0;k<=4;k++) { const v = lo+(hi-lo)*k/4, y = Y(v); g.beginPath(); g.moveTo(pad.l,y); g.lineTo(w-pad.r,y); g.stroke();
+    g.fillText((opts.pct? v.toFixed(1)+"%" : fmt(v, hi-lo>100?0:2)), 4, y+4); }
+  [0, Math.floor((n-1)/2), n-1].forEach(i => { if (labels[i]!=null) { g.textAlign = i===0?"left":i===n-1?"right":"center"; g.fillText(String(labels[i]).slice(0,10), X(i), h-6); } });
+  g.textAlign = "left";
+  if (opts.band) { g.fillStyle = opts.band.color; g.globalAlpha = .18; g.beginPath();
+    opts.band.hi.forEach((v,i)=>{ i?g.lineTo(X(i),Y(v)):g.moveTo(X(i),Y(v)); });
+    for (let i=opts.band.lo.length-1;i>=0;i--) g.lineTo(X(i),Y(opts.band.lo[i])); g.closePath(); g.fill(); g.globalAlpha = 1; }
+  if (opts.zero && lo<0 && hi>0) { g.strokeStyle = C.mute; g.setLineDash([4,4]); g.beginPath(); g.moveTo(pad.l,Y(0)); g.lineTo(w-pad.r,Y(0)); g.stroke(); g.setLineDash([]); }
+  series.forEach(s => { g.strokeStyle = s.color; g.lineWidth = s.width||1.8; g.setLineDash(s.dash||[]); g.beginPath(); let st=false;
+    s.values.forEach((v,i)=>{ if (v==null) return; st ? g.lineTo(X(i),Y(v)) : (g.moveTo(X(i),Y(v)), st=true); }); g.stroke(); g.setLineDash([]); });
+  if (series.length>1) { let x = pad.l+4; series.forEach(s => { g.fillStyle=s.color; g.fillRect(x,pad.t+2,10,3); g.fillStyle=C.mute; g.fillText(s.name,x+14,pad.t+8); x += 24+g.measureText(s.name).width; }); }
+}
+function barChart(cv, labels, values) {
+  const {g,w,h} = setup(cv), C = colors(), pad = {l:52,r:10,t:8,b:22};
+  if (!values.length) { g.fillStyle=C.mute; g.fillText("No data yet",12,24); return; }
+  const lo = Math.min(0,...values), hi = Math.max(0,...values) || 1, Y = v => pad.t + (1-(v-lo)/(hi-lo||1))*(h-pad.t-pad.b);
+  const bw = (w-pad.l-pad.r)/values.length;
+  g.font = "11px system-ui"; g.fillStyle = C.mute; g.strokeStyle = C.line;
+  g.beginPath(); g.moveTo(pad.l,Y(0)); g.lineTo(w-pad.r,Y(0)); g.stroke(); g.fillText(fmt(hi,0),4,Y(hi)+10); g.fillText(fmt(lo,0),4,Y(lo));
+  values.forEach((v,i)=>{ g.fillStyle = v>=0?C.good:C.bad; const y0 = Y(0), y1 = Y(v);
+    g.fillRect(pad.l+i*bw+bw*.15, Math.min(y0,y1), bw*.7, Math.abs(y1-y0)||1);
+    if (values.length<=14 || i%Math.ceil(values.length/10)===0) { g.fillStyle=C.mute; g.fillText(labels[i].slice(2),pad.l+i*bw,h-6); } });
+}
+
+// ---------- api ----------
+async function api(path, opts={}) {
+  const r = await fetch(path, {...opts, headers:{"X-Admin-Token":TOKEN,"Content-Type":"application/json",...(opts.headers||{})}});
+  if (r.status===401 || r.status===429) { const d = await r.json().catch(()=>({})); showLogin(d.detail||"Unauthorized"); throw new Error("auth"); }
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok && !(data && data.message)) throw new Error(data.detail || r.statusText);
+  return data;
+}
+function showLogin(err="") { $("#app").hidden = true; $("#login").hidden = false; $("#loginerr").textContent = err; clearInterval(TIMER); }
+function showApp() { $("#login").hidden = true; $("#app").hidden = false; refresh(); TIMER = setInterval(refresh, 15000); }
+
+// ---------- renderers ----------
+async function rOverview() {
+  const d = await api("/api/overview"), b = d.bot, s = d.snapshot||{}, a = s.account||{}, p = d.performance||{}, lc = d.last_cycle||{}, st = d.state||{};
+  // header pills
+  const pb = $("#p-bot"); pb.textContent = b.running ? (b.health==="healthy"?"BOT RUNNING":"BOT UNRESPONSIVE") : "BOT STOPPED";
+  pb.className = "pill " + (b.running ? (b.health==="healthy"?"good":"warn") : "bad");
+  const pm = $("#p-mode"); const mode = (b.heartbeat||{}).mode || s.mode;
+  pm.textContent = mode==="orders" ? "ORDERS ENABLED" : mode==="dry_run" ? "DRY-RUN" : "MODE ?"; pm.className = "pill " + (mode==="orders"?"warn":"");
+  const ph = $("#p-halt"); const halted = !!s.halted; ph.textContent = halted ? "ENTRIES HALTED" : "ENTRIES OK"; ph.className = "pill " + (halted?"bad":"good");
+  const pe = $("#p-err"); pe.textContent = d.errors_24h + " errors / 24h"; pe.className = "pill " + (d.errors_24h?"bad":"good");
+  // banners
+  const bn = $("#banner"); bn.replaceChildren();
+  if (b.kill_file_present) bn.append(el("div",{class:"banner",text:"Kill file present: the bot will flatten and exit as soon as it runs. Clear it on the Control tab to allow starting."}));
+  if (b.running && b.health!=="healthy") bn.append(el("div",{class:"banner",text:"Bot process is alive but its heartbeat is stale ("+b.heartbeat_age_s+"s). Check the error log."}));
+  if (d.snapshot_age_s!=null && d.snapshot_age_s>300 && b.running) bn.append(el("div",{class:"banner",text:"Account snapshot is "+d.snapshot_age_s+"s old: MT5 may be disconnected."}));
+  // KPIs
+  const k = $("#k-over"); k.replaceChildren(
+    kpi("Equity", a.equity!=null ? fmt(a.equity)+" "+(a.currency||"") : "-", a.server ? a.server+" #"+a.login : "no snapshot"),
+    kpi("Floating P&L", fmt(s.floating_pnl||0), (s.positions||[]).length+" open", sgn(s.floating_pnl||0)),
+    kpi("Today", pct(lc.daily_pct), "limit -2%", sgn(lc.daily_pct||0)),
+    kpi("This week", pct(lc.weekly_pct), "limit -4%", sgn(lc.weekly_pct||0)),
+    kpi("Net P&L (closed)", fmt(p.net_pnl||0), (p.n_trades||0)+" trades", sgn(p.net_pnl||0)),
+    kpi("Win rate", p.win_rate!=null ? fmt(p.win_rate*100,1)+"%" : "-", "PF "+(p.profit_factor??"-")),
+    kpi("Max drawdown", p.max_drawdown_pct!=null ? fmt(p.max_drawdown_pct)+"%" : "-", "now "+(p.current_drawdown_pct!=null?fmt(p.current_drawdown_pct)+"%":"-"), "neg"));
+  // charts
+  const eq = d.equity; lineChart($("#c-eq"), eq.map(x=>x.t), [{name:"equity",values:eq.map(x=>x.v),color:colors().accent}]);
+  let peak = -Infinity; const dd = eq.map(x => (peak = Math.max(peak,x.v), (x.v/peak-1)*100));
+  lineChart($("#c-dd"), eq.map(x=>x.t), [{name:"drawdown",values:dd,color:colors().bad}], {pct:true, zero:true});
+  // health
+  $("#health").replaceChildren(table([{h:"",f:r=>r[0]},{h:"",f:r=>r[1]}], [
+    ["Process", b.running ? "running (pid "+b.pid+")" : "stopped"], ["Heartbeat", b.heartbeat_age_s!=null ? b.heartbeat_age_s+"s ago" : "none"],
+    ["Last result", (b.heartbeat||{}).last_result||"-"], ["Last bar processed", st.last_bar||"-"], ["Last decision cycle", when(st.last_run)],
+    ["Snapshot age", d.snapshot_age_s!=null ? d.snapshot_age_s+"s" : "-"], ["Margin / free", a.margin!=null ? fmt(a.margin)+" / "+fmt(a.free_margin) : "-"]]));
+  $("#recent").replaceChildren(...(d.events.length ? d.events.map(evRow) : [el("p",{class:"mute",text:"No activity yet."})]));
+}
+function evRow(e) { return el("div",{class:"ev "+e.level},[el("time",{text:when(e.ts)}),el("b",{text:e.level==="INFO"?"":e.level+" "}),el("span",{text:(e.message||"")})]); }
+
+async function rPositions() {
+  const d = await api("/api/positions");
+  $("#tb-pos").replaceChildren(table([
+    {h:"Pair",f:r=>r.pair},{h:"Side",f:r=>r.side>0?"LONG":"SHORT",cls:r=>r.side>0?"pos":"neg"},{h:"Lots",f:r=>r.volume},
+    {h:"Entry",f:r=>fmt(r.entry,5)},{h:"Price",f:r=>fmt(r.price,5)},{h:"Stop",f:r=>fmt(r.sl,5)},{h:"To stop",f:r=>r.dist_to_sl_pct!=null?fmt(r.dist_to_sl_pct)+"%":"-"},
+    {h:"P&L",f:r=>fmt(r.profit),cls:r=>sgn(r.profit)},{h:"Opened",f:r=>when(r.open_time)}], d.positions));
+  $("#pos-note").textContent = d.ts ? "Snapshot "+(d.age_s)+"s ago · floating P&L "+fmt(d.floating_pnl) : "No snapshot yet: start the bot.";
+}
+let TRADES = [];
+async function rTrades() {
+  TRADES = (await api("/api/trades")).trades;
+  const sel = $("#tr-pair"), cur = sel.value, pairs = [...new Set(TRADES.map(t=>t.pair))].sort();
+  sel.replaceChildren(el("option",{value:"",text:"All pairs"}), ...pairs.map(p=>el("option",{value:p,text:p}))); sel.value = cur;
+  drawTrades();
+}
+function drawTrades() {
+  const f = $("#tr-pair").value, rows = TRADES.filter(t=>!f||t.pair===f), net = t => t.profit+(t.commission||0)+(t.swap||0);
+  $("#tb-trades").replaceChildren(table([
+    {h:"Pair",f:r=>r.pair},{h:"Side",f:r=>r.side>0?"LONG":"SHORT",cls:r=>r.side>0?"pos":"neg"},{h:"Lots",f:r=>r.volume},
+    {h:"Entry",f:r=>fmt(r.entry,5)},{h:"Exit",f:r=>fmt(r.exit,5)},{h:"Net P&L",f:r=>fmt(net(r)),cls:r=>sgn(net(r))},
+    {h:"Opened",f:r=>when(r.open_time)},{h:"Closed",f:r=>when(r.close_time)}], rows));
+}
+async function rSignals() {
+  const d = await api("/api/signals");
+  $("#tb-sig").replaceChildren(table([
+    {h:"Pair",f:r=>r.pair},{h:"Signal",f:r=>r.side>0?"LONG":r.side<0?"SHORT":"FLAT",cls:r=>r.side>0?"pos":r.side<0?"neg":"mute"},
+    {h:"Close",f:r=>fmt(r.close,5)},{h:"SMA",f:r=>fmt(r.sma,5)},{h:"Strength (ATR)",f:r=>fmt(r.strength)},
+    {h:"Momentum",f:r=>pct(r.mom*100)},{h:"ATR",f:r=>fmt(r.atr,5)},{h:"Bar",f:r=>r.bar}], d.signals, r => sigPair(r.pair)));
+}
+async function sigPair(pair) {
+  const d = await api("/api/signals?pair="+encodeURIComponent(pair)); $("#sig-title").textContent = pair+": close vs SMA";
+  const h = d.history; lineChart($("#c-sig"), h.map(x=>x.bar), [{name:"close",values:h.map(x=>x.close),color:colors().accent},{name:"SMA",values:h.map(x=>x.sma),color:colors().warn,dash:[5,4]}]);
+}
+async function rAnalysis() {
+  const d = await api("/api/analysis"), k = $("#k-ana");
+  k.replaceChildren(
+    kpi("Net P&L", fmt(d.net_pnl||0), d.n_trades+" trades", sgn(d.net_pnl||0)), kpi("Win rate", d.win_rate!=null?fmt(d.win_rate*100,1)+"%":"-", "avg win "+fmt(d.avg_win||0)+" / loss "+fmt(d.avg_loss||0)),
+    kpi("Profit factor", d.profit_factor ?? "-", "expectancy "+fmt(d.expectancy||0)+"/trade"), kpi("Best / worst", fmt(d.best||0)+" / "+fmt(d.worst||0), ""),
+    kpi("Streaks", (d.max_win_streak||0)+"W / "+(d.max_loss_streak||0)+"L", "max consecutive"), kpi("Avg hold", d.avg_hold_days!=null?d.avg_hold_days+" d":"-", ""),
+    kpi("Max drawdown", d.max_drawdown_pct!=null?fmt(d.max_drawdown_pct)+"%":"-", "return "+(d.return_pct!=null?pct(d.return_pct):"-"), "neg"));
+  const m = d.by_month||[]; barChart($("#c-month"), m.map(x=>x.month), m.map(x=>x.net));
+  $("#tb-bypair").replaceChildren(table([{h:"Pair",f:r=>r.pair},{h:"Trades",f:r=>r.trades},{h:"Win %",f:r=>fmt(r.win_rate*100,0)},{h:"Net",f:r=>fmt(r.net),cls:r=>sgn(r.net)}], d.by_pair||[]));
+  $("#bysd").textContent = d.by_side ? "Long net "+fmt(d.by_side.long||0)+" · Short net "+fmt(d.by_side.short||0) : "";
+}
+async function rPredictive() {
+  const d = await api("/api/predictive"), pr = d.projection, C = colors();
+  $("#disc").textContent = d.disclaimer;
+  if (pr.ok) { const n = pr.horizon_trades, lab = Array.from({length:n},(_,i)=>"#"+(i+1));
+    lineChart($("#c-proj"), lab, [{name:"median",values:pr.p50.map(v=>v*100),color:C.accent},{name:"5th",values:pr.p5.map(v=>v*100),color:C.bad,dash:[4,4],width:1.2},{name:"95th",values:pr.p95.map(v=>v*100),color:C.good,dash:[4,4],width:1.2}],
+      {pct:true, zero:true, band:{lo:pr.p5.map(v=>v*100),hi:pr.p95.map(v=>v*100),color:C.accent}});
+    $("#proj-sum").textContent = "Source: "+pr.source+" ("+pr.n_trades_used+" trades) · P(loss) "+fmt(pr.prob_loss*100,0)+"% · P(drawdown>5%) "+fmt(pr.prob_dd_gt_5pct*100,0)+"% · P(drawdown>10%) "+fmt(pr.prob_dd_gt_10pct*100,0)+"% · expectancy "+fmt(pr.expectancy_per_trade*100,3)+"%/trade";
+  } else { lineChart($("#c-proj"), [], []); $("#proj-sum").textContent = pr.reason; }
+  const g = d.regime; $("#regime").replaceChildren(table([{h:"",f:r=>r[0]},{h:"",f:r=>r[1]}], [["Long / Short / Flat", g.long+" / "+g.short+" / "+g.flat],["Trend breadth", g.trend_breadth_pct+"% of pairs trending"],["Avg strength", g.avg_abs_strength_atr+" ATR from SMA"]]));
+  const ccy = Object.entries(d.currency_net).filter(([,v])=>v!==0);
+  $("#ccy").replaceChildren(ccy.length ? table([{h:"Currency",f:r=>r[0]},{h:"Net legs",f:r=>(r[1]>0?"+":"")+r[1],cls:r=>sgn(r[1])}], ccy) : el("p",{class:"mute",text:"No open exposure."}));
+  $("#tb-flip").replaceChildren(table([
+    {h:"Pair",f:r=>r.pair},{h:"Signal",f:r=>r.side>0?"LONG":r.side<0?"SHORT":"FLAT",cls:r=>r.side>0?"pos":r.side<0?"neg":"mute"},
+    {h:"Upper level",f:r=>fmt(r.up_level,5)},{h:"Lower level",f:r=>fmt(r.dn_level,5)},
+    {h:"Change in 5d",f:r=>{const td=el("td"); td.append(el("div",{class:"bar"},el("i",{style:"width:"+Math.round(r.p_flip_5d*100)+"%"})),fmt(r.p_flip_5d*100,0)+"%"); return td;}},
+    {h:"Change in 20d",f:r=>{const td=el("td"); td.append(el("div",{class:"bar"},el("i",{style:"width:"+Math.round(r.p_flip_20d*100)+"%"})),fmt(r.p_flip_20d*100,0)+"%"); return td;}}], d.flips));
+}
+async function rBacktest() {
+  const d = await api("/api/backtest"), box = $("#bt"); box.replaceChildren();
+  if (!d.generated) { box.append(el("div",{class:"card"},el("p",{class:"mute",text:"No backtest report yet. Run: python scripts/run_fx_trend_backtest.py --csv-dir <dir> --holdout-start 2022-01-01  (or --mt5)"}))); return; }
+  const s = d.evaluated||{}, kp = el("div",{class:"grid kpis"},[
+    kpi("Return", pct(s.total_return_pct), (d.holdout_start?"holdout from "+d.holdout_start:"full period (in-sample)"), sgn(s.total_return_pct)),
+    kpi("CAGR", pct(s.cagr_pct), "", sgn(s.cagr_pct)), kpi("Max drawdown", fmt(s.max_drawdown_pct)+"%", "", "neg"), kpi("Sharpe", s.sharpe, ""),
+    kpi("Trades", s.n_trades, "win "+s.win_rate_pct+"% · PF "+(s.profit_factor??"-"))]);
+  const cv = el("canvas"); box.append(kp, el("div",{class:"card"},[el("h3",{text:"Backtest equity (source: "+d.source+", generated "+when(d.generated)+")"}),cv]));
+  lineChart(cv, d.equity.map(x=>x.t), [{name:"equity",values:d.equity.map(x=>x.v),color:colors().accent}]);
+  const mc = d.monte_carlo||{};
+  box.append(el("div",{class:"grid two",style:"margin-top:12px"},[
+    el("div",{class:"card"},[el("h3",{text:"Monte Carlo"}),table([{h:"",f:r=>r[0]},{h:"",f:r=>r[1]}],Object.entries(mc))]),
+    el("div",{class:"card"},[el("h3",{text:"Parameter sensitivity"}),el("div",{class:"scroll"},table([{h:"SMA/Mom/ATRx",f:r=>r.sma+"/"+r.mom+"/"+r.atr_mult},{h:"CAGR %",f:r=>r.cagr_pct,cls:r=>sgn(r.cagr_pct)},{h:"Max DD %",f:r=>r.max_drawdown_pct},{h:"Trades",f:r=>r.n_trades}], d.sensitivity||[])),
+      el("p",{class:"note",text:"If only one row is profitable the edge is fragile. In-sample: "+JSON.stringify(d.in_sample||{})})])]));
+}
+async function rLogs() {
+  const q = new URLSearchParams({file:$("#lg-file").value, lines:$("#lg-n").value, q:$("#lg-q").value, level:$("#lg-level").value});
+  const d = await api("/api/logs?"+q), out = $("#lg-out"), atBottom = out.scrollHeight-out.scrollTop-out.clientHeight < 40;
+  out.textContent = d.lines.length ? d.lines.join("\n") : (d.exists ? "(no matching lines)" : "(log file not created yet)");
+  if (atBottom) out.scrollTop = out.scrollHeight;
+  $("#lg-info").textContent = d.exists ? Math.round(d.size/1024)+" KB" : "";
+  const ev = (await api("/api/events?limit=150")).events; $("#ev-all").replaceChildren(...(ev.length?ev.map(evRow):[el("p",{class:"mute",text:"No events yet."})]));
+}
+async function rControl() {
+  const d = await api("/api/overview"), b = d.bot;
+  $("#ctl-status").replaceChildren(el("span",{class:"pill "+(b.running?"good":"bad"),text:b.running?"running pid "+b.pid:"stopped"}),
+    el("span",{class:"pill "+(b.kill_file_present?"bad":""),text:b.kill_file_present?"kill file present":"no kill file"}), el("span",{class:"pill",text:"heartbeat "+(b.heartbeat_age_s!=null?b.heartbeat_age_s+"s":"-")}));
+}
+async function rConfig() { $("#cfg").textContent = (await api("/api/config")).yaml || "(config/fx_trend.yaml not found)"; }
+
+const RENDER = {overview:rOverview,positions:rPositions,trades:rTrades,signals:rSignals,analysis:rAnalysis,predictive:rPredictive,backtest:rBacktest,logs:rLogs,control:rControl,config:rConfig};
+async function refresh() {
+  try { await rOverview(); if (TAB!=="overview") await RENDER[TAB](); $("#p-ref").textContent = "updated "+new Date().toLocaleTimeString(); }
+  catch (e) { if (e.message!=="auth") $("#p-ref").textContent = "error: "+e.message; }
+}
+
+// ---------- wiring ----------
+TABS.forEach(([id,name]) => { const b = el("button",{text:name,"data-t":id}); b.onclick = () => go(id); $("#tabs").append(b); });
+function go(id, noRefresh) { TAB = id; document.querySelectorAll("section").forEach(s=>s.classList.toggle("on",s.id==="t-"+id));
+  document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.t===id)); if (!noRefresh) refresh(); }
+$("#go").onclick = async () => { TOKEN = $("#tok").value.trim(); sessionStorage.setItem("fxtok",TOKEN); try { await api("/api/overview"); showApp(); } catch(e) {} };
+$("#tok").addEventListener("keydown", e => { if (e.key==="Enter") $("#go").click(); });
+$("#out").onclick = () => { sessionStorage.removeItem("fxtok"); TOKEN=""; showLogin(); };
+$("#theme").onclick = () => { const r = document.documentElement, dark = getComputedStyle(r).getPropertyValue("--bg").trim()==="#0e1116"; r.setAttribute("data-theme", dark?"light":"dark"); refresh(); };
+$("#tr-pair").onchange = drawTrades;
+["lg-file","lg-level","lg-n"].forEach(i => $("#"+i).onchange = rLogs); $("#lg-q").oninput = () => { clearTimeout(window._lq); window._lq = setTimeout(rLogs,300); };
+setInterval(() => { if (TAB==="logs" && $("#lg-auto").checked && TOKEN) rLogs().catch(()=>{}); }, 5000);
+window.addEventListener("resize", () => { clearTimeout(window._rs); window._rs = setTimeout(refresh,200); });
+document.querySelectorAll("#t-control button[data-a]").forEach(b => b.onclick = async () => {
+  const action = b.dataset.a, mode = b.dataset.m || "dry_run"; let confirm = "";
+  if (mode==="orders") { confirm = prompt('This lets the bot place REAL ORDERS (demo accounts only). Type SEND ORDERS to confirm:')||""; if (!confirm) return; }
+  if (action==="flatten") { confirm = prompt("This closes ALL positions opened by this bot and stops it. Type FLATTEN to confirm:")||""; if (!confirm) return; }
+  if (action==="stop" && !window.confirm("Stop the bot? Open positions stay open with their stop-losses at the broker.")) return;
+  const m = $("#msg"); m.className = "mute"; m.textContent = "Working…";
+  try { const r = await api("/api/control",{method:"POST",body:JSON.stringify({action,mode,confirm})}); m.className = r.ok?"pos":"neg"; m.textContent = r.message; }
+  catch(e) { m.className = "neg"; m.textContent = e.message; }
+  refresh();
+});
+go("overview", true); if (TOKEN) { api("/api/overview").then(showApp).catch(()=>showLogin()); } else showLogin();
+</script>
+</body>
+</html>
