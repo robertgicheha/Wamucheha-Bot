@@ -51,7 +51,15 @@ risk:
   max_position_pct: 3                # % of trading_balance risked on any single trade
   stop_loss_pct: 2.0                 # per-trade stop loss, always attached at order time
   take_profit_pct: 2.5               # optional per-trade target
-  profit_withdrawal_threshold: 500   # when trading_balance hits this, sweep excess to stake wallet
+  # Profit policy. "split" compounds most profit and pays you the rest: profit is
+  # balance above a high-water mark; payout_pct of it is flagged for you to
+  # withdraw and the remainder stays in the trading balance (position size is a
+  # % of that balance, so it compounds). "threshold" is the older behaviour: at
+  # profit_withdrawal_threshold, sweep everything above profit_withdrawal_keep.
+  profit_policy: split
+  payout_pct: 50                     # % of each profit slice paid out; 0 = pure compounding
+  payout_min_usd: 5                  # skip slices smaller than this (transfer fees)
+  profit_withdrawal_threshold: 500   # [threshold policy] when trading_balance hits this, sweep excess to stake wallet
   profit_withdrawal_keep: 200        # amount left in trading_balance after a sweep
   volatility_circuit_breaker_pct: 3  # pause trading if price moves this % in the window below
   volatility_window_minutes: 5

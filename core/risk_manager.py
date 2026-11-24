@@ -371,6 +371,8 @@ class RiskManager:
 
     # ---------- profit sweeping ----------
     def _maybe_sweep_profit(self):
+        if self.cfg.get("profit_policy", "threshold") == "split":
+            return self._split_profit()
         risk_state = self.state.get_risk_state()
         threshold = self.cfg["profit_withdrawal_threshold"]
         keep = self.cfg["profit_withdrawal_keep"]
@@ -397,6 +399,46 @@ class RiskManager:
                 f"(manual transfer required — the bot has no withdrawal permissions "
                 f"by design). Trading continues with {keep:.2f} USD.",
             )
+
+    def _split_profit(self):
+        """Compound most of the profit, pay out the rest.
+
+        Profit = trading_balance above `payout_baseline`, a high-water mark set
+        on first run and reset to the post-payout balance after every payout.
+        Because it is a high-water mark, a drawdown is never "paid out" as it
+        recovers: only genuinely new profit is split. `payout_pct` of that
+        profit leaves the trading balance (you withdraw it by hand; the bot has
+        no withdrawal permission) and the remainder stays in, so position
+        sizing, which is a % of trading_balance, grows with it.
+        """
+        rs = self.state.get_risk_state()
+        balance, base = rs["trading_balance"], rs.get("payout_baseline")
+        if base is None:
+            self.state.update_risk_state(payout_baseline=balance)
+            return
+        profit = balance - base
+        if profit < self.cfg.get("payout_min_usd", 5.0):
+            return
+        payout_pct = min(max(float(self.cfg.get("payout_pct", 50.0)), 0.0), 100.0)
+        payout = round(profit * payout_pct / 100.0, 2)
+        if payout <= 0:
+            self.state.update_risk_state(payout_baseline=balance)   # 0% payout: pure compounding
+            return
+        new_balance = balance - payout
+        self.state.update_risk_state(trading_balance=new_balance, payout_baseline=new_balance)
+        try:
+            self.state.record_cash_flow(
+                "sweep", payout,
+                note=f"profit split: {payout_pct:.0f}% of {profit:.2f} USD profit paid out, "
+                     f"{profit - payout:.2f} USD compounded")
+        except Exception:
+            pass
+        self.notifier.notify(
+            "profit_swept_to_stake",
+            f"Profit of {profit:.2f} USD: {payout:.2f} USD ({payout_pct:.0f}%) is yours to "
+            f"withdraw (manual transfer; the bot has no withdrawal permission by design). "
+            f"{profit - payout:.2f} USD stays in and compounds. Trading balance now "
+            f"{new_balance:.2f} USD.")
 
     # ---------- circuit breakers ----------
     def _halt(self, reason: str, until_tomorrow: bool = False):

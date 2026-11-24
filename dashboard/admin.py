@@ -164,7 +164,8 @@ def health_checks():
 
     eng = _engine_status()
     add("Engine heartbeat", eng["state"] in ("running", "halted", "standby", "starting"),
-        f"{eng['state']} (last beat {eng['heartbeat_age_seconds']}s ago)")
+        f"{eng['state']} (last beat {eng['heartbeat_age_seconds']}s ago)"
+        if eng["heartbeat_age_seconds"] is not None else f"{eng['state']} (no heartbeat file: engine never started?)")
     try:
         du = shutil.disk_usage(DATA_DIR if DATA_DIR.exists() else ROOT)
         add("Disk space", du.free / du.total > 0.10, f"{du.free / 1e9:.1f} GB free ({du.free / du.total:.0%})")

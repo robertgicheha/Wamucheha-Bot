@@ -54,11 +54,15 @@ class RiskStateRow(Base):
     daily_reset_at = Column(String, nullable=False)
     trading_halted = Column(Integer, nullable=False, default=0)
     halt_reason = Column(String, nullable=True)
+    # High-water mark for the profit-split policy: the balance as of the last
+    # payout (or first run). Profit is balance above this line.
+    payout_baseline = Column(Float, nullable=True)
     updated_at = Column(String, nullable=False)
 
     def to_dict(self) -> dict:
         return {
             "id": self.id,
+            "payout_baseline": self.payout_baseline,
             "trading_balance": self.trading_balance,
             "peak_balance": self.peak_balance,
             "consecutive_losses": self.consecutive_losses,
@@ -241,6 +245,7 @@ def _safe_migrate():
             "open_positions": {
                 "entry_fee": "REAL", "fee_rate": "REAL",
             },
+            "risk_state": {"payout_baseline": "REAL"},
         }
         for table, cols in additions.items():
             cursor = conn.execute(f"PRAGMA table_info({table})")

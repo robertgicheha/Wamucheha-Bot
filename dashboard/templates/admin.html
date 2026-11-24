@@ -133,6 +133,7 @@ let KEY = sessionStorage.getItem("adminKey") || "", tab = "overview", timer = nu
 
 const el = (tag, props = {}, ...kids) => { const e = document.createElement(tag); Object.assign(e, props); kids.flat().forEach(k => e.append(k)); return e; };
 const num = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? "–" : Number(v).toLocaleString(undefined, {maximumFractionDigits: d});
+const usd = (v, d = 2) => (v < 0 ? "-$" : "$") + num(Math.abs(v), d);
 const cls = v => v > 0 ? "ok" : v < 0 ? "bad" : "";
 function toast(m){const t=$("#toast");t.textContent=m;t.style.display="block";clearTimeout(toast._t);toast._t=setTimeout(()=>t.style.display="none",6000)}
 
@@ -162,7 +163,7 @@ function prep(c) { const d = devicePixelRatio || 1, w = c.clientWidth, h = c.cli
 function empty(g, m) { g.x.fillStyle = g.mute; g.x.font = "13px system-ui"; g.x.fillText(m, 10, 24); }
 function lineChart(id, series, labels) {
   const c = $(id), g = prep(c), {x, w, h} = g; if (!series.length || !series[0].y.length) return empty(g, "No data yet.");
-  const all = series.flatMap(s => s.y), lo = Math.min(...all), hi = Math.max(...all), span = (hi - lo) || 1, n = series[0].y.length, L = 52, B = 18;
+  const all = series.flatMap(s => s.band ? [...s.band[0], ...s.band[1]] : s.y), lo = Math.min(...all), hi = Math.max(...all), span = (hi - lo) || 1, n = series[0].y.length, L = 52, B = 18;
   const X = i => L + (n > 1 ? i / (n - 1) : 0) * (w - L - 8), Y = v => 8 + (1 - (v - lo) / span) * (h - B - 12);
   x.strokeStyle = g.line; x.fillStyle = g.mute; x.font = "11px system-ui"; x.lineWidth = 1;
   for (let k = 0; k <= 4; k++) { const v = lo + span * k / 4, yy = Y(v); x.beginPath(); x.moveTo(L, yy); x.lineTo(w - 8, yy); x.stroke(); x.fillText(num(v, 2), 2, yy + 4); }
@@ -184,11 +185,11 @@ async function loadOverview() {
   const [o, h, a, pos] = await Promise.all([api("/overview"), api("/health"), api("/analytics"), api("/positions")]);
   engPill(o.engine); const m = o.metrics, r = o.risk;
   $("#kpis").replaceChildren(
-    kpi("Trading balance", "$" + num(r.trading_balance), "peak $" + num(r.peak_balance)),
-    kpi("Today P&L", "$" + num(o.today.pnl, 4), o.today.trades + " trades", cls(o.today.pnl)),
-    kpi("All-time P&L", "$" + num(m.total_pnl, 4), (m.trades || 0) + " closed trades", cls(m.total_pnl)),
+    kpi("Trading balance", usd(r.trading_balance), "peak $" + num(r.peak_balance)),
+    kpi("Today P&L", usd(o.today.pnl, 4), o.today.trades + " trades", cls(o.today.pnl)),
+    kpi("All-time P&L", usd(m.total_pnl, 4), (m.trades || 0) + " closed trades", cls(m.total_pnl)),
     kpi("Win rate", m.trades ? m.win_rate_pct + "%" : "–", "PF " + num(m.profit_factor)),
-    kpi("Max drawdown", m.trades ? num(m.max_drawdown_pct) + "%" : "–", "$" + num(m.max_drawdown, 4), m.max_drawdown_pct < -5 ? "bad" : ""),
+    kpi("Max drawdown", m.trades ? num(m.max_drawdown_pct) + "%" : "–", usd(m.max_drawdown, 4), m.max_drawdown_pct < -5 ? "bad" : ""),
     kpi("Trading", r.trading_halted ? "HALTED" : "ACTIVE", r.halt_reason || "", r.trading_halted ? "warn" : "ok"),
     kpi("Open positions", o.open_positions, "loss streak " + (r.consecutive_losses ?? 0)),
     kpi("Uptime", dur(o.engine.uptime_seconds), (o.engine.restarts ?? "–") + " restarts"),
@@ -206,10 +207,10 @@ const bcols = [{h: "", k: "key"}, {h: "Trades", k: "trades"}, {h: "P&L", f: r =>
 async function loadAnalysis() {
   const a = await api("/analytics"), m = a.metrics, b = a.breakdowns;
   $("#mkpis").replaceChildren(
-    kpi("Expectancy / trade", "$" + num(m.expectancy, 4), "", cls(m.expectancy)), kpi("Profit factor", num(m.profit_factor), "gross win ÷ gross loss"),
+    kpi("Expectancy / trade", usd(m.expectancy, 4), "", cls(m.expectancy)), kpi("Profit factor", num(m.profit_factor), "gross win ÷ gross loss"),
     kpi("Avg win / loss", num(m.avg_win, 3) + " / " + num(m.avg_loss, 3), "payoff " + num(m.payoff_ratio)), kpi("Best / worst", num(m.best_trade, 3) + " / " + num(m.worst_trade, 3)),
     kpi("Streaks", "W" + (m.max_win_streak ?? 0) + " / L" + (m.max_loss_streak ?? 0), "current " + (m.current_streak ?? 0)), kpi("Avg hold", dur((m.avg_hold_hours ?? 0) * 3600)),
-    kpi("Fees paid", "$" + num(m.total_fees, 4)), kpi("Sharpe / trade", num(m.sharpe_per_trade, 3)));
+    kpi("Fees paid", usd(m.total_fees, 4)), kpi("Sharpe / trade", num(m.sharpe_per_trade, 3)));
   barChart("#c-sym", b.by_symbol.map(r => ({k: r.key, v: r.pnl}))); barChart("#c-hour", b.by_hour.map(r => ({k: r.key, v: r.pnl})));
   put("#b-strat", table(b.by_strategy, bcols)); put("#b-reg", table(b.by_regime, bcols)); put("#b-day", table(b.by_weekday, bcols)); put("#b-ex", table(b.by_exchange, bcols));
 }
@@ -219,10 +220,10 @@ async function loadProjection() {
   else {
     $("#pkpis").replaceChildren(
       kpi("Reliability", p.reliable ? "Usable" : "UNRELIABLE", p.note, p.reliable ? "ok" : "warn"),
-      kpi("Median outcome", "$" + num(p.median_final), "after " + p.horizon_trades + " trades from $" + num(p.start_balance)),
+      kpi("Median outcome", usd(p.median_final), "after " + p.horizon_trades + " trades from $" + num(p.start_balance)),
       kpi("Chance of being down", p.prob_loss_pct + "%", "vs. starting balance", p.prob_loss_pct > 40 ? "warn" : ""),
       kpi("Chance of breaching " + p.drawdown_limit_pct + "% drawdown", p.prob_breach_drawdown_pct + "%", "at any point", p.prob_breach_drawdown_pct > 20 ? "bad" : ""),
-      kpi("Expectancy 95% range", "$" + num(p.expectancy_ci95[0], 4) + " … $" + num(p.expectancy_ci95[1], 4), p.edge_is_positive_with_95pct_confidence ? "edge positive (95% conf.)" : "cannot rule out zero/negative edge", p.edge_is_positive_with_95pct_confidence ? "ok" : "warn"));
+      kpi("Expectancy 95% range", usd(p.expectancy_ci95[0], 4) + " … $" + num(p.expectancy_ci95[1], 4), p.edge_is_positive_with_95pct_confidence ? "edge positive (95% conf.)" : "cannot rule out zero/negative edge", p.edge_is_positive_with_95pct_confidence ? "ok" : "warn"));
     const B = p.bands; lineChart("#c-proj", [
       {band: [B.map(b => b.p5), B.map(b => b.p95)], color: cs("--acc"), y: B.map(b => b.p5)},
       {band: [B.map(b => b.p25), B.map(b => b.p75)], color: cs("--acc"), y: B.map(b => b.p25)},
