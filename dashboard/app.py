@@ -24,6 +24,7 @@ Endpoints:
   POST /api/resume            -> resume trading (auth required)
   POST /api/terminal          -> execute VPS command (auth required)
   WS   /ws                    -> real-time data streaming (trades, prices, balance)
+  GET  /admin                 -> admin console UI (API under /api/admin, key required)
   GET  /                      -> dashboard HTML UI
 """
 import json
@@ -554,8 +555,18 @@ async def websocket_endpoint(websocket: WebSocket):
         ws_manager.disconnect(websocket)
 
 
+# ---------- Admin console ----------
+from dashboard.admin import router as _admin_router  # noqa: E402
+app.include_router(_admin_router)
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(request: Request):
+    return templates.TemplateResponse(request, "admin.html")
+
+
 # ---------- Dashboard UI ----------
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request, "index.html")

@@ -486,3 +486,68 @@ class EngineHeartbeat:
 
 
 heartbeat = EngineHeartbeat()
+
+
+# ---------- error capture ----------
+# Most failures in the engine are reported with print(f"... error: {e}") inside
+# a try/except that keeps the loop alive. That is the right behaviour for the
+# loop and the wrong one for diagnosis: the message scrolls past in container
+# stdout and is gone after a rotation. install_error_capture() keeps a durable,
+# size-capped copy of every error-looking line plus uncaught exceptions, so the
+# dashboard can show "what went wrong, when, how often".
+
+ERROR_LOG = LOG_DIR / "errors.log"
+_ERROR_MAX_BYTES = 5 * 1024 * 1024
+_ERROR_WORDS = ("error", "failed", "exception", "traceback", "critical", "timed out")
+
+
+def _append_error_line(line: str):
+    try:
+        if ERROR_LOG.exists() and ERROR_LOG.stat().st_size > _ERROR_MAX_BYTES:
+            ERROR_LOG.replace(ERROR_LOG.with_suffix(".log.1"))     # keep one generation
+        with open(ERROR_LOG, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {line.rstrip()}\n")
+    except Exception:
+        pass
+
+
+class _TeeStream:
+    """Pass-through stdout/stderr wrapper that copies error-looking lines to disk."""
+
+    def __init__(self, wrapped, always: bool = False):
+        self._wrapped = wrapped
+        self._always = always          # stderr: record everything
+        self._buf = ""
+
+    def write(self, s):
+        n = self._wrapped.write(s)
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.strip() and (self._always or any(w in line.lower() for w in _ERROR_WORDS)):
+                _append_error_line(line)
+        return n
+
+    def flush(self):
+        self._wrapped.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
+
+
+def install_error_capture():
+    """Idempotent. Call once at engine start-up."""
+    import sys
+    if isinstance(sys.stdout, _TeeStream):
+        return
+    sys.stdout = _TeeStream(sys.stdout)
+    sys.stderr = _TeeStream(sys.stderr, always=True)
+    previous = sys.excepthook
+
+    def _hook(exc_type, exc, tb):
+        import traceback
+        _append_error_line("UNCAUGHT " + "".join(
+            traceback.format_exception(exc_type, exc, tb)).replace("\n", " | "))
+        previous(exc_type, exc, tb)
+
+    sys.excepthook = _hook

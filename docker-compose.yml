@@ -67,6 +67,7 @@ services:
     volumes:
     - ./config:/app/config:ro
     - engine-data:/app/data
+    - engine-control:/app/data/control   # dashboard -> engine command mailbox
     - ml-models:/app/ml/saved_models
     environment:
       # Resolves to the `mt5` service above. Leave this empty on Windows, where
@@ -101,6 +102,7 @@ services:
     - 127.0.0.1:8000:8000
     volumes:
     - engine-data:/app/data:ro
+    - engine-control:/app/data/control   # writable: the only place the dashboard can write
     - ./config:/app/config:ro
     networks:
     - trading-net
@@ -134,6 +136,8 @@ services:
     - trading-net
 volumes:
   engine-data:
+    driver: local
+  engine-control:
     driver: local
   ml-models:
     driver: local

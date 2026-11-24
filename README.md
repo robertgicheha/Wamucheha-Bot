@@ -456,3 +456,25 @@ a real exit path — not a claim that it beats the market.
 This is engineering scaffolding, not investment advice. You are responsible for
 regulatory compliance in your jurisdiction (in Kenya: Capital Markets Authority
 rules on algorithmic/forex trading apply).
+---
+
+## Admin console
+
+Open `http://<host>:8000/admin` and sign in with `DASHBOARD_SECRET_KEY`. Tabs:
+Overview (engine health, balance, KPIs, equity, positions, system checks),
+Trades, Analysis (by symbol / strategy / regime / hour / weekday / venue),
+Projection (Monte Carlo of your own trade results; flagged unreliable under 30
+trades; not a market forecast), Errors, Logs, Signals & Events, and Control.
+
+**Control actions** (halt, resume, standby, restart) are disabled until
+`DASHBOARD_SECRET_KEY` is changed from `change_me`. The dashboard never touches
+the trading DB or Docker: it drops a command file into the shared
+`engine-control` volume (`data/control`), and the engine executes it within a
+few seconds and records it in `data/control/audit.jsonl`.
+
+- **Standby** ("shutdown") halts trading and idles the engine but keeps the
+  process alive, because `restart: unless-stopped` / `Restart=always` would
+  relaunch a real exit. To stop the process itself run `docker compose stop engine`.
+- **Restart** makes the engine exit cleanly so the supervisor relaunches it.
+- Engine errors (anything printed with "error/failed/exception", plus uncaught
+  exceptions) are copied to `data/logs/errors.log` (5 MB cap) for the Errors tab.

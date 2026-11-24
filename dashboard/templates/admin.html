@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wamucheha Admin Console</title>
+<style>
+:root{--bg:#0f1419;--panel:#1a212b;--line:#2a3441;--text:#e6edf3;--mute:#8b98a8;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff}
+@media (prefers-color-scheme: light){:root{--bg:#f5f7fa;--panel:#fff;--line:#d8dee6;--text:#1c2430;--mute:#5d6b7c;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--acc:#0969da}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,sans-serif}
+header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5;flex-wrap:wrap}
+header h1{font-size:16px;margin:0;flex:1}
+nav{display:flex;gap:4px;padding:8px 16px;overflow-x:auto;border-bottom:1px solid var(--line)}
+nav button{background:none;border:1px solid transparent;color:var(--mute);padding:6px 12px;border-radius:6px;cursor:pointer;white-space:nowrap;font:inherit}
+nav button.on{color:var(--text);border-color:var(--line);background:var(--panel)}
+main{padding:16px;max-width:1300px;margin:0 auto}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
+.card h3{margin:0 0 6px;font-size:12px;color:var(--mute);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.big{font-size:22px;font-weight:650}
+.sub{color:var(--mute);font-size:12px}
+.pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;font-weight:600;border:1px solid}
+.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
+.pill.ok{border-color:var(--ok)}.pill.warn{border-color:var(--warn)}.pill.bad{border-color:var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:6px 8px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{color:var(--mute);font-weight:600;position:sticky;top:0;background:var(--panel)}
+.scroll{overflow:auto;max-height:480px}
+pre.log{margin:0;white-space:pre-wrap;word-break:break-word;font:12px/1.4 ui-monospace,Consolas,monospace;max-height:560px;overflow:auto;background:var(--bg);padding:10px;border-radius:6px;border:1px solid var(--line)}
+button.act{background:var(--panel);color:var(--text);border:1px solid var(--line);padding:8px 14px;border-radius:6px;cursor:pointer;font:inherit}
+button.act:hover{border-color:var(--acc)}
+button.danger{border-color:var(--bad);color:var(--bad)}
+input,select{background:var(--bg);color:var(--text);border:1px solid var(--line);padding:6px 9px;border-radius:6px;font:inherit}
+canvas{width:100%;height:240px;display:block}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.two{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+#login{max-width:340px;margin:12vh auto;text-align:center}
+#toast{position:fixed;bottom:16px;right:16px;background:var(--panel);border:1px solid var(--line);padding:10px 14px;border-radius:8px;display:none;max-width:360px}
+.note{background:var(--panel);border-left:3px solid var(--warn);padding:8px 12px;border-radius:4px;margin-bottom:12px;color:var(--mute)}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div id="login" class="card" hidden>
+  <h2>Admin console</h2>
+  <p class="sub">Enter the dashboard key (DASHBOARD_SECRET_KEY)</p>
+  <input id="key" type="password" placeholder="dashboard key" style="width:100%;margin-bottom:8px">
+  <button class="act" id="go" style="width:100%">Sign in</button>
+  <p id="loginerr" class="bad"></p>
+</div>
+
+<div id="app" hidden>
+<header>
+  <h1>Wamucheha Admin Console</h1>
+  <span id="engpill" class="pill">…</span>
+  <span class="sub" id="clock"></span>
+  <label class="sub"><input type="checkbox" id="auto" checked> auto-refresh 5s</label>
+  <button class="act" id="out">Sign out</button>
+</header>
+<nav id="tabs"></nav>
+<main>
+ <section id="t-overview">
+  <div class="grid" id="kpis"></div>
+  <div class="two" style="margin-top:12px">
+    <div class="card"><h3>System health</h3><div id="health"></div></div>
+    <div class="card"><h3>Equity (cumulative closed P&amp;L)</h3><canvas id="c-eq"></canvas></div>
+  </div>
+  <div class="card" style="margin-top:12px"><h3>Open positions</h3><div class="scroll" id="positions"></div></div>
+ </section>
+
+ <section id="t-trades" hidden>
+  <div class="card"><h3>Recent trades</h3><div class="scroll" id="trades" style="max-height:640px"></div></div>
+ </section>
+
+ <section id="t-analysis" hidden>
+  <div class="grid" id="mkpis"></div>
+  <div class="two" style="margin-top:12px">
+    <div class="card"><h3>P&amp;L by symbol</h3><canvas id="c-sym"></canvas></div>
+    <div class="card"><h3>P&amp;L by hour of day (UTC)</h3><canvas id="c-hour"></canvas></div>
+  </div>
+  <div class="two" style="margin-top:12px">
+    <div class="card"><h3>By strategy</h3><div class="scroll" id="b-strat"></div></div>
+    <div class="card"><h3>By market regime</h3><div class="scroll" id="b-reg"></div></div>
+    <div class="card"><h3>By weekday</h3><div class="scroll" id="b-day"></div></div>
+    <div class="card"><h3>By exchange</h3><div class="scroll" id="b-ex"></div></div>
+  </div>
+ </section>
+
+ <section id="t-predict" hidden>
+  <div class="note">Statistical projection, not a market forecast. It resamples your bot's own past trade results to show a plausible range for the next trades. With few trades it is unreliable, and the page says so.</div>
+  <div class="row"><label>Next <input id="horizon" type="number" value="50" min="5" max="500" style="width:80px"> trades</label><button class="act" id="runproj">Run projection</button></div>
+  <div class="grid" id="pkpis"></div>
+  <div class="card" style="margin-top:12px"><h3>Projected equity: median with 25–75% and 5–95% bands</h3><canvas id="c-proj" style="height:300px"></canvas></div>
+  <div class="card" style="margin-top:12px"><h3>Edge trend</h3><div id="trend"></div></div>
+ </section>
+
+ <section id="t-errors" hidden>
+  <div class="two">
+   <div class="card"><h3>Errors per hour (last 24h, oldest → newest)</h3><canvas id="c-err"></canvas></div>
+   <div class="card"><h3>Most frequent errors</h3><div class="scroll" id="toperr" style="max-height:240px"></div></div>
+  </div>
+  <div class="card" style="margin-top:12px"><div class="row"><input id="errq" placeholder="filter…"><button class="act" id="errgo">Search</button></div><pre class="log" id="errlines"></pre></div>
+ </section>
+
+ <section id="t-logs" hidden>
+  <div class="card"><div class="row"><select id="logfile"></select><input id="logq" placeholder="filter…"><input id="logn" type="number" value="300" style="width:90px"><button class="act" id="loggo">Load</button></div><pre class="log" id="loglines"></pre></div>
+ </section>
+
+ <section id="t-signals" hidden>
+  <div class="card"><h3>Recent signals, risk and system events</h3><div class="scroll" id="signals" style="max-height:640px"></div></div>
+ </section>
+
+ <section id="t-control" hidden>
+  <div class="note" id="ctlnote"></div>
+  <div class="grid">
+   <div class="card"><h3>Halt trading</h3><p class="sub">Stops new trades. Open positions keep their stops. Engine stays up.</p><button class="act danger" data-cmd="halt">Halt</button></div>
+   <div class="card"><h3>Resume</h3><p class="sub">Clears the halt and leaves standby.</p><button class="act" data-cmd="resume">Resume</button></div>
+   <div class="card"><h3>Shutdown (standby)</h3><p class="sub">Halts trading and idles the engine. The process stays alive (a supervisor would restart a real exit). Use Resume to wake it.</p><button class="act danger" data-cmd="standby">Standby</button></div>
+   <div class="card"><h3>Restart engine</h3><p class="sub">Engine exits cleanly; the container/systemd supervisor starts it again.</p><button class="act danger" data-cmd="restart">Restart</button></div>
+  </div>
+  <div class="card" style="margin-top:12px"><h3>Command audit (executed by the engine)</h3><div class="scroll" id="audit"></div></div>
+  <div class="card" style="margin-top:12px"><h3>Effective config (read-only)</h3><pre class="log" id="cfg"></pre></div>
+ </section>
+</main>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const TABS = [["overview","Overview"],["trades","Trades"],["analysis","Analysis"],["predict","Projection"],["errors","Errors"],["logs","Logs"],["signals","Signals & Events"],["control","Control"]];
+let KEY = sessionStorage.getItem("adminKey") || "", tab = "overview", timer = null;
+
+const el = (tag, props = {}, ...kids) => { const e = document.createElement(tag); Object.assign(e, props); kids.flat().forEach(k => e.append(k)); return e; };
+const num = (v, d = 2) => (v === null || v === undefined || isNaN(v)) ? "–" : Number(v).toLocaleString(undefined, {maximumFractionDigits: d});
+const cls = v => v > 0 ? "ok" : v < 0 ? "bad" : "";
+function toast(m){const t=$("#toast");t.textContent=m;t.style.display="block";clearTimeout(toast._t);toast._t=setTimeout(()=>t.style.display="none",6000)}
+
+async function api(path, opts = {}) {
+  const r = await fetch("/api/admin" + path, {...opts, headers: {"X-Dashboard-Key": KEY, "Content-Type": "application/json", ...(opts.headers||{})}});
+  if (r.status === 401) { signOut(); throw new Error("unauthorized"); }
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.detail || r.statusText);
+  return j;
+}
+
+function kpi(title, value, sub = "", c = "") { return el("div", {className: "card"}, el("h3", {textContent: title}), el("div", {className: "big " + c, textContent: value}), el("div", {className: "sub", textContent: sub})); }
+
+function table(rows, cols) {
+  if (!rows.length) return el("p", {className: "sub", textContent: "No data yet."});
+  const t = el("table"), h = el("tr");
+  cols.forEach(c => h.append(el("th", {textContent: c.h})));
+  t.append(el("thead", {}, h));
+  const b = el("tbody");
+  rows.forEach(r => { const tr = el("tr"); cols.forEach(c => { const v = c.f ? c.f(r) : r[c.k]; tr.append(el("td", {textContent: v ?? "–", className: c.c ? c.c(r) : ""})); }); b.append(tr); });
+  t.append(b); return t;
+}
+function put(sel, node) { const e = $(sel); e.replaceChildren(node); }
+
+/* ---------- tiny canvas charts ---------- */
+function prep(c) { const d = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight; c.width = w * d; c.height = h * d; const x = c.getContext("2d"); x.scale(d, d); x.clearRect(0, 0, w, h); const st = getComputedStyle(document.documentElement); return {x, w, h, mute: st.getPropertyValue("--mute"), line: st.getPropertyValue("--line"), acc: st.getPropertyValue("--acc"), ok: st.getPropertyValue("--ok"), bad: st.getPropertyValue("--bad"), text: st.getPropertyValue("--text")}; }
+function empty(g, m) { g.x.fillStyle = g.mute; g.x.font = "13px system-ui"; g.x.fillText(m, 10, 24); }
+function lineChart(id, series, labels) {
+  const c = $(id), g = prep(c), {x, w, h} = g; if (!series.length || !series[0].y.length) return empty(g, "No data yet.");
+  const all = series.flatMap(s => s.y), lo = Math.min(...all), hi = Math.max(...all), span = (hi - lo) || 1, n = series[0].y.length, L = 52, B = 18;
+  const X = i => L + (n > 1 ? i / (n - 1) : 0) * (w - L - 8), Y = v => 8 + (1 - (v - lo) / span) * (h - B - 12);
+  x.strokeStyle = g.line; x.fillStyle = g.mute; x.font = "11px system-ui"; x.lineWidth = 1;
+  for (let k = 0; k <= 4; k++) { const v = lo + span * k / 4, yy = Y(v); x.beginPath(); x.moveTo(L, yy); x.lineTo(w - 8, yy); x.stroke(); x.fillText(num(v, 2), 2, yy + 4); }
+  series.forEach(s => { if (s.band) { x.fillStyle = s.color; x.globalAlpha = .16; x.beginPath(); s.band[0].forEach((v, i) => x[i ? "lineTo" : "moveTo"](X(i), Y(v))); [...s.band[1]].reverse().forEach((v, i) => x.lineTo(X(s.band[1].length - 1 - i), Y(v))); x.closePath(); x.fill(); x.globalAlpha = 1; } else { x.strokeStyle = s.color; x.lineWidth = s.w || 2; x.beginPath(); s.y.forEach((v, i) => x[i ? "lineTo" : "moveTo"](X(i), Y(v))); x.stroke(); } });
+  if (labels) { x.fillStyle = g.mute; x.fillText(labels[0], L, h - 3); x.textAlign = "right"; x.fillText(labels[1], w - 8, h - 3); x.textAlign = "left"; }
+}
+function barChart(id, items) {
+  const c = $(id), g = prep(c), {x, w, h} = g; if (!items.length) return empty(g, "No data yet.");
+  const max = Math.max(...items.map(i => Math.abs(i.v)), 1e-9), bw = (w - 20) / items.length, mid = h / 2 - 6;
+  x.strokeStyle = g.line; x.beginPath(); x.moveTo(0, mid); x.lineTo(w, mid); x.stroke();
+  items.forEach((it, i) => { const bh = Math.abs(it.v) / max * (mid - 14); x.fillStyle = it.v >= 0 ? g.ok : g.bad; x.fillRect(10 + i * bw + 2, it.v >= 0 ? mid - bh : mid, Math.max(bw - 4, 1), Math.max(bh, 1)); if (items.length <= 14 || i % Math.ceil(items.length / 12) === 0) { x.fillStyle = g.mute; x.font = "10px system-ui"; x.save(); x.translate(10 + i * bw + bw / 2, h - 2); x.rotate(-Math.PI / 4); x.fillText(it.k, 0, 0); x.restore(); } });
+}
+
+/* ---------- renderers ---------- */
+function engPill(e) { const p = $("#engpill"); const m = {running: "ok", halted: "warn", standby: "warn", starting: "warn", stale: "warn", offline: "bad", unknown: "bad", restarting: "warn"}[e.state] || "warn"; p.className = "pill " + m; p.textContent = "Engine: " + e.state; }
+const dur = s => s == null ? "–" : s > 86400 ? (s / 86400).toFixed(1) + " d" : s > 3600 ? (s / 3600).toFixed(1) + " h" : Math.round(s / 60) + " m";
+
+async function loadOverview() {
+  const [o, h, a, pos] = await Promise.all([api("/overview"), api("/health"), api("/analytics"), api("/positions")]);
+  engPill(o.engine); const m = o.metrics, r = o.risk;
+  $("#kpis").replaceChildren(
+    kpi("Trading balance", "$" + num(r.trading_balance), "peak $" + num(r.peak_balance)),
+    kpi("Today P&L", "$" + num(o.today.pnl, 4), o.today.trades + " trades", cls(o.today.pnl)),
+    kpi("All-time P&L", "$" + num(m.total_pnl, 4), (m.trades || 0) + " closed trades", cls(m.total_pnl)),
+    kpi("Win rate", m.trades ? m.win_rate_pct + "%" : "–", "PF " + num(m.profit_factor)),
+    kpi("Max drawdown", m.trades ? num(m.max_drawdown_pct) + "%" : "–", "$" + num(m.max_drawdown, 4), m.max_drawdown_pct < -5 ? "bad" : ""),
+    kpi("Trading", r.trading_halted ? "HALTED" : "ACTIVE", r.halt_reason || "", r.trading_halted ? "warn" : "ok"),
+    kpi("Open positions", o.open_positions, "loss streak " + (r.consecutive_losses ?? 0)),
+    kpi("Uptime", dur(o.engine.uptime_seconds), (o.engine.restarts ?? "–") + " restarts"),
+    kpi("Errors (24h)", o.errors_24h, "see Errors tab", o.errors_24h > 20 ? "bad" : o.errors_24h ? "warn" : "ok"));
+  put("#health", table(h.checks, [{h: "Check", k: "name"}, {h: "Status", f: r => r.ok ? "OK" : "PROBLEM", c: r => r.ok ? "ok" : "bad"}, {h: "Detail", k: "detail"}]));
+  const eq = a.equity_curve.map(p => p.cumulative_pnl);
+  lineChart("#c-eq", [{y: eq, color: getComputedStyle(document.documentElement).getPropertyValue("--acc")}]);
+  put("#positions", table(pos.positions, [{h: "Symbol", k: "symbol"}, {h: "Venue", k: "exchange"}, {h: "Side", k: "side"}, {h: "Amount", k: "amount"}, {h: "Entry", k: "entry_price"}, {h: "Opened", k: "opened_at"}]));
+}
+async function loadTrades() {
+  const t = await api("/trades?n=300");
+  put("#trades", table(t.trades, [{h: "Closed", f: r => r.closed_at || r.opened_at}, {h: "Venue", k: "exchange"}, {h: "Symbol", k: "symbol"}, {h: "Side", k: "side"}, {h: "Status", k: "status"}, {h: "Entry", k: "entry_price"}, {h: "Exit", k: "exit_price"}, {h: "P&L", f: r => r.pnl == null ? "–" : num(r.pnl, 4), c: r => cls(r.pnl)}, {h: "Fees", f: r => num(r.fees, 4)}, {h: "Reason", k: "reason"}, {h: "Regime", k: "regime"}]));
+}
+const bcols = [{h: "", k: "key"}, {h: "Trades", k: "trades"}, {h: "P&L", f: r => num(r.pnl, 4), c: r => cls(r.pnl)}, {h: "Win %", k: "win_rate_pct"}, {h: "Avg", f: r => num(r.avg_pnl, 4)}];
+async function loadAnalysis() {
+  const a = await api("/analytics"), m = a.metrics, b = a.breakdowns;
+  $("#mkpis").replaceChildren(
+    kpi("Expectancy / trade", "$" + num(m.expectancy, 4), "", cls(m.expectancy)), kpi("Profit factor", num(m.profit_factor), "gross win ÷ gross loss"),
+    kpi("Avg win / loss", num(m.avg_win, 3) + " / " + num(m.avg_loss, 3), "payoff " + num(m.payoff_ratio)), kpi("Best / worst", num(m.best_trade, 3) + " / " + num(m.worst_trade, 3)),
+    kpi("Streaks", "W" + (m.max_win_streak ?? 0) + " / L" + (m.max_loss_streak ?? 0), "current " + (m.current_streak ?? 0)), kpi("Avg hold", dur((m.avg_hold_hours ?? 0) * 3600)),
+    kpi("Fees paid", "$" + num(m.total_fees, 4)), kpi("Sharpe / trade", num(m.sharpe_per_trade, 3)));
+  barChart("#c-sym", b.by_symbol.map(r => ({k: r.key, v: r.pnl}))); barChart("#c-hour", b.by_hour.map(r => ({k: r.key, v: r.pnl})));
+  put("#b-strat", table(b.by_strategy, bcols)); put("#b-reg", table(b.by_regime, bcols)); put("#b-day", table(b.by_weekday, bcols)); put("#b-ex", table(b.by_exchange, bcols));
+}
+async function loadProjection() {
+  const p = await api("/projection?horizon=" + (+$("#horizon").value || 50)), cs = k => getComputedStyle(document.documentElement).getPropertyValue(k);
+  if (!p.bands.length) { $("#pkpis").replaceChildren(kpi("Projection", "Not enough data", p.note, "warn")); lineChart("#c-proj", []); }
+  else {
+    $("#pkpis").replaceChildren(
+      kpi("Reliability", p.reliable ? "Usable" : "UNRELIABLE", p.note, p.reliable ? "ok" : "warn"),
+      kpi("Median outcome", "$" + num(p.median_final), "after " + p.horizon_trades + " trades from $" + num(p.start_balance)),
+      kpi("Chance of being down", p.prob_loss_pct + "%", "vs. starting balance", p.prob_loss_pct > 40 ? "warn" : ""),
+      kpi("Chance of breaching " + p.drawdown_limit_pct + "% drawdown", p.prob_breach_drawdown_pct + "%", "at any point", p.prob_breach_drawdown_pct > 20 ? "bad" : ""),
+      kpi("Expectancy 95% range", "$" + num(p.expectancy_ci95[0], 4) + " … $" + num(p.expectancy_ci95[1], 4), p.edge_is_positive_with_95pct_confidence ? "edge positive (95% conf.)" : "cannot rule out zero/negative edge", p.edge_is_positive_with_95pct_confidence ? "ok" : "warn"));
+    const B = p.bands; lineChart("#c-proj", [
+      {band: [B.map(b => b.p5), B.map(b => b.p95)], color: cs("--acc"), y: B.map(b => b.p5)},
+      {band: [B.map(b => b.p25), B.map(b => b.p75)], color: cs("--acc"), y: B.map(b => b.p25)},
+      {y: B.map(b => b.p50), color: cs("--text"), w: 2}], ["trade 1", "trade " + p.horizon_trades]);
+  }
+  const t = (await api("/analytics")).trend;
+  put("#trend", el("p", {textContent: t.slope_per_trade == null ? t.direction : `Last ${t.window} trades: ${t.direction} (slope ${num(t.slope_per_trade, 4)} per trade)`}));
+}
+async function loadErrors() {
+  const e = await api("/errors?n=300&q=" + encodeURIComponent($("#errq").value));
+  barChart("#c-err", e.per_hour_last_24h.map((v, i) => ({k: (23 - i) + "h", v: -v})));
+  put("#toperr", table(e.top_errors, [{h: "Count", k: "count"}, {h: "Message", k: "message"}]));
+  $("#errlines").textContent = e.lines.join("\n") || "No errors recorded.";
+}
+async function loadLogs(first) {
+  if (first || !$("#logfile").options.length) { const f = await api("/logs/files"); $("#logfile").replaceChildren(...f.files.map(x => el("option", {value: x.name, textContent: `${x.name} (${(x.size / 1024).toFixed(0)} KB)`}))); }
+  if (!$("#logfile").value) { $("#loglines").textContent = "No log files yet."; return; }
+  const l = await api(`/logs/tail?file=${encodeURIComponent($("#logfile").value)}&n=${+$("#logn").value || 300}&q=${encodeURIComponent($("#logq").value)}`);
+  $("#loglines").textContent = l.lines.join("\n"); $("#loglines").scrollTop = 1e9;
+}
+async function loadSignals() {
+  const s = await api("/signals?n=200");
+  put("#signals", table(s.events, [{h: "Time", k: "ts"}, {h: "Type", k: "type"}, {h: "Event", f: r => r.event || r.action || ""}, {h: "Symbol", k: "symbol"}, {h: "Score/Conf", f: r => r.score ?? r.confidence ?? ""}, {h: "Detail", f: r => r.details || (r.strategies || []).join(", ") || ""}]));
+}
+async function loadControl() {
+  const [a, c, p] = await Promise.all([api("/audit"), api("/config"), api("/ping")]);
+  $("#ctlnote").textContent = p.control_enabled ? "Commands are queued and executed by the engine within seconds. Restart and Standby ask you to type the command to confirm." : "Control actions are DISABLED: DASHBOARD_SECRET_KEY is still the default. Change it in .env and redeploy.";
+  put("#audit", table(a.entries, [{h: "When", f: r => new Date(r.executed_at * 1000).toLocaleString()}, {h: "Command", k: "command"}, {h: "By", k: "by"}]));
+  $("#cfg").textContent = JSON.stringify(c, null, 2);
+}
+const LOADERS = {overview: loadOverview, trades: loadTrades, analysis: loadAnalysis, predict: loadProjection, errors: loadErrors, logs: () => loadLogs(false), signals: loadSignals, control: loadControl};
+
+async function refresh() { try { await LOADERS[tab](); $("#clock").textContent = "updated " + new Date().toLocaleTimeString(); } catch (e) { if (e.message !== "unauthorized") toast("Load failed: " + e.message); } }
+function show(t) { tab = t; document.querySelectorAll("main > section").forEach(s => s.hidden = s.id !== "t-" + t); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.t === t)); refresh(); }
+function start() {
+  $("#login").hidden = true; $("#app").hidden = false;
+  $("#tabs").replaceChildren(...TABS.map(([k, n]) => el("button", {textContent: n, onclick: () => show(k)}, )));
+  document.querySelectorAll("nav button").forEach((b, i) => b.dataset.t = TABS[i][0]);
+  show("overview"); clearInterval(timer);
+  timer = setInterval(() => { if ($("#auto").checked && !["logs", "predict"].includes(tab)) refresh(); }, 5000);
+  loadLogs(true).catch(() => {});
+}
+function signOut() { sessionStorage.removeItem("adminKey"); KEY = ""; clearInterval(timer); $("#app").hidden = true; $("#login").hidden = false; }
+async function signIn() { KEY = $("#key").value.trim() || KEY; try { await api("/ping"); sessionStorage.setItem("adminKey", KEY); $("#loginerr").textContent = ""; start(); } catch (e) { $("#loginerr").textContent = e.message; } }
+
+$("#go").onclick = signIn; $("#key").onkeydown = e => e.key === "Enter" && signIn(); $("#out").onclick = signOut;
+$("#runproj").onclick = loadProjection; $("#errgo").onclick = loadErrors; $("#loggo").onclick = () => loadLogs(false);
+document.querySelectorAll("[data-cmd]").forEach(b => b.onclick = async () => {
+  const cmd = b.dataset.cmd; let confirm = "";
+  if (cmd === "restart" || cmd === "standby") { confirm = prompt(`This will ${cmd} the engine. Type "${cmd}" to confirm:`) || ""; if (confirm !== cmd) return toast("Cancelled."); }
+  else if (!window.confirm(`Send "${cmd}" to the engine?`)) return;
+  try { const r = await api("/control", {method: "POST", body: JSON.stringify({command: cmd, confirm})}); toast(r.note); setTimeout(refresh, 2500); } catch (e) { toast("Failed: " + e.message); }
+});
+addEventListener("resize", () => refresh());
+if (KEY) { signIn(); } else { $("#login").hidden = false; }
+</script>
+</body>
+</html>

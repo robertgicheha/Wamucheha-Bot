@@ -18,6 +18,7 @@ Architecture layers:
   Monitoring: Structured JSON logging, API failure tracking, strategy performance
 """
 import os
+import sys
 import time
 import yaml
 import pandas as pd
@@ -34,8 +35,9 @@ from core.fee_manager import FeeModel
 from core.structured_logger import (
     slippage_tracker, api_failure_tracker, strategy_perf_tracker,
     log_trade_open, log_trade_close, log_signal, log_risk_event, log_system_event,
-    heartbeat,
+    heartbeat, install_error_capture,
 )
+from core import control_channel
 from alerts.notifier import Notifier
 # Imported as `fm`, not `f`: this module already binds `f` to a file handle
 # (the config load below, and the retrain stamp), and because both are
@@ -530,6 +532,7 @@ def main():
     # Record the run start before anything else can fail. Without this the
     # 24-hour report has no uptime to report, and a bot that dies during
     # start-up leaves no evidence it was ever attempted.
+    install_error_capture()
     heartbeat.beat(health="starting", force=True)
 
     from data_feeds.nse_feed import NSEFeed
@@ -573,7 +576,34 @@ def main():
         if results:
             notifier.notify("nse_alert", "NSE Kenya Analysis:\n" + "\n".join(results))
 
+    standby = False
+
+    def apply_dashboard_commands():
+        """Execute queued dashboard commands. Returns True if the engine must exit."""
+        nonlocal standby
+        for cmd in control_channel.poll_commands():
+            verb = cmd["command"]
+            log_system_event("dashboard_command", f"{verb} by {cmd.get('by')}", cmd)
+            control_channel.append_audit(cmd)
+            if verb == "halt":
+                state.update_risk_state(trading_halted=1,
+                                        halt_reason=f"Dashboard halt ({cmd.get('by')})")
+            elif verb == "resume":
+                standby = False
+                state.update_risk_state(trading_halted=0, halt_reason=None)
+            elif verb == "standby":
+                standby = True
+                state.update_risk_state(trading_halted=1,
+                                        halt_reason=f"Dashboard standby ({cmd.get('by')})")
+            elif verb == "restart":
+                heartbeat.beat(health="restarting", force=True)
+                print("Dashboard requested restart; exiting for supervisor to relaunch.")
+                return True
+        return False
+
     while True:
+        if apply_dashboard_commands():
+            sys.exit(0)
         risk_state = state.get_risk_state()
 
         # Liveness first, and unconditionally. A halted bot is still a running
@@ -581,7 +611,8 @@ def main():
         # account", and the 24-hour report has to say HALTED rather than go
         # silent for a day. Skipping these while halted would turn a deliberate
         # risk stop into an indistinguishable outage.
-        heartbeat.beat(health="halted" if risk_state.get("trading_halted") else "running")
+        heartbeat.beat(health="standby" if standby else
+                       "halted" if risk_state.get("trading_halted") else "running")
         try:
             session_reporter.maybe_report()
         except Exception as e:
@@ -592,7 +623,7 @@ def main():
             print(f"Trade digest error: {e}")
 
         if risk_state["trading_halted"]:
-            time.sleep(30)
+            time.sleep(5)       # short, so a dashboard "resume" takes effect promptly
             continue
 
         now = time.time()
