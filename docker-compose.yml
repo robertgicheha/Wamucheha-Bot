@@ -48,7 +48,7 @@ services:
     restart: unless-stopped
     env_file: .env
     ports:
-    - 127.0.0.1:${DASHBOARD_PORT:-8000}:8000
+    - ${DASHBOARD_BIND:-127.0.0.1}:${DASHBOARD_PORT:-8000}:8000   # DASHBOARD_BIND=0.0.0.0 to reach it from your phone on the same Wi-Fi
     volumes:
     - engine-data:/app/data:ro
     - engine-control:/app/data/control   # writable: the only place the dashboard can write

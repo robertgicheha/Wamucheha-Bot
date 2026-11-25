@@ -250,3 +250,23 @@ def test_no_remote_shell_endpoint_exists(client):
     paths = {getattr(r, "path", "") for r in appmod.app.routes}
     assert not any("terminal" in p for p in paths)
     assert client.post("/api/terminal", json={"command": "whoami"}, headers=H).status_code in (404, 405)
+
+
+# ---------- demo test trade ----------
+def test_test_trade_needs_demo_mode_and_typed_word(client):
+    assert "test_trade" in control_channel.ALLOWED_COMMANDS
+    # not in demo mode: refused even with the right word
+    r = client.post("/api/admin/control", json={"command": "test_trade", "confirm": "TEST"}, headers=H)
+    assert r.status_code == 409 and control_channel.pending_count() == 0
+    (Path(_TMP) / "engine_heartbeat.json").write_text(json.dumps(
+        {"ts": "2099-01-01T00:00:00+00:00", "health": "running", "mt5_demo": True}))
+    assert client.post("/api/admin/control", json={"command": "test_trade"}, headers=H).status_code == 400
+    assert client.post("/api/admin/control", json={"command": "test_trade", "confirm": "test"}, headers=H).status_code == 400
+    r = client.post("/api/admin/control", json={"command": "test_trade", "confirm": "TEST"}, headers=H)
+    assert r.status_code == 200 and control_channel.poll_commands()[0]["command"] == "test_trade"
+
+
+def test_mt5_demo_flag_is_honoured_only_for_demo_servers():
+    src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
+    assert '"demo" in mt5_server.lower()' in src
+    assert "dry_run=not (LIVE_TRADING or mt5_demo_orders)" in src

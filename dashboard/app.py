@@ -38,6 +38,13 @@ from fastapi import Request
 from fastapi.middleware.cors import CORSMiddleware
 
 sys.path.append(str(Path(__file__).parent.parent))
+# Native runs (start-dashboard.ps1) have no docker env_file, so read .env like the engine
+# does. override=False: real environment variables (Docker) always win.
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+except ImportError:
+    pass
 from core.state_manager import StateManager, SNAPSHOT_PATH
 from alerts.notifier import Notifier, EVENT_LOG, TRADE_LOG
 from reporting.hourly_report import read_hourly_log

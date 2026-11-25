@@ -22,6 +22,8 @@ Verbs:
            it will simply be relaunched)
   dry_run  force every executor into simulated mode. There is deliberately NO verb that
            turns real trading ON: going live needs LIVE_TRADING=true in .env + restart.
+  test_trade  DEMO ONLY: open one minimum-size gold order through the normal order path to
+           prove demo orders reach the dashboard. Refused unless the engine is in MT5 demo mode.
   dry_test one-shot self-test (connectivity, data, signals) that places no orders;
            result lands in data/control/dry_test.json
 """
@@ -33,7 +35,7 @@ from pathlib import Path
 
 CONTROL_DIR = Path(os.environ.get("CONTROL_DIR",
                                   Path(__file__).parent.parent / "data" / "control"))
-ALLOWED_COMMANDS = {"halt", "resume", "standby", "restart", "kill", "stop", "dry_run", "dry_test"}
+ALLOWED_COMMANDS = {"halt", "resume", "standby", "restart", "kill", "stop", "dry_run", "dry_test", "test_trade"}
 MAX_COMMAND_AGE_SECONDS = 600   # a command queued while the engine was down must not
                                 # fire minutes later on an unrelated boot
 

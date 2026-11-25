@@ -238,6 +238,35 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
     return signal
 
 
+def sync_demo_balance(state, tolerance_pct: float = 0.5):
+    """Align the trading balance with the MT5 DEMO account's balance.
+
+    Only used for a demo server with MT5_DEMO_ORDERS=true: the dashboard should then
+    show the demo money, and position sizing (a % of trading balance) should size from
+    it. Skipped while a position is open (it would distort P&L). Resets the peak and
+    payout baseline too, otherwise the jump would read as an instant profit or drawdown.
+    Returns the new balance, or None if nothing changed.
+    """
+    try:
+        from core.mt5_client import get_mt5
+        info = get_mt5().account_info()
+        if not info:
+            return None
+        bal = float(info.balance)
+        rs = state.get_risk_state()
+        cur = float(rs.get("trading_balance") or 0.0)
+        if bal <= 0 or (cur and abs(bal - cur) / cur * 100 < tolerance_pct):
+            return None
+        if state.get_open_positions():
+            return None
+        state.update_risk_state(trading_balance=bal, peak_balance=bal, payout_baseline=bal,
+                                daily_pnl=0.0, consecutive_losses=0)
+        return bal
+    except Exception as e:
+        print(f"  MT5 demo balance sync skipped: {e}")
+        return None
+
+
 def main():
     notifier = build_notifier()
     state = StateManager(
@@ -340,6 +369,11 @@ def main():
     mt5_login = int(os.environ.get("MT5_LOGIN", "0") or "0")
     mt5_password = os.environ.get("MT5_PASSWORD", "")
     mt5_server = os.environ.get("MT5_SERVER", "")
+    # Opt-in: send REAL orders to the MT5 DEMO account (play money). Honoured only when
+    # the server name says "demo", so it can never put real money at risk, and it is
+    # independent of LIVE_TRADING (which stays false and keeps crypto simulated).
+    mt5_demo_orders = (os.environ.get("MT5_DEMO_ORDERS", "false").lower() == "true"
+                       and "demo" in mt5_server.lower())
     if mt5_login and venue_enabled("mt5"):
         print(f"  MT5: login={mt5_login} server={mt5_server} "
               f"({'DEMO server' if 'demo' in mt5_server.lower() else 'LIVE — real money'})")
@@ -350,8 +384,8 @@ def main():
             login=mt5_login,
             password=mt5_password,
             server=mt5_server,
-            dry_run=not LIVE_TRADING,
-            allow_min_lot=CONFIG["execution"].get("mt5_allow_min_lot", False),
+            dry_run=not (LIVE_TRADING or mt5_demo_orders),
+            allow_min_lot=CONFIG["execution"].get("mt5_allow_min_lot", False) or mt5_demo_orders,
             # Bridge-side guards, enforced on the Windows box independently of
             # the engine so a compromised engine still cannot place a runaway
             # order. Sized well above what the risk manager allows in normal
@@ -363,7 +397,13 @@ def main():
         )
         if mt5_exec.connect():
             executors["mt5"] = mt5_exec
-            print("  MT5 executor initialized")
+            print("  MT5 executor initialized"
+                  + (" (DEMO orders ENABLED: real orders on the demo account, no real money)"
+                     if mt5_demo_orders else ""))
+            if mt5_demo_orders:
+                synced = sync_demo_balance(state)
+                if synced:
+                    print(f"  Trading balance synced to the MT5 demo account: ${synced:,.2f}")
         else:
             print("  WARNING: MT5 connection failed")
 
@@ -386,7 +426,12 @@ def main():
     all_markets = [(v, s) for v, s in all_markets if v in executors]
 
     print(f"\nTrading {len(all_markets)} symbols across {len(executors)} exchanges/brokers")
-    mode_str = "LIVE — REAL MONEY" if LIVE_TRADING else "DRY-RUN (simulated, no real orders)"
+    if LIVE_TRADING:
+        mode_str = "LIVE — REAL MONEY"
+    elif mt5_demo_orders:
+        mode_str = "DEMO TRADING (real orders on the MT5 demo account, play money; crypto simulated)"
+    else:
+        mode_str = "DRY-RUN (simulated, no real orders)"
     print(f"*** MODE: {mode_str} ***")
     print(f"Strategy: 20-strategy adaptive ensemble (10 categories) + portfolio-level strategies")
     print(f"Costs: taker {fee_model.taker_bps:.0f}bps base, network fee "
@@ -456,13 +501,18 @@ def main():
 
     def mode_label() -> str:
         live = LIVE_TRADING and not forced_dry
-        return "LIVE - REAL MONEY" if live else "DRY-RUN (simulated)"
+        if live:
+            return "LIVE - REAL MONEY"
+        if mt5_demo_orders and not forced_dry:
+            return "DEMO TRADING: MT5 demo orders (play money); crypto simulated"
+        return "DRY-RUN (simulated)"
 
     def publish_mode():
         """Tell the dashboard what mode we are in and whether the kill switch is armed."""
         rs = state.get_risk_state()
         heartbeat.extra.update({
             "mode": mode_label(), "live": bool(LIVE_TRADING and not forced_dry),
+            "mt5_demo": bool(mt5_demo_orders and not forced_dry),
             "kill_switch": str(rs.get("halt_reason") or "").startswith("KILL SWITCH"),
             "markets": [f"{v}:{sym}" for v, sym in all_markets],
         })
@@ -529,6 +579,22 @@ def main():
                     dry_test.run_dry_test(executors, feed_router, all_markets, _sig, mode_label())
                 except Exception as e:
                     print(f"Dry test failed: {e}")
+            elif verb == "test_trade":
+                ex = executors.get("mt5")
+                if LIVE_TRADING or forced_dry or not mt5_demo_orders or ex is None:
+                    print("test_trade refused: only allowed in MT5 demo mode with a connected MT5 venue.")
+                    continue
+                try:
+                    px = feed_router.latest_price("XAUUSD")
+                    rs = state.get_risk_state()
+                    amount = rs["trading_balance"] * CONFIG["risk"]["max_position_pct"] / 100
+                    res = ex.open_trade(symbol="XAUUSD", side="buy", proposed_amount=amount,
+                                        entry_price=px, stop_loss_pct=CONFIG["risk"]["stop_loss_pct"],
+                                        take_profit_pct=CONFIG["risk"]["take_profit_pct"],
+                                        strategies=["manual_test"], score=0.0, regime="test")
+                    print(f"test_trade: {'opened' if res else 'not opened (see rejection alert)'} XAUUSD @ {px}")
+                except Exception as e:
+                    print(f"test_trade failed: {e}")
             elif verb == "stop":
                 heartbeat.beat(health="stopped", force=True)
                 print("Dashboard requested stop; exiting.")

@@ -162,7 +162,7 @@ def overview():
     live_env = os.environ.get("LIVE_TRADING", "false").lower() == "true"
     return {
         "mode": {"label": hb.get("mode") or ("LIVE - REAL MONEY" if live_env else "DRY-RUN (simulated)"),
-                 "live": bool(hb.get("live")), "kill_switch": bool(hb.get("kill_switch")),
+                 "live": bool(hb.get("live")), "mt5_demo": bool(hb.get("mt5_demo")), "kill_switch": bool(hb.get("kill_switch")),
                  "markets": hb.get("markets", [])},
         "capital": capital,
         "engine": _engine_status(),
@@ -336,7 +336,7 @@ class ControlBody(BaseModel):
 
 
 # verbs that need the operator to type a word: a mis-click must not do these
-_CONFIRM_WORD = {"restart": "restart", "standby": "standby", "stop": "stop", "kill": "KILL"}
+_CONFIRM_WORD = {"restart": "restart", "standby": "standby", "stop": "stop", "kill": "KILL", "test_trade": "TEST"}
 
 
 @router.post("/control")
@@ -347,6 +347,8 @@ def control(body: ControlBody, request: Request, _=Depends(require_control_key))
     if need and body.confirm != need:
         raise HTTPException(400, f"type '{need}' in the confirm field to proceed")
     args = {}
+    if body.command == "test_trade" and not _read_json(HEARTBEAT).get("mt5_demo"):
+        raise HTTPException(409, "test trades are only available while the engine is in MT5 demo mode")
     if body.command == "kill":
         args["close_positions"] = bool(body.close_positions)
     if body.command == "resume" and _read_json(HEARTBEAT).get("kill_switch"):

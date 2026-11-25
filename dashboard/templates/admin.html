@@ -4,9 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Wamucheha Admin Console</title>
+<script>
+(function(){try{var t=localStorage.getItem("theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t)}catch(e){}})();
+</script>
 <style>
 :root{--bg:#0f1419;--panel:#1a212b;--line:#2a3441;--text:#e6edf3;--mute:#8b98a8;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff}
-@media (prefers-color-scheme: light){:root{--bg:#f5f7fa;--panel:#fff;--line:#d8dee6;--text:#1c2430;--mute:#5d6b7c;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--acc:#0969da}}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){--bg:#f5f7fa;--panel:#fff;--line:#d8dee6;--text:#1c2430;--mute:#5d6b7c;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--acc:#0969da}}
+:root[data-theme="light"]{--bg:#f5f7fa;--panel:#fff;--line:#d8dee6;--text:#1c2430;--mute:#5d6b7c;--ok:#1a7f37;--warn:#9a6700;--bad:#cf222e;--acc:#0969da}
+:root{color-scheme:dark}:root[data-theme="light"]{color-scheme:light}
+@media (prefers-color-scheme: light){:root:not([data-theme="dark"]){color-scheme:light}}
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:14px/1.45 system-ui,Segoe UI,sans-serif}
 header{display:flex;align-items:center;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5;flex-wrap:wrap}
@@ -15,7 +21,7 @@ nav{display:flex;gap:4px;padding:8px 16px;overflow-x:auto;border-bottom:1px soli
 nav button{background:none;border:1px solid transparent;color:var(--mute);padding:6px 12px;border-radius:6px;cursor:pointer;white-space:nowrap;font:inherit}
 nav button.on{color:var(--text);border-color:var(--line);background:var(--panel)}
 main{padding:16px;max-width:1300px;margin:0 auto}
-.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(170px,100%),1fr))}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px}
 .card h3{margin:0 0 6px;font-size:12px;color:var(--mute);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .big{font-size:22px;font-weight:650}
@@ -34,11 +40,36 @@ button.danger{border-color:var(--bad);color:var(--bad)}
 input,select{background:var(--bg);color:var(--text);border:1px solid var(--line);padding:6px 9px;border-radius:6px;font:inherit}
 canvas{width:100%;height:240px;display:block}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-.two{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(380px,1fr))}
+.two{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(min(380px,100%),1fr))}
 #login{max-width:340px;margin:12vh auto;text-align:center}
 #toast{position:fixed;bottom:16px;right:16px;background:var(--panel);border:1px solid var(--line);padding:10px 14px;border-radius:8px;display:none;max-width:360px}
 .note{background:var(--panel);border-left:3px solid var(--warn);padding:8px 12px;border-radius:4px;margin-bottom:12px;color:var(--mute)}
 [hidden]{display:none!important}
+#mk-chart{height:480px}
+button.act{min-height:36px}
+.iconbtn{padding:6px 10px;line-height:1}
+@media (max-width:640px){
+  main{padding:10px}
+  header{padding:8px 10px;gap:8px}
+  header h1{font-size:14px;flex:1 1 100%}
+  #clock{display:none}
+  nav{padding:6px 10px}
+  nav button{padding:9px 13px}
+  .grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .grid.cards-wide{grid-template-columns:1fr}
+  .card{padding:10px}
+  .big{font-size:18px}
+  .card h3{font-size:11px}
+  th,td{padding:6px;font-size:12px}
+  .row>select,.row>input,.row>button{flex:1 1 42%;min-width:0}
+  #mk-chart{height:340px}
+  canvas{height:210px}
+  button.act{min-height:44px}
+  #toast{left:10px;right:10px;max-width:none}
+  .modebar{font-size:12px}
+  pre.log{font-size:11px}
+}
+@media (max-width:360px){.grid{grid-template-columns:1fr}}
 h2.sec{font-size:13px;color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px}
 h2.sec:first-child{margin-top:0}
 .modebar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel)}
@@ -64,6 +95,7 @@ button.kill{background:var(--bad);color:#fff;border-color:var(--bad);font-weight
   <span id="engpill" class="pill">…</span>
   <span class="sub" id="clock"></span>
   <label class="sub"><input type="checkbox" id="auto" checked> auto-refresh 5s</label>
+  <button class="act iconbtn" id="theme" title="Switch light / dark theme" aria-label="Switch theme">&#9790;</button>
   <button class="act" id="out">Sign out</button>
 </header>
 <nav id="tabs"></nav>
@@ -92,7 +124,7 @@ button.kill{background:var(--bad);color:#fff;border-color:var(--bad);font-weight
     <label class="sub"><input type="checkbox" id="mk-trd" checked> My trades</label>
     <span class="sub" id="mk-info"></span>
   </div>
-  <div class="card"><div id="mk-chart" style="height:480px"></div></div>
+  <div class="card"><div id="mk-chart"></div></div>
   <div class="note" style="margin-top:12px">Candles come read-only from the MT5 terminal when it is reachable, otherwise from public exchange data (no keys). Green arrows are buy entries, red are sell entries; circles are exits. Prices can differ slightly between sources.</div>
  </section>
 
@@ -153,6 +185,7 @@ button.kill{background:var(--bad);color:#fff;border-color:var(--bad);font-weight
   <div class="grid cards-wide">
    <div class="card" style="border-color:var(--bad)"><h3>Kill switch</h3><p class="sub">Immediately stops all trading and LOCKS it: a normal resume is refused until you type <b>release</b>.</p><label class="sub"><input type="checkbox" id="kill-close"> also close every open position at market</label><br><br><button class="act kill" data-cmd="kill">KILL SWITCH</button></div>
    <div class="card"><h3>Mode</h3><div id="modecard" class="sub"></div><br><button class="act" data-cmd="dry_run">Switch to DRY-RUN</button><p class="sub">There is deliberately no button for LIVE. Going live needs <code>LIVE_TRADING=true</code> in <code>.env</code> and a restart, so a stray click can never risk real money.</p></div>
+   <div class="card"><h3>Demo test trade</h3><p class="sub">Places ONE minimum-size (0.01 lot) gold buy on the MT5 <b>demo</b> account through the normal order path, so you can watch it appear in the trade log and close at its stop or target. Only works in demo mode.</p><button class="act" data-cmd="test_trade">Place demo test trade</button></div>
    <div class="card"><h3>Dry test</h3><p class="sub">Checks connections, candle data and strategy decisions for every market. Places <b>no orders</b>.</p><button class="act" data-cmd="dry_test">Run dry test</button> <span class="sub" id="dt-state"></span></div>
   </div>
   <div class="card" style="margin-top:12px"><h3>Dry test result</h3><div class="scroll" id="drytest" style="max-height:340px"></div></div>
@@ -166,6 +199,15 @@ button.kill{background:var(--bad);color:#fff;border-color:var(--bad);font-weight
 <script>
 const $ = s => document.querySelector(s);
 const TABS = [["overview","Overview"],["market","Market"],["trades","Trades"],["analysis","Analysis"],["predict","Projection"],["errors","Errors"],["logs","Logs"],["signals","Signals & Events"],["control","Control"]];
+function curTheme() { return document.documentElement.getAttribute("data-theme") || (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark"); }
+function themeIcon() { $("#theme").innerHTML = curTheme() === "dark" ? "&#9728;" : "&#9790;"; $("#theme").title = "Switch to " + (curTheme() === "dark" ? "light" : "dark") + " theme"; }
+function setTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  try { localStorage.setItem("theme", t); } catch (e) {}
+  themeIcon();
+  if (typeof MK !== "undefined" && MK.chart) { MK.chart.applyOptions(mkTheme()); mkColors(); }
+  refresh();
+}
 let KEY = sessionStorage.getItem("adminKey") || "", tab = "overview", timer = null;
 
 const el = (tag, props = {}, ...kids) => { const e = document.createElement(tag); Object.assign(e, props); kids.flat().forEach(k => e.append(k)); return e; };
@@ -222,7 +264,8 @@ let MODE = {kill_switch: false, live: false};
 function modeBar(o) {
   MODE = o.mode; const b = $("#modebar"), m = o.mode, e = o.engine;
   b.className = "modebar" + (m.kill_switch ? " kill" : m.live ? " live" : "");
-  const bits = [el("span", {className: "pill " + (m.live ? "bad" : "ok"), textContent: m.live ? "LIVE - REAL MONEY" : "DRY-RUN (simulated)"}),
+  const modeTxt = m.live ? "LIVE - REAL MONEY" : m.mt5_demo ? "MT5 DEMO orders (play money) + crypto simulated" : "DRY-RUN (simulated)";
+  const bits = [el("span", {className: "pill " + (m.live ? "bad" : m.mt5_demo ? "warn" : "ok"), textContent: modeTxt}),
     el("span", {className: "pill " + (e.state === "running" ? "ok" : e.state === "offline" || e.state === "unknown" ? "bad" : "warn"), textContent: "Engine: " + e.state})];
   if (m.kill_switch) bits.push(el("span", {className: "pill bad", textContent: "KILL SWITCH ARMED"}));
   if (o.risk.trading_halted && !m.kill_switch) bits.push(el("span", {className: "pill warn", textContent: "Paused: " + (o.risk.halt_reason || "halted")}));
@@ -263,6 +306,11 @@ async function loadOverview() {
 const MK = {chart: null, candle: null, vol: null, e9: null, e21: null, key: "", ready: false};
 const emaOf = (cs, p) => { const k = 2 / (p + 1); let e = null; return cs.map(c => { e = e === null ? c.close : c.close * k + e * (1 - k); return {time: c.time, value: e}; }); };
 function mkTheme() { const st = getComputedStyle(document.documentElement), g = k => st.getPropertyValue(k).trim(); return {layout: {background: {color: g("--panel")}, textColor: g("--mute")}, grid: {vertLines: {color: g("--line")}, horzLines: {color: g("--line")}}, rightPriceScale: {borderColor: g("--line")}, timeScale: {borderColor: g("--line"), timeVisible: true, secondsVisible: false}, crosshair: {mode: 0}}; }
+function mkColors() {
+  const st = getComputedStyle(document.documentElement), g = k => st.getPropertyValue(k).trim();
+  MK.candle.applyOptions({upColor: g("--ok"), downColor: g("--bad"), borderUpColor: g("--ok"), borderDownColor: g("--bad"), wickUpColor: g("--ok"), wickDownColor: g("--bad")});
+  MK.vol.applyOptions({color: g("--mute")});
+}
 function mkInit() {
   if (MK.chart) return true;
   if (typeof LightweightCharts === "undefined") { $("#mk-info").textContent = "Chart library failed to load (needs internet access to cdn.jsdelivr.net)."; return false; }
@@ -361,14 +409,14 @@ async function loadControl() {
   const [a, c, p, o, d] = await Promise.all([api("/audit"), api("/config"), api("/ping"), api("/overview"), api("/dry-test")]);
   modeBar(o); engPill(o.engine);
   $("#ctlnote").textContent = p.control_enabled ? "Commands are queued and executed by the engine within seconds. Dangerous ones (kill, restart, stop, standby) ask you to type a word." : "Control actions are DISABLED: DASHBOARD_SECRET_KEY is still the default. Change it in .env and restart the dashboard.";
-  $("#modecard").textContent = o.mode.label + (o.mode.live ? " - orders are real" : " - no real orders are sent");
+  $("#modecard").textContent = o.mode.label + (o.mode.live ? " - orders are real" : o.mode.mt5_demo ? " - gold orders go to the MT5 demo account (no real money); crypto stays simulated" : " - no real orders are sent");
   put("#audit", table(a.entries, [{h: "When", f: r => new Date(r.executed_at * 1000).toLocaleString()}, {h: "Command", k: "command"}, {h: "By", k: "by"}]));
   renderDryTest(d);
   $("#cfg").textContent = JSON.stringify(c, null, 2);
 }
 const LOADERS = {overview: loadOverview, market: loadMarket, trades: loadTrades, analysis: loadAnalysis, predict: loadProjection, errors: loadErrors, logs: () => loadLogs(false), signals: loadSignals, control: loadControl};
 
-async function refresh() { try { await LOADERS[tab](); if (!["overview", "control"].includes(tab)) api("/overview").then(o => { modeBar(o); engPill(o.engine); }).catch(() => {});$("#clock").textContent = "updated " + new Date().toLocaleTimeString(); } catch (e) { if (e.message !== "unauthorized") toast("Load failed: " + e.message); } }
+async function refresh() { if (!KEY || $("#app").hidden) return; try { await LOADERS[tab](); if (!["overview", "control"].includes(tab)) api("/overview").then(o => { modeBar(o); engPill(o.engine); }).catch(() => {});$("#clock").textContent = "updated " + new Date().toLocaleTimeString(); } catch (e) { if (e.message !== "unauthorized") toast("Load failed: " + e.message); } }
 function show(t) { tab = t; document.querySelectorAll("main > section").forEach(s => s.hidden = s.id !== "t-" + t); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.t === t)); refresh(); }
 function start() {
   $("#login").hidden = true; $("#app").hidden = false;
@@ -381,13 +429,14 @@ function start() {
 function signOut() { sessionStorage.removeItem("adminKey"); KEY = ""; clearInterval(timer); $("#app").hidden = true; $("#login").hidden = false; }
 async function signIn() { KEY = $("#key").value.trim() || KEY; try { await api("/ping"); sessionStorage.setItem("adminKey", KEY); $("#loginerr").textContent = ""; start(); } catch (e) { $("#loginerr").textContent = e.message; } }
 
+$("#theme").onclick = () => setTheme(curTheme() === "dark" ? "light" : "dark"); themeIcon();
 $("#go").onclick = signIn; $("#key").onkeydown = e => e.key === "Enter" && signIn(); $("#out").onclick = signOut;
 $("#runproj").onclick = loadProjection; $("#errgo").onclick = loadErrors; $("#loggo").onclick = () => loadLogs(false);
 async function sendCmd(cmd, extra = {}) {
   const r = await api("/control", {method: "POST", body: JSON.stringify({command: cmd, ...extra})});
   toast(r.note); setTimeout(refresh, 2500); return r;
 }
-const TYPED = {restart: "restart", standby: "standby", stop: "stop", kill: "KILL"};
+const TYPED = {restart: "restart", standby: "standby", stop: "stop", kill: "KILL", test_trade: "TEST"};
 document.querySelectorAll("[data-cmd]").forEach(b => b.onclick = async () => {
   const cmd = b.dataset.cmd; let confirm = "", extra = {};
   try {
@@ -396,7 +445,8 @@ document.querySelectorAll("[data-cmd]").forEach(b => b.onclick = async () => {
       if (confirm !== "release") return toast("Cancelled.");
     } else if (TYPED[cmd]) {
       const extraMsg = cmd === "kill" ? ($("#kill-close").checked ? "\nAll open positions will be CLOSED at market." : "\nOpen positions stay open with their stops.") : "";
-      confirm = prompt(`This will ${cmd === "kill" ? "engage the KILL SWITCH and lock trading" : cmd + " the engine"}.${extraMsg}\nType "${TYPED[cmd]}" to confirm:`) || "";
+      const what = cmd === "kill" ? "engage the KILL SWITCH and lock trading" : cmd === "test_trade" ? "place ONE 0.01-lot XAUUSD buy on the MT5 DEMO account (play money)" : cmd + " the engine";
+      confirm = prompt(`This will ${what}.${extraMsg}\nType "${TYPED[cmd]}" to confirm:`) || "";
       if (confirm !== TYPED[cmd]) return toast("Cancelled.");
       if (cmd === "kill") extra.close_positions = $("#kill-close").checked;
     } else if (cmd === "dry_run") {
@@ -419,7 +469,14 @@ async function pollDryTest() {
 $("#btn-start").onclick = async () => {
   try { const r = await api("/engine/start", {method: "POST", body: "{}"}); toast(r.note); setTimeout(refresh, 4000); } catch (e) { toast("Failed: " + e.message); }
 };
-addEventListener("resize", () => refresh());
+// Re-render on a real width change only. Phones fire "resize" when the address bar slides
+// in and out (height only) and at page load, before sign-in; neither may trigger requests.
+let lastW = innerWidth, rzTimer = null;
+addEventListener("resize", () => {
+  if (innerWidth === lastW) return;
+  lastW = innerWidth; clearTimeout(rzTimer);
+  rzTimer = setTimeout(() => { if (KEY && !$("#app").hidden) refresh(); }, 300);
+});
 if (KEY) { signIn(); } else { $("#login").hidden = false; }
 </script>
 </body>
