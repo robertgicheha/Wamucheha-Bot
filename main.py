@@ -248,6 +248,23 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
     return signal
 
 
+def mt5_account_is_demo(server: str = "") -> bool:
+    """True only if the BROKER says the connected MT5 account is a demo account.
+
+    MT5 reports this itself (account trade_mode 0 = demo), which is far more reliable than
+    guessing from the server name: Exness demo servers are called "...MT5Trial9", with no
+    "demo" in them. A server name that says "demo" is accepted too. Any doubt -> False.
+    """
+    try:
+        from core.mt5_client import get_mt5
+        info = get_mt5().account_info()
+        if not info:
+            return False
+        return int(getattr(info, "trade_mode", 2)) == 0 or "demo" in str(server).lower()
+    except Exception:
+        return False
+
+
 def sync_demo_balance(state, tolerance_pct: float = 0.5):
     """Align the trading balance with the MT5 DEMO account's balance.
 
@@ -379,14 +396,14 @@ def main():
     mt5_login = int(os.environ.get("MT5_LOGIN", "0") or "0")
     mt5_password = os.environ.get("MT5_PASSWORD", "")
     mt5_server = os.environ.get("MT5_SERVER", "")
-    # Opt-in: send REAL orders to the MT5 DEMO account (play money). Honoured only when
-    # the server name says "demo", so it can never put real money at risk, and it is
-    # independent of LIVE_TRADING (which stays false and keeps crypto simulated).
-    mt5_demo_orders = (os.environ.get("MT5_DEMO_ORDERS", "false").lower() == "true"
-                       and "demo" in mt5_server.lower())
+    # Opt-in: send REAL orders to the MT5 DEMO account (play money). It only switches on
+    # AFTER the broker confirms the connected account is a demo (mt5_account_is_demo), so
+    # it can never put real money at risk; it is independent of LIVE_TRADING (which stays
+    # false and keeps crypto simulated). Until verified, MT5 orders are simulated.
+    mt5_demo_requested = os.environ.get("MT5_DEMO_ORDERS", "false").lower() == "true"
+    mt5_demo_orders = False
     if mt5_login and venue_enabled("mt5"):
-        print(f"  MT5: login={mt5_login} server={mt5_server} "
-              f"({'DEMO server' if 'demo' in mt5_server.lower() else 'LIVE — real money'})")
+        print(f"  MT5: login={mt5_login} server={mt5_server} (checking demo/live with the broker...)")
         mt5_exec = MT5Executor(
             state_manager=state,
             risk_manager=risk,
@@ -394,8 +411,8 @@ def main():
             login=mt5_login,
             password=mt5_password,
             server=mt5_server,
-            dry_run=not (LIVE_TRADING or mt5_demo_orders),
-            allow_min_lot=CONFIG["execution"].get("mt5_allow_min_lot", False) or mt5_demo_orders,
+            dry_run=not LIVE_TRADING,
+            allow_min_lot=CONFIG["execution"].get("mt5_allow_min_lot", False),
             # Bridge-side guards, enforced on the Windows box independently of
             # the engine so a compromised engine still cannot place a runaway
             # order. Sized well above what the risk manager allows in normal
@@ -407,6 +424,17 @@ def main():
         )
         if mt5_exec.connect():
             executors["mt5"] = mt5_exec
+            is_demo = mt5_account_is_demo(mt5_server)
+            mt5_exec.is_demo = is_demo
+            print(f"  MT5 account is a {'DEMO account (play money)' if is_demo else 'LIVE account (REAL MONEY)'}")
+            if mt5_demo_requested and not LIVE_TRADING:
+                if is_demo:
+                    mt5_demo_orders = True
+                    mt5_exec.dry_run = False
+                    mt5_exec.allow_min_lot = True
+                else:
+                    print("  MT5_DEMO_ORDERS ignored: the broker says this is NOT a demo account, "
+                          "so MT5 orders stay simulated.")
             print("  MT5 executor initialized"
                   + (" (DEMO orders ENABLED: real orders on the demo account, no real money)"
                      if mt5_demo_orders else ""))
@@ -439,7 +467,9 @@ def main():
     if LIVE_TRADING:
         mode_str = "LIVE — REAL MONEY"
     elif mt5_demo_orders:
-        mode_str = "DEMO TRADING (real orders on the MT5 demo account, play money; crypto simulated)"
+        _sim = [n for n in executors if n != "mt5"]
+        mode_str = ("DEMO TRADING (real orders on the MT5 demo account, play money"
+                    + (f"; {', '.join(_sim)} simulated" if _sim else "") + ")")
     else:
         mode_str = "DRY-RUN (simulated, no real orders)"
     print(f"*** MODE: {mode_str} ***")
@@ -514,7 +544,8 @@ def main():
         if live:
             return "LIVE - REAL MONEY"
         if mt5_demo_orders and not forced_dry:
-            return "DEMO TRADING: MT5 demo orders (play money); crypto simulated"
+            sim = [n for n in executors if n != "mt5"]
+            return "DEMO TRADING: MT5 demo orders (play money)" + (f"; {', '.join(sim)} simulated" if sim else "")
         return "DRY-RUN (simulated)"
 
     def publish_mode():

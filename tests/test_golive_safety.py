@@ -206,3 +206,39 @@ def test_feed_router_sends_slashless_symbols_to_mt5_and_pairs_to_ccxt(monkeypatc
     assert r._classify_symbol("ETHUSD") == "mt5"
     assert r._classify_symbol("BTC/USDT") == "okx"
     assert r._classify_symbol("PAXG/USDT") == "okx"
+
+
+def test_mt5_connect_reuses_an_already_logged_in_terminal(monkeypatch):
+    """A password login can hang for a broker the terminal is not set up for; if the
+    terminal is already on the right account the bot must not log in again."""
+    import core.mt5_executor as mx
+
+    class FakeInfo:
+        login = 123456789
+        balance = 10000.0
+        server = "ExnessKE-MT5Trial9"
+        leverage = 200
+
+    class FakeMT5:
+        logins = 0
+
+        def initialize(self, **kw):
+            return True
+
+        def account_info(self):
+            return FakeInfo()
+
+        def login(self, *a, **k):
+            FakeMT5.logins += 1
+            return True
+
+        def last_error(self):
+            return (1, "ok")
+
+    monkeypatch.setattr(mx, "get_mt5", lambda: FakeMT5())
+    ex = mx.MT5Executor(state_manager=None, risk_manager=None, notifier=None,
+                        login=123456789, password="x", server="ExnessKE-MT5Trial9", dry_run=True)
+    assert ex.connect() is True and FakeMT5.logins == 0
+    ex2 = mx.MT5Executor(state_manager=None, risk_manager=None, notifier=None,
+                         login=111, password="x", server="s", dry_run=True)
+    assert ex2.connect() is True and FakeMT5.logins == 1       # a different account still logs in

@@ -38,7 +38,9 @@ class MT5Feed:
         except Exception:  # ImportError on non-Windows, or MT5 bridge unreachable
             return False
 
-        if self.login:
+        info0 = mt5.account_info()
+        already = bool(info0 and self.login and int(info0.login) == int(self.login))
+        if self.login and not already:
             authorized = mt5.login(self.login, password=self.password, server=self.server)
             if not authorized:
                 mt5.shutdown()

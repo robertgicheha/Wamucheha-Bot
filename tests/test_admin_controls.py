@@ -266,10 +266,12 @@ def test_test_trade_needs_demo_mode_and_typed_word(client):
     assert r.status_code == 200 and control_channel.poll_commands()[0]["command"] == "test_trade"
 
 
-def test_mt5_demo_flag_is_honoured_only_for_demo_servers():
+def test_mt5_demo_orders_need_the_broker_to_confirm_a_demo_account():
     src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
-    assert '"demo" in mt5_server.lower()' in src
-    assert "dry_run=not (LIVE_TRADING or mt5_demo_orders)" in src
+    assert "def mt5_account_is_demo" in src and "trade_mode" in src
+    assert "mt5_demo_requested and not LIVE_TRADING" in src          # never combined with live trading
+    assert "dry_run=not LIVE_TRADING" in src                         # simulated until verified
+    assert "mt5_exec.dry_run = False" in src and "if is_demo:" in src
 
 
 # ---------- Start inside Docker ----------
@@ -348,7 +350,7 @@ def test_live_returns_prices_positions_and_floating_pnl(client, monkeypatch):
     assert abs(pos["XAUUSD"]["pnl"] - 10.0) < 1e-6          # 0.01 lot * 100 oz * (3510 - 3500)
     assert abs(pos["BTC/USDT"]["pnl"] - 500.0) < 1e-6        # short 0.5 BTC, price fell 1000
     assert abs(j["open_pnl"] - 510.0) < 1e-6 and abs(j["equity"] - (j["balance"] + 510.0)) < 1e-6
-    assert any(r["symbol"] == "XAUUSD" and r["asset"] == "gold" for r in j["prices"])
+    assert any(r["asset"] == "gold" for r in j["prices"])     # whatever the broker calls gold (XAUUSD / XAUUSDm)
     assert client.get("/api/admin/live").status_code == 401
 
 

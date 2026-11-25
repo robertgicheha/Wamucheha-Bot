@@ -371,7 +371,7 @@ function modeBar(o) {
   const mp = $("#modepill");
   mp.className = "pill " + (m.live ? "bad" : m.mt5_demo ? "warn" : "ok");
   mp.textContent = m.live ? "LIVE TRADING" : m.mt5_demo ? "DEMO TRADING" : "DRY-RUN";
-  const modeTxt = m.live ? "LIVE - REAL MONEY" : m.mt5_demo ? "MT5 DEMO orders (play money) + crypto simulated" : "DRY-RUN (simulated)";
+  const modeTxt = m.live ? "LIVE - REAL MONEY" : m.mt5_demo ? "MT5 DEMO orders (play money)" + ((m.markets || []).some(x => !x.startsWith("mt5:")) ? " + crypto simulated" : "") : "DRY-RUN (simulated)";
   const bits = [el("span", {className: "pill " + (m.live ? "bad" : m.mt5_demo ? "warn" : "ok"), textContent: modeTxt}),
     el("span", {className: "pill " + (e.state === "running" ? "ok" : e.state === "offline" || e.state === "unknown" ? "bad" : "warn"), textContent: "Engine: " + e.state})];
   if (m.kill_switch) bits.push(el("span", {className: "pill bad", textContent: "KILL SWITCH ARMED"}));
@@ -641,7 +641,7 @@ async function loadControl() {
   const [a, c, p, o, d] = await Promise.all([api("/audit"), api("/config"), api("/ping"), api("/overview"), api("/dry-test")]);
   modeBar(o); engPill(o.engine);
   $("#ctlnote").textContent = p.control_enabled ? "Commands are queued and executed by the engine within seconds. Dangerous ones (kill, restart, stop, standby) ask you to type a word." : "Control actions are DISABLED: DASHBOARD_SECRET_KEY is still the default. Change it in .env and restart the dashboard.";
-  $("#modecard").textContent = o.mode.label + (o.mode.live ? " - orders are real" : o.mode.mt5_demo ? " - gold orders go to the MT5 demo account (no real money); crypto stays simulated" : " - no real orders are sent");
+  $("#modecard").textContent = o.mode.label + (o.mode.live ? " - orders are real" : o.mode.mt5_demo ? " - orders go to the MT5 demo account (no real money)" + ((o.mode.markets || []).some(x => !x.startsWith("mt5:")) ? "; the other venue stays simulated" : "") : " - no real orders are sent");
   put("#audit", table(a.entries, [{h: "When", f: r => new Date(r.executed_at * 1000).toLocaleString()}, {h: "Command", k: "command"}, {h: "By", k: "by"}]));
   renderDryTest(d);
   $("#cfg").textContent = JSON.stringify(c, null, 2);

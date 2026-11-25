@@ -103,7 +103,7 @@ def mode_of(name: str) -> tuple[str, str]:
         return "LIVE", "ccxt venue; dry-run is the only sandbox and LIVE_TRADING gates it"
     if name == "mt5":
         server = E("MT5_SERVER")
-        if "demo" in server.lower():
+        if "demo" in server.lower() or "trial" in server.lower():
             return "demo", f"server '{server}' is a demo server"
         return "LIVE", f"server '{server}' is not a demo server"
     return "unknown", ""

@@ -28,7 +28,8 @@ def run_dry_test(executors: dict, feed_router, markets: list, signal_fn, mode_la
         add("Executors", False, "no broker/exchange executor is connected, so nothing can trade")
     for name, ex in executors.items():
         simulated = getattr(ex, "dry_run", None)
-        demo = simulated is False and "demo" in str(getattr(ex, "server", "")).lower()
+        demo = simulated is False and (bool(getattr(ex, "is_demo", False))
+                                       or "demo" in str(getattr(ex, "server", "")).lower())
         add(f"Executor: {name}", True,
             "connected, orders are SIMULATED" if simulated else
             "connected, orders are REAL but on a DEMO account (play money)" if demo else

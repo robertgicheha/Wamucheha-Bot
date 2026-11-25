@@ -86,7 +86,9 @@ class MT5Executor:
             logger.error(f"MT5 initialize failed: {mt5.last_error()}")
             return False
 
-        if self.login:
+        info0 = mt5.account_info()
+        already = bool(info0 and self.login and int(info0.login) == int(self.login))
+        if self.login and not already:
             authorized = mt5.login(self.login, password=self.password, server=self.server)
             if not authorized:
                 logger.error(f"MT5 login failed: {mt5.last_error()}")

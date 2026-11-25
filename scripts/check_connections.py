@@ -84,10 +84,13 @@ def mt5():
     if not m.login(int(E("MT5_LOGIN")), password=E("MT5_PASSWORD"), server=E("MT5_SERVER")):
         raise RuntimeError(f"login failed: {m.last_error()}")
     a = m.account_info()
-    m.symbol_select("XAUUSD", True)
-    t = m.symbol_info_tick("XAUUSD")
+    import yaml
+    gold = next((s for s in yaml.safe_load((ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))
+                 ["execution"].get("mt5_markets", []) if s.upper().startswith(("XAU", "GOLD"))), "XAUUSD")
+    m.symbol_select(gold, True)
+    t = m.symbol_info_tick(gold)
     return (f"{a.login} @ {a.server} balance={a.balance} leverage=1:{a.leverage} "
-            f"trade_allowed={getattr(a, 'trade_allowed', '?')} XAUUSD bid={t.bid if t else 'n/a'}")
+            f"trade_allowed={getattr(a, 'trade_allowed', '?')} {gold} bid={t.bid if t else 'n/a'}")
 run("MT5", mt5)
 
 # ---------- Optional alerts (no messages sent) ----------
