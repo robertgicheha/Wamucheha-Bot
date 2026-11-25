@@ -108,7 +108,7 @@ def check_and_close_positions(state_manager, executors: dict, feed_router,
             if pos["take_profit_price"] and last_price >= pos["take_profit_price"]:
                 _do_close(executor, state_manager, client_order_id, last_price, "take_profit_hit")
                 continue
-        else:  # short (OANDA/Alpaca can go short; Binance spot here does not)
+        else:  # short (MT5 can go short; crypto spot here does not)
             if pos["stop_loss_price"] and last_price >= pos["stop_loss_price"]:
                 _do_close(executor, state_manager, client_order_id, last_price, "stop_loss_hit")
                 continue

@@ -1,0 +1,5 @@
+# Optional: PyTorch LSTM direction filter (config.yaml -> ml.use_lstm: true).
+# Large download (several GB with CUDA wheels). On a CPU-only machine/container prefer:
+#   pip install torch==2.9.0 --index-url https://download.pytorch.org/whl/cpu
+-r requirements.txt
+torch==2.9.0

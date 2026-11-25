@@ -1,17 +1,14 @@
 """
 Market-hours gate shared by the entry loop and the position monitor.
 
-Trading a closed market either fails (OANDA rejects weekend orders, MT5
-returns "market closed") or queues an order that fills at the next open at an
-unknown price (Alpaca). Signals computed on a frozen weekend/overnight chart
+Trading a closed market either fails (MT5 returns "market closed") or fills at
+an unknown price at the next open. Signals computed on a frozen weekend chart
 are stale anyway, so both opening and closing are skipped until it reopens.
 
 - Crypto exchanges: always open.
-- Alpaca (US stocks/ETFs): asks the broker's /v2/clock (handles holidays,
-  half-days and DST), cached for a minute.
-- OANDA / MT5 forex, gold: closed from Friday 21:00 UTC to Sunday 22:00 UTC
-  (covers both the summer and winter New York close). MT5 crypto CFDs
-  (BTCUSD, ETHUSD) trade through the weekend.
+- MT5 gold: closed from Friday 21:00 UTC to Sunday 22:00 UTC (covers both the
+  summer and winter New York close). MT5 crypto CFDs (BTCUSD, ETHUSD) trade
+  through the weekend.
 """
 from datetime import datetime, timezone
 
@@ -34,12 +31,8 @@ def forex_market_open(now: datetime = None) -> bool:
 def market_is_open(exchange_name: str, symbol: str, executor=None) -> bool:
     if exchange_name in CRYPTO_EXCHANGES:
         return True
-    if exchange_name == "alpaca":
-        if executor is not None and hasattr(executor, "is_market_open"):
-            return executor.is_market_open()
-        return True
     if exchange_name == "mt5" and symbol.upper().startswith(MT5_CRYPTO_PREFIXES):
         return True
-    if exchange_name in ("oanda", "mt5"):
+    if exchange_name == "mt5":
         return forex_market_open()
     return True

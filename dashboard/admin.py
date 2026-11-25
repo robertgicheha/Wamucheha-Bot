@@ -11,6 +11,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import time
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timedelta, timezone
@@ -19,7 +21,8 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from core import control_channel
+from core import control_channel, dry_test
+from dashboard import market_data
 from core.state_manager import SNAPSHOT_PATH
 from reporting import analytics
 
@@ -140,7 +143,28 @@ def overview():
     err_lines = _tail(LOG_DIR / "errors.log", 2000)
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
     errors_24h = sum(1 for l in err_lines if l[:32] >= cutoff)
+    hb = _read_json(HEARTBEAT)
+    try:
+        flows = _state().get_cash_flow_totals()
+    except Exception:
+        flows = {}
+    metrics = analytics.compute_metrics(trades, snap.get("trading_balance") or 0.0)
+    balance = snap.get("trading_balance") or 0.0
+    paid_out = flows.get("swept", 0.0) + flows.get("returned", 0.0)
+    start_cap = round(balance - (metrics.get("total_pnl") or 0.0) + flows.get("swept", 0.0), 4)
+    capital = {
+        "starting_capital": start_cap,                       # derived: what the account began with
+        "balance_now": round(balance, 4),                    # after all closed trades and payouts
+        "paid_out": round(paid_out, 4),                      # profit already moved out to you
+        "total_value": round(balance + paid_out, 4),         # balance + what you already took out
+        "return_pct": round(((balance + paid_out) / start_cap - 1) * 100, 2) if start_cap else None,
+    }
+    live_env = os.environ.get("LIVE_TRADING", "false").lower() == "true"
     return {
+        "mode": {"label": hb.get("mode") or ("LIVE - REAL MONEY" if live_env else "DRY-RUN (simulated)"),
+                 "live": bool(hb.get("live")), "kill_switch": bool(hb.get("kill_switch")),
+                 "markets": hb.get("markets", [])},
+        "capital": capital,
         "engine": _engine_status(),
         "risk": {k: snap.get(k) for k in ("trading_balance", "peak_balance", "daily_pnl",
                                           "consecutive_losses", "trading_halted", "halt_reason",
@@ -148,7 +172,7 @@ def overview():
         "open_positions": len(open_pos),
         "today": {"trades": len(today_trades),
                   "pnl": round(sum((t.get("pnl") or 0) for t in today_trades), 4)},
-        "metrics": analytics.compute_metrics(trades, snap.get("trading_balance") or 0.0),
+        "metrics": metrics,
         "errors_24h": errors_24h,
         "pending_commands": control_channel.pending_count(),
         "server_time": datetime.now(timezone.utc).isoformat(),
@@ -308,18 +332,129 @@ class ControlBody(BaseModel):
     command: str
     confirm: str = ""
     note: str = ""
+    close_positions: bool = False
+
+
+# verbs that need the operator to type a word: a mis-click must not do these
+_CONFIRM_WORD = {"restart": "restart", "standby": "standby", "stop": "stop", "kill": "KILL"}
 
 
 @router.post("/control")
 def control(body: ControlBody, request: Request, _=Depends(require_control_key)):
     if body.command not in control_channel.ALLOWED_COMMANDS:
         raise HTTPException(400, f"command must be one of {sorted(control_channel.ALLOWED_COMMANDS)}")
-    # Disruptive verbs need the operator to retype the verb: a mis-click can't restart the bot.
-    if body.command in ("restart", "standby") and body.confirm != body.command:
-        raise HTTPException(400, f"type '{body.command}' in the confirm field to proceed")
+    need = _CONFIRM_WORD.get(body.command)
+    if need and body.confirm != need:
+        raise HTTPException(400, f"type '{need}' in the confirm field to proceed")
+    args = {}
+    if body.command == "kill":
+        args["close_positions"] = bool(body.close_positions)
+    if body.command == "resume" and _read_json(HEARTBEAT).get("kill_switch"):
+        # A kill switch is a deliberate lock: releasing it takes a second, explicit confirmation.
+        if body.confirm != "release":
+            raise HTTPException(409, "the kill switch is armed; type 'release' to resume trading")
+        args["release_kill"] = True
     who = f"dashboard@{request.client.host if request.client else '?'}"
-    sent = control_channel.send_command(body.command, by=who, note=body.note)
+    sent = control_channel.send_command(body.command, by=who, note=body.note, args=args)
     return {"queued": True, "command": sent,
             "note": "The engine applies this on its next loop tick (seconds). If the engine "
                     f"is offline the command is discarded after "
                     f"{control_channel.MAX_COMMAND_AGE_SECONDS // 60} minutes."}
+
+
+# ---------- start the engine (native runs) ----------
+PID_FILE = DATA_DIR / "engine.pid"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            return str(pid) in out
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+@router.post("/engine/start")
+def engine_start(request: Request, _=Depends(require_control_key)):
+    """Launch main.py as a detached process. Only for native (non-container) runs; in
+    Docker the engine is its own supervised service and is started with docker compose."""
+    if Path("/.dockerenv").exists():
+        raise HTTPException(400, "running in a container: start the engine service with "
+                                 "`docker compose up -d engine` instead")
+    status = _engine_status()
+    if status["state"] in ("running", "halted", "standby", "starting", "restarting"):
+        raise HTTPException(409, f"engine is already {status['state']}")
+    try:
+        if PID_FILE.exists() and _pid_alive(int(PID_FILE.read_text().strip() or 0)):
+            raise HTTPException(409, "an engine process started from here is still alive")
+    except ValueError:
+        pass
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    out = open(LOG_DIR / "engine_stdout.log", "ab")
+    flags = (subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0
+    proc = subprocess.Popen([sys.executable, "-u", "main.py"], cwd=str(ROOT), stdout=out, stderr=out,
+                            stdin=subprocess.DEVNULL, creationflags=flags,
+                            start_new_session=(os.name != "nt"))
+    PID_FILE.write_text(str(proc.pid))
+    control_channel.append_audit({"command": "start",
+                                  "by": f"dashboard@{request.client.host if request.client else '?'}",
+                                  "id": f"pid{proc.pid}"})
+    return {"started": True, "pid": proc.pid,
+            "note": "Engine launching. It appears as running in about a minute; output goes to "
+                    "data/logs/engine_stdout.log."}
+
+
+# ---------- dry test + market data ----------
+@router.get("/dry-test", dependencies=[Depends(require_key)])
+def dry_test_result():
+    return dry_test.read_dry_test() or {"checks": [], "summary": "No dry test has been run yet."}
+
+
+@router.get("/symbols", dependencies=[Depends(require_key)])
+def symbols():
+    mt5 = []
+    try:
+        import yaml
+        cfg = yaml.safe_load((ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))
+        mt5 = list(cfg.get("execution", {}).get("mt5_markets", []))
+    except Exception:
+        pass
+    return {"symbols": market_data.default_symbols(mt5), "timeframes": market_data.TIMEFRAMES,
+            "traded": mt5}
+
+
+@router.get("/candles", dependencies=[Depends(require_key)])
+def candles(symbol: str, tf: str = "15m", limit: int = 300, source: str = "auto"):
+    if not re.fullmatch(r"[A-Za-z0-9]{2,12}(/[A-Za-z0-9]{2,12})?([._-][A-Za-z0-9]{1,8})?", symbol):
+        raise HTTPException(400, "bad symbol")
+    try:
+        data = market_data.fetch_candles(symbol, tf, limit, source)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(502, f"no data source could provide {symbol}: {e}")
+    since = data["candles"][0]["time"]
+    marks = []
+    try:
+        rows = _closed_trades(2000) + _state().get_open_positions()
+    except Exception:
+        rows = []
+    for t in rows:
+        if t.get("symbol") != symbol:
+            continue
+        for kind, ts, px in (("entry", t.get("opened_at"), t.get("entry_price")),
+                             ("exit", t.get("closed_at"), t.get("exit_price"))):
+            dt = None
+            try:
+                dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00")).timestamp() if ts else None
+            except Exception:
+                pass
+            if dt and px and dt >= since:
+                marks.append({"time": int(dt), "kind": kind, "side": t.get("side"), "price": px,
+                              "pnl": t.get("pnl")})
+    data["markers"] = marks
+    return data

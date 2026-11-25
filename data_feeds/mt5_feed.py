@@ -4,6 +4,8 @@ MetaTrader 5 data feed.
 Fetches OHLCV data from the MT5 terminal for any symbol available
 on the connected broker (forex, metals, crypto, indices, etc.).
 """
+import os
+
 import pandas as pd
 from datetime import datetime, timezone
 
@@ -28,7 +30,10 @@ class MT5Feed:
     def connect(self) -> bool:
         try:
             mt5 = get_mt5()
-            if not mt5.initialize():
+            kwargs = {"timeout": 30000}
+            if os.environ.get("MT5_TERMINAL_PATH", "").strip():
+                kwargs["path"] = os.environ["MT5_TERMINAL_PATH"].strip()
+            if not mt5.initialize(**kwargs):
                 return False
         except Exception:  # ImportError on non-Windows, or MT5 bridge unreachable
             return False

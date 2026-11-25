@@ -62,15 +62,13 @@ VENUE_META = {
     "okx":     "OKX",
     "bybit":   "Bybit",
     "kraken":  "Kraken",
-    "oanda":   "OANDA",
-    "alpaca":  "Alpaca",
     "mt5":     "MetaTrader 5",
     "paper":   "Paper",
 }
 # Venues whose balances are not USDT in a hot wallet — the operator funds
 # these through a broker dashboard, not a chain transfer. Worth saying in a
 # log line so nobody waits for an on-chain deposit that was never coming.
-BROKER_VENUES = {"mt5", "oanda", "alpaca"}
+BROKER_VENUES = {"mt5"}
 
 
 def venue_name(venue: str) -> str:

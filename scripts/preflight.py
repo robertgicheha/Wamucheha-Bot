@@ -38,10 +38,6 @@ VENUE_RULES = {
                 ("KRAKEN_API_SECRET", "no orders")],
     "coinbase": [("COINBASE_API_KEY", "no market data or orders"),
                  ("COINBASE_API_SECRET", "no orders")],
-    "oanda":   [("OANDA_API_KEY", "no forex data or orders"),
-                ("OANDA_ACCOUNT_ID", "OANDA is skipped entirely without it")],
-    "alpaca":  [("ALPACA_API_KEY", "no US equity data or orders"),
-                ("ALPACA_API_SECRET", "no orders")],
     "mt5":     [("MT5_LOGIN", "MT5 is skipped entirely without it"),
                 ("MT5_PASSWORD", "login fails"),
                 ("MT5_SERVER", "login fails")],
@@ -51,7 +47,6 @@ VENUE_RULES = {
 # an MT5 account from an exchange.
 NON_CRYPTO_FUNDING = {
     "mt5": "broker deposit (card / bank / M-Pesa) — cannot be funded by USDT transfer",
-    "alpaca": "bank or wire transfer — cannot be funded by USDT transfer",
 }
 
 # Networks this bot can settle USDT over, with the shape of a valid address on
@@ -106,12 +101,6 @@ def mode_of(name: str) -> tuple[str, str]:
         if not E(f"{name.upper()}_API_KEY"):
             return "unconfigured", "no API key"
         return "LIVE", "ccxt venue; dry-run is the only sandbox and LIVE_TRADING gates it"
-    if name == "oanda":
-        practice = E("OANDA_PRACTICE").lower() == "true"
-        return ("practice" if practice else "LIVE", "OANDA_PRACTICE=false targets api-fxtrade")
-    if name == "alpaca":
-        paper = E("ALPACA_PAPER").lower() == "true"
-        return ("paper" if paper else "LIVE", "ALPACA_PAPER=false targets api.alpaca.markets")
     if name == "mt5":
         server = E("MT5_SERVER")
         if "demo" in server.lower():
@@ -129,7 +118,7 @@ def main() -> int:
     # ---------- 1. mode flags that are independent of LIVE_TRADING ----------
     print("\n[1] Mode flags")
     if live:
-        for name in ("oanda", "alpaca", "mt5"):
+        for name in ("mt5",):
             if any(e.get("name") == name and e.get("enabled")
                    for e in CFG["execution"]["exchanges"]):
                 m, why = mode_of(name)
@@ -140,11 +129,6 @@ def main() -> int:
                     ok(f"{name.upper()} is enabled but {m} ({why})")
     else:
         ok("LIVE_TRADING=false — no real orders can be placed regardless of other flags")
-        for name in ("oanda", "alpaca"):
-            if E(f"{name.upper()}_PRACTICE" if name == "oanda" else f"{name.upper()}_PAPER").lower() == "false":
-                warn(f"{name.upper()} points at a LIVE endpoint, but LIVE_TRADING=false "
-                     f"keeps it in dry-run. Set the flag true, or the venue disabled, "
-                     f"before ever setting LIVE_TRADING=true.")
     mt5_server = E("MT5_SERVER")
     if mt5_server and "demo" not in mt5_server.lower():
         warn(f"MT5_SERVER='{mt5_server}' is not a demo server — MT5 would trade real money")
@@ -190,8 +174,7 @@ def main() -> int:
         for sym in ex.get("markets") or []:
             total += 1
     print(f"  {total} crypto/ccxt symbols configured")
-    for key, label in (("oanda_markets", "oanda"), ("mt5_markets", "mt5"),
-                       ("alpaca_markets", "alpaca")):
+    for key, label in (("mt5_markets", "mt5"),):
         syms = CFG["execution"].get(key) or []
         is_enabled = any(e.get("name") == label and e.get("enabled")
                          for e in CFG["execution"]["exchanges"])
@@ -329,11 +312,8 @@ def main() -> int:
 
     # ---------- 6. credentials hygiene ----------
     print("\n[6] Credential hygiene")
-    if E("RAPID_API_KEY") and E("RAPID_API_KEY") == E("NEWSAPI_KEY"):
-        blocker("RAPID_API_KEY is a duplicate of NEWSAPI_KEY — a known-invalid "
-                "credential. Remove it; use NSE_RAPIDAPI_KEY for RapidAPI.")
     for var in ("BINANCE_API_SECRET", "OKX_API_SECRET", "BYBIT_API_SECRET",
-                "OANDA_API_KEY", "ALPACA_API_SECRET", "MT5_PASSWORD"):
+                "MT5_PASSWORD"):
         if E(var) and len(E(var)) < 8:
             blocker(f"{var} looks truncated ({len(E(var))} chars)")
     ok("no truncated secrets")

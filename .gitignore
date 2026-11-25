@@ -26,3 +26,9 @@ build/
 .env
 *.bak
 data/fx_trend.db*
+
+# runtime state written by the engine
+data/control/
+data/engine_heartbeat.json*
+data/.last_retrain
+data/engine.pid

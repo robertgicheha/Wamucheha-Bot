@@ -15,6 +15,15 @@ Verbs:
   standby  "shutdown": stop trading AND stop polling markets; process stays up
            (under `restart: unless-stopped` a real exit would just be restarted)
   restart  engine exits cleanly; the container supervisor starts it again
+  kill     KILL SWITCH: halt immediately and LOCK the halt (a plain resume is refused;
+           release needs resume with args.release_kill). args.close_positions=True
+           also closes every open position at market.
+  stop     real process exit with no restart request (native runs; under a supervisor
+           it will simply be relaunched)
+  dry_run  force every executor into simulated mode. There is deliberately NO verb that
+           turns real trading ON: going live needs LIVE_TRADING=true in .env + restart.
+  dry_test one-shot self-test (connectivity, data, signals) that places no orders;
+           result lands in data/control/dry_test.json
 """
 import json
 import os
@@ -24,7 +33,7 @@ from pathlib import Path
 
 CONTROL_DIR = Path(os.environ.get("CONTROL_DIR",
                                   Path(__file__).parent.parent / "data" / "control"))
-ALLOWED_COMMANDS = {"halt", "resume", "standby", "restart"}
+ALLOWED_COMMANDS = {"halt", "resume", "standby", "restart", "kill", "stop", "dry_run", "dry_test"}
 MAX_COMMAND_AGE_SECONDS = 600   # a command queued while the engine was down must not
                                 # fire minutes later on an unrelated boot
 
@@ -34,11 +43,12 @@ def _dir() -> Path:
     return CONTROL_DIR
 
 
-def send_command(command: str, by: str = "dashboard", note: str = "") -> dict:
+def send_command(command: str, by: str = "dashboard", note: str = "", args: dict | None = None) -> dict:
     if command not in ALLOWED_COMMANDS:
         raise ValueError(f"unknown command {command!r}")
     payload = {"id": uuid.uuid4().hex[:12], "command": command, "by": by,
-               "note": note[:200], "ts": time.time()}
+               "note": note[:200], "ts": time.time(),
+               "args": {k: v for k, v in (args or {}).items() if isinstance(v, (bool, int, str))}}
     d = _dir()
     tmp = d / f".{payload['id']}.tmp"
     tmp.write_text(json.dumps(payload))

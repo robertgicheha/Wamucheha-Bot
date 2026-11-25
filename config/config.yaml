@@ -27,8 +27,6 @@ fees:
     binance: 10                  # 0.10% spot taker, standard tier
     okx: 10
     bybit: 10
-    alpaca: 0                    # commission-free equities
-    oanda: 0                     # cost is in the spread, not a commission line
     mt5: 0                       # cost is in the spread
   network: BEP20                 # must match TRANSFER_NETWORK in .env. The two
                                  # are kept in step because this drives the
@@ -100,32 +98,27 @@ execution:
   # fractions, and a 5% move earns the same % whatever the price. What matters
   # is 24h volume, spread, and that volatility comfortably exceeds
   # fees + spread. Thin pairs (QNT) are added last and capped.
+  # Scope: CRYPTO and GOLD only.
+  #   * Crypto + tokenised gold (PAXG/USDT, 1 token = 1 oz of gold) trade through ccxt.
+  #     OKX serves candles without API keys, so a DRY-RUN needs no credentials, and it
+  #     also works inside Docker.
+  #   * Spot gold (XAUUSD) trades through the MetaTrader 5 terminal, which only runs on
+  #     Windows, so that venue works for a natively-run engine, not a Linux container.
   exchanges:
-    # Crypto - disabled as requested
-    - name: binance
-      enabled: false
-      markets: []
     - name: okx
+      enabled: true
+      markets: ["BTC/USDT", "ETH/USDT", "PAXG/USDT"]
+    - name: binance
       enabled: false
       markets: []
     - name: bybit
       enabled: false
       markets: []
-    # Forex/CFD via OANDA - disabled as requested
-    - name: oanda
-      enabled: false
-      markets: []
-    # US equities - disabled for live trading (analysis only via long_term)
-    - name: alpaca
-      enabled: false
-      markets: []
     - name: mt5
       enabled: true
       markets: []
-  oanda_markets: []
   mt5_markets:
-    - "XAUUSD"  # Trade Gold only on MT5 via Fusion Markets (Fusion Markets broker)
-  alpaca_markets: []
+    - "XAUUSD"  # spot gold via the MT5 terminal
   # MT5's minimum order is 0.01 lot (~$1,000 EURUSD, ~$4,000 gold) — far above
   # max_position_pct of a small trading balance. false: skip such trades.
   # true: trade the minimum lot anyway (only sensible on a demo account).
@@ -231,63 +224,15 @@ ml:
 
 intelligence:
   fear_greed_enabled: true       # use Fear & Greed index as market regime filter
-  dxy_enabled: true              # use Dollar Index for forex correlation
+  dxy_enabled: true              # use the Dollar Index as a gold/crypto headwind filter
   correlation_lookback: 20       # bars for cross-asset correlation
-  news_sentiment_enabled: true   # use news sentiment as additional filter
-
-long_term:
-  # Free by default: US/ETF data+fundamentals via yfinance (no key/signup),
-  # NSE prices via RapidAPI NSE_RAPIDAPI_KEY (optional, gives the whole
-  # exchange in one request) with a free afx.kwayisi.org fallback, and NSE
-  # fundamentals via afx.kwayisi.org — RapidAPI's /stocks endpoint returns no
-  # P/E, EPS or dividend data. FMP/Alpha Vantage keys in .env are optional
-  # richer fallbacks, not required.
-  universe:
-    us_stocks: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "JNJ", "KO",
-                "PG", "V", "JPM", "XOM", "WMT", "HD", "UNH", "PEP", "AVGO"]
-    etfs: ["SPY", "QQQ", "VOO", "VTI", "GLD", "SCHD", "VYM"]
-    # Verified against the live afx.kwayisi.org/nse/ listed-companies table.
-    nse_kenya: ["SCOM", "EQTY", "KCB", "EABL", "BAT", "COOP", "ABSA", "SCBK",
-                "NCBA", "DTK", "BAMB", "JUB", "KEGN", "KPLC", "BRIT", "SASN",
-                "CTUM", "NMG", "UMME", "IMH"]
-    # Kenya's own exchange-traded funds, listed on the NSE. These are separate
-    # from the US ETFs above and are scored on the same NSE data as the Kenyan
-    # equities (quoted in KES, no free expense-ratio or AUM series exists), so
-    # the digest shows price and 1-year return for them and "n/a" for the
-    # US-only fee/5-year/AUM columns rather than borrowing a US number.
-    nse_etfs: ["GLD", "SMWF"]
-  screens:
-    min_dividend_years_growth: 5
-    max_payout_ratio: 70
-    min_market_cap_usd: 500000000
-  sell_review:
-    trend_drop_pct: 8          # flag "consider selling" if price fell at least this much...
-    lookback_days: 5           # ...over this many trading days
-  gainers_losers_top_n: 8
-  rebalance_alert_schedule: "0 8 * * MON"    # cron: weekly deep fundamentals screen, Monday 8am UTC
-  daily_digest_schedule: "30 5 * * *"        # cron: daily buy/sell/gainers/losers digest, 05:30 UTC (~08:30 EAT, before NSE's 09:30 EAT open)
-  dashboard_refresh_interval_minutes: 60     # how often the dashboard's long-term cache refreshes (price/gainers-losers only, no fundamentals calls)
-
-nse:
-  watchlist: ["SCOM", "EQTY", "KCB", "BAT", "EABL", "DTK",
-              "COOP", "ABSA", "SCBK", "NCBA"]
-  analysis_interval_minutes: 60   # how often to check NSE stocks for alerts
-
-  # --- Exchange-wide daily snapshot (RapidAPI) ---
-  # NSE trades 09:00-15:00 EAT, so 16:00 EAT is after the close. This trigger is
-  # pinned to Africa/Nairobi in long_term/scheduler.py, so it does not depend on
-  # the host clock. It is the ONLY job permitted to call RapidAPI: the Basic plan
-  # allows 4 requests/hour and 250/month, and this costs ~22 calls/month.
-  snapshot_schedule: "0 16 * * MON-FRI"
-  misfire_grace_minutes: 180       # if the process was down at 16:00, still take the close
-  fundamentals_max_workers: 4      # threads hitting the free afx.kwayisi.org site for P/E etc.
+  news_sentiment_enabled: false  # news provider was removed; kept off
 
 alerts:
-  channels: [telegram, discord, email, dashboard]
-  # NOTE: this block is not read by the code. Per-event channel routing lives in
-  # code — see EMAIL_ALLOWED_EVENTS in alerts/notifier.py, which decides the only
-  # event type that reaches email (the daily investing digest). Everything else
-  # is Telegram/Discord only.
+  channels: [telegram, email, dashboard]
+  # NOTE: this block is not read by the code. Per-event routing lives in
+  # alerts/notifier.py. Alerts are optional: with no TELEGRAM_BOT_TOKEN/email
+  # configured the bot simply logs them, and the dashboard is the control surface.
   notify_on:
     - trade_opened
     - trade_closed
@@ -295,9 +240,6 @@ alerts:
     - daily_loss_limit_hit
     - profit_swept_to_stake
     - heartbeat_missed
-    - long_term_signal
-    - long_term_daily_digest
-    - nse_alert
     - market_regime_change
     - window_report
     - daily_report

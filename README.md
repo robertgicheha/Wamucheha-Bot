@@ -1,25 +1,23 @@
-# Trading Bot — Multi-Asset Stake-Protected Compounding System
+# Trading Bot: Crypto + Gold, Stake-Protected Compounding
 
-A risk-first algorithmic trading system across crypto (Binance, OKX), forex/gold
-(OANDA), US stocks/ETFs (Alpaca), and Kenyan stocks (NSE alerts), with a
-non-predictive equity screener for long-term investing.
+A risk-first algorithmic trading system for **crypto** (OKX, Binance, Bybit via ccxt)
+and **gold** (spot XAUUSD via MetaTrader 5, plus the tokenised PAXG/USDT pair on OKX),
+with a browser admin console (`/admin`) to start, pause, kill, dry-test and monitor it.
 
 ## Honesty first
 No bot can guarantee profit or "tell you which stock makes you richest." This system
 is built to (a) protect your capital aggressively, (b) fail loudly and safely rather
-than silently, and (c) give you evidence-based alerts for long-term investing — not
+than silently, and (c) show you honest, evidence-based performance numbers, not
 predictions dressed up as certainty. Backtest and paper-trade for months before real
 money touches it.
 
-## Supported exchanges & brokers
+## Supported markets
 
-| Exchange | Asset Class | Automated Trading | Paper Trading |
-|----------|------------|-------------------|---------------|
-| Binance | Crypto (BTC, ETH, SOL, etc.) | Yes | Dry-run mode |
-| OKX | Crypto (BTC, ETH, SOL, etc.) | Yes | Dry-run mode |
-| OANDA | Forex (EUR/USD, GBP/USD), Gold (XAU/USD) | Yes | Practice account |
-| Alpaca | US Stocks & ETFs (AAPL, SPY, GLD, QQQ) | Yes | Paper trading built-in |
-| NSE Kenya | Kenyan Stocks (SCOM, EQTY, KCB) | Alerts only | N/A |
+| Venue | Markets | Automated trading | Paper trading |
+|-------|---------|-------------------|---------------|
+| OKX (ccxt) | BTC/USDT, ETH/USDT, PAXG/USDT (gold token) | Yes | Dry-run mode (works in Docker, no API keys needed for data) |
+| Binance, Bybit (ccxt) | Crypto | Yes (disabled by default) | Dry-run mode |
+| MetaTrader 5 | XAUUSD (spot gold) | Yes | Demo account + dry-run. **Windows only** (the MT5 terminal does not run in Linux containers) |
 
 ---
 
@@ -29,20 +27,39 @@ money touches it.
 ```bash
 git clone <your-repo-url> trading_bot
 cd trading_bot
-python3 -m venv venv
-source venv/bin/activate        # Windows: venv\Scripts\activate
+python3 -m venv .venv
+source .venv/bin/activate       # Linux/macOS (bash)
+pip install -r requirements.txt
+```
+
+Windows PowerShell (`source` does not exist there, and the folder is `.venv`).
+Run `python -m venv .venv` **only once**; it fails with "Permission denied" if the venv is active or in use.
+Next time just activate it:
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1      # if blocked: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 pip install -r requirements.txt
 ```
 
 ### 2. Configure
 ```bash
-cp .env.example .env
+cp .env.example .env            # PowerShell: Copy-Item .env.example .env
 ```
 
-Edit `.env` with your API keys. At minimum, fill in:
-- `BINANCE_API_KEY` + `BINANCE_API_SECRET` (for crypto)
-- `STAKE_AMOUNT=10` (start small for testing)
+Edit `.env`. At minimum, fill in:
+- `LIVE_TRADING=false` (keep it `false` until `python scripts/paper_readiness.py` says READY)
+- `DASHBOARD_SECRET_KEY=<long random string>` (the admin console's control buttons stay disabled while it is `change_me`)
+- `STAKE_AMOUNT` (start small for testing)
 - `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` (for alerts)
+- Crypto venues (only if enabled in `config/config.yaml`): `BINANCE_API_KEY` + `BINANCE_API_SECRET`, etc.
+- **MT5 (the default venue, trades XAUUSD):** `MT5_LOGIN`, `MT5_PASSWORD`, `MT5_SERVER`.
+  Leave `MT5_RPC_HOST` empty on Windows. If several MT5 terminals are installed, set
+  `MT5_TERMINAL_PATH` to the one you use.
+
+**MT5 prerequisites (Windows):** install the MetaTrader 5 desktop app, open a **demo** account in it
+(File -> Open an Account) and confirm it connects (green bars, bottom right) *before* starting the bot.
+The `MetaTrader5` Python package only works on Windows, so the engine must run natively on Windows
+(not inside a Linux container).
 
 ### Fund your exchange accounts (manual, one-time)
 The bot **never moves money**. Funding is **one funder, one settlement, no
@@ -67,28 +84,40 @@ STAKE_AMOUNT=500     # $500 stake
 This overrides `config.yaml` without editing code. The stake is capital
 that is NEVER traded — only profits from trading are risked.
 
-### 4. Run the bot
+### 4. Check your setup, then run the bot
 ```bash
-python main.py
+python scripts/preflight.py     # read every blocker/warning first
+python main.py                  # keep this terminal open (Ctrl+C stops it)
 ```
+A healthy start prints `MT5 executor initialized` and `MODE: DRY-RUN`. If it prints
+`MT5 connection failed`, fix the MT5 login (see Troubleshooting) and restart.
 
-### 5. Run the dashboard (separate terminal)
+### 5. Run the dashboard (separate terminal, venv activated)
 ```bash
 uvicorn dashboard.app:app --host 127.0.0.1 --port 8000
 ```
-Open http://127.0.0.1:8000 in your browser.
+- http://127.0.0.1:8000 : main dashboard
+- http://127.0.0.1:8000/admin : admin console (performance, errors, logs, projections, halt/resume/restart). Sign in with `DASHBOARD_SECRET_KEY`.
 
-### 6. Run the long-term screener (separate terminal)
-```bash
-python long_term/scheduler.py
-```
+The engine and dashboard share the `data/` folder, so start both from the project root.
 
-### 7. Run the watchdog (separate terminal, monitors the bot)
-```bash
-# First, set VPS_HEARTBEAT_URL in .env (for local testing, point at localhost)
-# VPS_HEARTBEAT_URL=http://127.0.0.1:8000/health
-python scripts/heartbeat_monitor.py
-```
+### Paper-trade before going live
+Follow [docs/PAPER_TRADING_CHECKLIST.md](docs/PAPER_TRADING_CHECKLIST.md). Run
+`python scripts/paper_readiness.py` weekly. Only set `LIVE_TRADING=true` after it says READY.
+
+### Troubleshooting
+| Symptom | Fix |
+|---|---|
+| `source` / `venv\Scripts\activate` not recognised | PowerShell: `.venv\Scripts\Activate.ps1` (folder is `.venv`) |
+| `MT5 initialize failed: (-6, 'Authorization failed')` | Wrong/expired MT5 login, password or server name. Log in manually in the MT5 app first |
+| MT5 start hangs or picks the wrong terminal | Set `MT5_TERMINAL_PATH` in `.env` |
+| `docker compose` 500 error | Docker Desktop engine not running; install WSL (`wsl --install --no-distribution`) and reboot |
+| Control buttons disabled in `/admin` | Change `DASHBOARD_SECRET_KEY` from `change_me` |
+
+### 6. Start the bot from the dashboard
+Run `.\start-dashboard.ps1`, open http://127.0.0.1:8000/admin, go to **Control** and press **Start**.
+That launches the engine as a background process; **Pause / Kill switch / Run dry test / Stop**
+are on the same page. The bot is in DRY-RUN unless `LIVE_TRADING=true`.
 
 ---
 
@@ -151,9 +180,8 @@ execution:
 ```bash
 sudo cp /opt/trading_bot/deploy/tradingbot.service /etc/systemd/system/
 sudo cp /opt/trading_bot/deploy/tradingbot-dashboard.service /etc/systemd/system/
-sudo cp /opt/trading_bot/deploy/tradingbot-screener.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now tradingbot tradingbot-dashboard tradingbot-screener
+sudo systemctl enable --now tradingbot tradingbot-dashboard
 sudo systemctl status tradingbot
 ```
 
@@ -205,9 +233,6 @@ scp tradingbot@YOUR_VPS_IP:/opt/trading_bot/data/backups/state_latest.db ./data/
 ```bash
 # Option A: Run the bot in dry-run mode as a standby
 python main.py    # dry_run=True by default — won't execute real trades
-
-# Option B: Run only the watchdog to monitor the VPS
-python scripts/heartbeat_monitor.py
 ```
 
 ### Automate backup sync (cron)
@@ -216,7 +241,7 @@ python scripts/heartbeat_monitor.py
 0 * * * * scp tradingbot@YOUR_VPS_IP:/opt/trading_bot/data/backups/*.db /path/to/trading_bot/data/backups/ 2>/dev/null
 ```
 
-If the VPS dies: stop the watchdog, change `dry_run=True` to `dry_run=False`
+If the VPS dies: change `dry_run=True` to `dry_run=False`
 in main.py (or the relevant executor), and your local laptop becomes the
 primary trading server. When the VPS comes back, reverse the process.
 
@@ -237,31 +262,12 @@ TELEGRAM_CHAT_ID=123456789
 ```
 
 You'll get alerts for: trade opened/closed, circuit breakers, daily PnL,
-profit sweeps, NSE analysis, heartbeat misses, and an hourly transaction/PnL
+profit sweeps, heartbeat misses, and an hourly transaction/PnL
 report (every trade closed in the last hour + running account totals).
 
-### Control the bot from Telegram/Discord (not just alerts)
-
-The steps above only make the bot able to *talk to you*. To *control* it —
-check status, see profit/loss, view past hourly logs, and kill/resume/restart —
-run the separate interactive control bots:
-
-```bash
-python control/telegram_bot.py     # polls Telegram for commands
-python control/discord_bot.py      # real Discord bot, not the webhook above
-```
-
-Commands: `/status /positions /profit /trades /logs [n] /kill /resume /restart /refresh`
-
-Both fail closed: nobody can issue a command until you allowlist them in `.env`
-— `TELEGRAM_ALLOWED_USERS` (numeric Telegram user IDs) or
-`DISCORD_ALLOWED_ROLES` (role names). An empty allowlist denies every command
-from everyone, and the engine refuses to start a control bot with no allowlist
-at all. Full setup
-(bot tokens, intents, the sudoers rule `/restart` needs) is in
-`deploy/DEPLOYMENT.md` Part 1b. For 24/7 use, install them as systemd services
-just like the engine — units are in `deploy/tradingbot-telegram.service` and
-`deploy/tradingbot-discord.service`.
+### Controlling the bot
+Control is done from the dashboard's **Control** tab (`/admin`), not from chat bots.
+Telegram here is for alerts only.
 
 ## Link Discord alerts
 
@@ -339,76 +345,50 @@ python scripts/run_backtest.py --exchange okx --symbol BTC/USDT --timeframe 15m 
 
 ---
 
-## Docker deployment (alternative)
+## Docker deployment
 
 ```bash
-# Build and start all 4 services
-docker compose up -d --build
-
-# Check status
+docker compose up -d --build     # engine + dashboard
 docker compose ps
 docker compose logs -f engine
-
-# Stop everything
 docker compose down
 ```
 
 Services:
-- `engine` — main trading loop
-- `dashboard` — FastAPI web UI
-- `screener` — weekly long-term equity analysis
-- `watchdog` — monitors the engine (ideally runs on a separate machine)
+- `engine`: the trading loop. DRY-RUN unless `LIVE_TRADING=true`. Trades crypto and the PAXG/USDT gold token.
+- `dashboard`: the admin console at http://127.0.0.1:8000/admin (`DASHBOARD_PORT` in `.env` changes the host port).
+
+**Gold via MT5 is not available in Docker** (MT5 is a Windows program). To trade XAUUSD
+through MT5, run the engine natively on Windows (dashboard Start button, or `python main.py`).
+In Docker the **Start** button does nothing useful because the engine container is always
+supervised; use **Pause/Resume** or **Standby** there.
 
 ---
 
-## Architecture (4 separate services)
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    VPS (primary)                         │
-│                                                         │
-│  Service 1: Engine (main.py)                            │
-│   ├─ Data Ingestion: Binance/OKX (ccxt), OANDA,        │
-│   │   Alpaca, NSE scraper                               │
-│   ├─ Strategy: EMA crossover + RSI + volume + LSTM      │
-│   ├─ Risk Manager: circuit breakers, position sizing    │
-│   └─ Execution: broker-specific order placement         │
-│                                                         │
-│  Service 2: Dashboard (dashboard/app.py)                │
-│   ├─ /health, /api/status                               │
-│   └─ /api/kill-switch, /api/resume                      │
-│                                                         │
-│  Service 3: Screener (long_term/scheduler.py)           │
-│   └─ Weekly fundamentals + news sentiment analysis      │
-│                                                         │
-│  Service 4: Watchdog (scripts/heartbeat_monitor.py)     │
-│   └─ Independent health monitor                         │
-│                                                         │
-│  Alerts: Telegram + Discord + Email (all channels)      │
-│  State: SQLite with WAL mode (crash-safe)               │
-└─────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────┐
-│           LOCAL LAPTOP (backup + watchdog)               │
-│  - Polls VPS /health every 60s                          │
-│  - Independent alert channel if VPS dies                │
-│  - Can take over trading if VPS is wiped                │
-│  - Pulls nightly state backups from VPS                 │
-└─────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────┐
-│              STAKE WALLET (cold storage)                 │
-│  - Bot has NO access, ever                              │
-│  - Only receives profit sweeps from trading balance     │
-│  - Set STAKE_AMOUNT in .env (e.g. 10, 100, 500)        │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│  Engine (main.py)                                        │
+│   ├─ Data: OKX/Binance/Bybit (ccxt), MT5 (gold)          │
+│   ├─ Strategy: 20-strategy ensemble + regime filter      │
+│   ├─ Risk Manager: circuit breakers, position sizing     │
+│   └─ Execution: ccxt orders / MT5 orders (dry-run first) │
+│                                                          │
+│  Dashboard (dashboard/app.py, /admin)                    │
+│   ├─ KPIs, trade log, candlestick charts, analytics      │
+│   └─ Control: start, pause, kill switch, dry test, stop  │
+│                                                          │
+│  Alerts (optional): Telegram / email                     │
+│  State: SQLite with WAL mode (crash-safe)                │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Going live — the one switch that matters
 
 `LIVE_TRADING=false` in `.env` (the default) means every exchange/broker
 executor runs in dry-run: signals still fire, trades are still logged and
-scored, but no real order ever reaches Binance/OKX/OANDA/Alpaca. Set
+scored, but no real order ever reaches OKX/Binance/Bybit/MT5. Set
 `LIVE_TRADING=true` only after you're satisfied with weeks of dry-run/paper
 results — this is the only place that decides real-vs-simulated, on purpose,
 so it's one clearly auditable line instead of scattered across executor code.
@@ -446,7 +426,6 @@ a real exit path — not a claim that it beats the market.
 - **Volatility breaker**: pauses if price moves 5%+ in 5 minutes
 - **Profit sweep**: when balance hits $500, sweeps $300 to stake wallet
 - **Stop-loss**: placed as real exchange-side order at trade entry, not just in-memory
-- **NSE**: alerts/analysis only — no automated execution (no public trading API)
 
 ## Read before going live
 - `docs/COMMON_MISTAKES.md` — real failure modes and how this system avoids them
@@ -461,12 +440,17 @@ rules on algorithmic/forex trading apply).
 ## Admin console
 
 Open `http://<host>:8000/admin` and sign in with `DASHBOARD_SECRET_KEY`. Tabs:
-Overview (engine health, balance, KPIs, equity, positions, system checks),
-Trades, Analysis (by symbol / strategy / regime / hour / weekday / venue),
+Overview (mode banner, money cards: starting capital / total after trades / paid out /
+total value, performance cards: gross profit, gross loss, win and loss rate,
+efficiency, profit factor, expectancy, drawdown, plus equity curve, positions and a
+live trade log), Market (MT5-style candlestick chart with volume, EMA 9/21 and your
+trade entries/exits; symbol, timeframe and source selectable; candles come from the
+MT5 terminal, else public exchange data, else yfinance), Trades, Analysis (by symbol / strategy / regime / hour / weekday / venue),
 Projection (Monte Carlo of your own trade results; flagged unreliable under 30
 trades; not a market forecast), Errors, Logs, Signals & Events, and Control.
 
-**Control actions** (halt, resume, standby, restart) are disabled until
+**Control actions** (start, pause, resume, kill switch, dry-run, dry test, standby,
+stop, restart) are disabled until
 `DASHBOARD_SECRET_KEY` is changed from `change_me`. The dashboard never touches
 the trading DB or Docker: it drops a command file into the shared
 `engine-control` volume (`data/control`), and the engine executes it within a
@@ -475,6 +459,14 @@ few seconds and records it in `data/control/audit.jsonl`.
 - **Standby** ("shutdown") halts trading and idles the engine but keeps the
   process alive, because `restart: unless-stopped` / `Restart=always` would
   relaunch a real exit. To stop the process itself run `docker compose stop engine`.
+- **Start** launches `main.py` as a detached process (native runs only; under Docker
+  use `docker compose up -d engine`).
+- **Kill switch** halts trading and locks it: a normal resume is refused until you type
+  `release`. Optionally closes every open position at market. Typed word: `KILL`.
+- **Mode**: the dashboard can force DRY-RUN but can never turn real trading ON. Going
+  live needs `LIVE_TRADING=true` in `.env` and a restart.
+- **Dry test** checks executor connections, candle data and strategy decisions for every
+  market without placing any order; the result appears on the Control tab.
 - **Restart** makes the engine exit cleanly so the supervisor relaunches it.
 - Engine errors (anything printed with "error/failed/exception", plus uncaught
   exceptions) are copied to `data/logs/errors.log` (5 MB cap) for the Errors tab.

@@ -439,6 +439,8 @@ class EngineHeartbeat:
         # restart, not a cold boot — worth knowing, because a crash loop looks
         # exactly like a healthy day if nobody counts restarts.
         self._restarts = self._count_restarts()
+        # Extra fields (mode, kill switch ...) the engine publishes for the dashboard.
+        self.extra = {}
 
     def _count_restarts(self) -> int:
         try:
@@ -465,6 +467,7 @@ class EngineHeartbeat:
             "restarts": self._restarts,
             "health": health,
             "ts": datetime.now(timezone.utc).isoformat(),
+            **self.extra,
         }
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)

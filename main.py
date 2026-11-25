@@ -1,19 +1,15 @@
 """
 Main entry point — run this on the VPS.
 
-Wires together state, risk, execution, and alerting across multiple asset classes:
-- Crypto (Binance, OKX via ccxt)
-- Forex (EUR/USD, GBP/USD, etc. via OANDA or MT5)
-- Commodities (XAU/USD via OANDA or MT5)
-- US Stocks/ETFs (AAPL, SPY via Alpaca)
-- MT5 (XAUUSD, BTCUSD, GBPUSD, EURUSD, AUDUSD, EURJPY, EURGBP, USDCAD)
-- Kenyan Stocks (NSE — analysis/alerts only, no automated execution)
+Wires together state, risk, execution, and alerting for two asset classes:
+- Crypto (Binance, OKX, Bybit via ccxt)
+- Gold (XAUUSD via MT5)
 
 Architecture layers:
   Strategy: 20-strategy adaptive ensemble (10 categories)
   Aggregation: Signal aggregator with conflict resolution
   Risk: Portfolio-level risk (correlation, asset-class caps, position reconciliation)
-  Execution: ccxt/OANDA/Alpaca/MT5 with slippage tracking
+  Execution: ccxt (crypto) / MT5 (gold) with slippage tracking
   Data: Feature store with indicator caching
   Monitoring: Structured JSON logging, API failure tracking, strategy performance
 """
@@ -27,8 +23,6 @@ from dotenv import load_dotenv
 from core.state_manager import StateManager
 from core.risk_manager import RiskManager
 from core.execution_manager import ExecutionManager
-from core.oanda_executor import OandaExecutor
-from core.alpaca_executor import AlpacaExecutor
 from core.mt5_executor import MT5Executor
 from core.feature_store import init_feature_store, get_feature_store
 from core.fee_manager import FeeModel
@@ -37,7 +31,7 @@ from core.structured_logger import (
     log_trade_open, log_trade_close, log_signal, log_risk_event, log_system_event,
     heartbeat, install_error_capture,
 )
-from core import control_channel
+from core import control_channel, dry_test
 from alerts.notifier import Notifier
 # Imported as `fm`, not `f`: this module already binds `f` to a file handle
 # (the config load below, and the retrain stamp), and because both are
@@ -48,7 +42,7 @@ from data_feeds.feed_router import FeedRouter
 from strategy.technical_strategy import (
     detect_cross_exchange_arbitrage, detect_triangular_arbitrage,
     generate_portfolio_rotation_signal, generate_dca_signal,
-    generate_safe_haven_rotation_signal, generate_options_signal,
+    generate_safe_haven_rotation_signal,
 )
 from strategy.signal_aggregator import SignalAggregator
 from strategy import decision
@@ -58,9 +52,7 @@ from core.market_hours import market_is_open
 from reporting.hourly_report import HourlyReporter
 from reporting.session_report import SessionReporter
 from reporting.trade_digest import TradeDigest
-from long_term.market_intelligence import MarketIntelligence
-from control.telegram_bot import TelegramControlBot
-from control.discord_bot import DiscordControlBot
+from core.market_intelligence import MarketIntelligence
 
 load_dotenv()
 
@@ -104,7 +96,6 @@ def build_notifier():
     return Notifier(
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID"),
-        discord_webhook_url=os.environ.get("DISCORD_WEBHOOK_URL"),
         email_cfg={
             "address": os.environ.get("EMAIL_ADDRESS"),
             "app_password": os.environ.get("EMAIL_APP_PASSWORD"),
@@ -112,7 +103,6 @@ def build_notifier():
             "smtp_host": os.environ.get("EMAIL_SMTP_HOST"),
             "smtp_port": int(os.environ.get("EMAIL_SMTP_PORT", 587)),
         },
-        discord_webhook_trades=os.environ.get("DISCORD_WEBHOOK_TRADES") or os.environ.get("DISCORD_WEBHOOK_URL"),
     )
 
 
@@ -126,12 +116,8 @@ def load_ml_models(config: dict) -> dict:
     for ex_cfg in config.get("execution", {}).get("exchanges", []):
         if ex_cfg.get("enabled"):
             symbols_to_check.extend(ex_cfg.get("markets", []))
-    oanda_markets = config.get("execution", {}).get("oanda_markets", [])
-    symbols_to_check.extend(oanda_markets)
     mt5_markets = config.get("execution", {}).get("mt5_markets", [])
     symbols_to_check.extend(mt5_markets)
-    alpaca_markets = config.get("execution", {}).get("alpaca_markets", [])
-    symbols_to_check.extend(alpaca_markets)
 
     for symbol in symbols_to_check:
         predictor = LSTMPricePredictor(symbol=symbol)
@@ -143,6 +129,8 @@ def load_ml_models(config: dict) -> dict:
 
 def maybe_retrain_models(config: dict, feed_router: FeedRouter, ml_models: dict):
     """Periodically retrain ML models to avoid staleness."""
+    if not config.get("ml", {}).get("use_lstm", True):
+        return          # LSTM filter is off: nothing to retrain
     retrain_hours = config.get("ml", {}).get("auto_retrain_hours", 168)
     min_samples = config.get("ml", {}).get("min_train_samples", 500)
     retrain_file = "data/.last_retrain"
@@ -158,7 +146,7 @@ def maybe_retrain_models(config: dict, feed_router: FeedRouter, ml_models: dict)
     for ex_cfg in config.get("execution", {}).get("exchanges", []):
         if ex_cfg.get("enabled"):
             all_symbols.extend(ex_cfg.get("markets", []))
-    all_symbols.extend(config.get("execution", {}).get("oanda_markets", []))
+    all_symbols.extend(config.get("execution", {}).get("mt5_markets", []))
 
     for symbol in all_symbols:
         try:
@@ -346,44 +334,6 @@ def main():
                 executors[name].exchange.password = passphrase
             print(f"  {name.upper()} executor initialized")
 
-    # OANDA executor
-    oanda_key = os.environ.get("OANDA_API_KEY")
-    oanda_account = os.environ.get("OANDA_ACCOUNT_ID")
-    if oanda_key and oanda_account and venue_enabled("oanda"):
-        practice = os.environ.get("OANDA_PRACTICE", "true").lower() == "true"
-        print(f"  OANDA: practice={practice} "
-              f"({'DEMO' if practice else 'LIVE — real money'})")
-        executors["oanda"] = OandaExecutor(
-            api_key=oanda_key,
-            account_id=oanda_account,
-            state_manager=state,
-            risk_manager=risk,
-            notifier=notifier,
-            practice=practice,
-            dry_run=not LIVE_TRADING,
-            fee_model=fee_model,
-        )
-        print("  OANDA executor initialized")
-
-    # Alpaca executor
-    alpaca_key = os.environ.get("ALPACA_API_KEY")
-    alpaca_secret = os.environ.get("ALPACA_API_SECRET")
-    if alpaca_key and alpaca_secret and venue_enabled("alpaca"):
-        paper = os.environ.get("ALPACA_PAPER", "true").lower() == "true"
-        print(f"  Alpaca: paper={paper} "
-              f"({'PAPER' if paper else 'LIVE — real money'})")
-        executors["alpaca"] = AlpacaExecutor(
-            api_key=alpaca_key,
-            api_secret=alpaca_secret,
-            state_manager=state,
-            risk_manager=risk,
-            notifier=notifier,
-            paper=paper,
-            dry_run=not LIVE_TRADING,
-            fee_model=fee_model,
-        )
-        print("  Alpaca executor initialized")
-
     # MT5 executor. The server name decides whether this is demo or live:
     # "MetaQuotes-Demo" is a demo server, so capital cannot reach it, but a
     # real broker server name would be live with no separate flag to check.
@@ -424,12 +374,16 @@ def main():
             for symbol in ex_cfg.get("markets", []):
                 all_markets.append((ex_cfg["name"], symbol))
 
-    for symbol in CONFIG.get("execution", {}).get("oanda_markets", []):
-        all_markets.append(("oanda", symbol))
-    for symbol in CONFIG.get("execution", {}).get("alpaca_markets", []):
-        all_markets.append(("alpaca", symbol))
     for symbol in CONFIG.get("execution", {}).get("mt5_markets", []):
         all_markets.append(("mt5", symbol))
+
+    # A market whose venue has no executor (MT5 inside Linux/Docker, MT5 not logged in,
+    # a venue that failed to connect) can never trade. Say so once and drop it, rather
+    # than polling it forever or reporting it as a market the bot is trading.
+    skipped = [f"{v}:{s}" for v, s in all_markets if v not in executors]
+    if skipped:
+        print(f"  Skipping markets with no connected venue: {', '.join(skipped)}")
+    all_markets = [(v, s) for v, s in all_markets if v in executors]
 
     print(f"\nTrading {len(all_markets)} symbols across {len(executors)} exchanges/brokers")
     mode_str = "LIVE — REAL MONEY" if LIVE_TRADING else "DRY-RUN (simulated, no real orders)"
@@ -467,48 +421,7 @@ def main():
         priority="high" if LIVE_TRADING else "normal",
     )
 
-    # --- Interactive control bots ---
-    # A token without an allowlist is a bot that accepts commands from anyone who
-    # can reach it, because both control bots treat an empty allowlist as "deny
-    # everything". Starting it anyway would be a bot that looks live and silently
-    # rejects every command, which reads as "the commands are broken" rather than
-    # "the bot is unconfigured". So refuse to start and say exactly what to set.
-    # Trading is entirely unaffected by this — the control bots are an
-    # observability and emergency-stop convenience, not a dependency.
-    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-    tg_allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "").strip()
-    if tg_token and not tg_allowed:
-        print("  Telegram control bot: NOT STARTED — TELEGRAM_ALLOWED_USERS is "
-              "empty.\n"
-              "    Every command would be denied, so it is better not to run. Get "
-              "your numeric user ID from @userinfobot, set\n"
-              "    TELEGRAM_ALLOWED_USERS=<your_id> in .env, and restart. "
-              "Trading is unaffected.")
-    elif tg_token:
-        tg_bot = TelegramControlBot(state_manager=state, risk_manager=risk)
-        tg_bot.start(tg_token)
-        print(f"  Telegram control bot started "
-              f"({len(tg_bot.authorized_count())} authorized user(s))")
-    else:
-        print("  Telegram control bot: no token configured (skipped)")
-
-    dc_token = os.environ.get("DISCORD_BOT_TOKEN", "")
-    dc_allowed = os.environ.get("DISCORD_ALLOWED_ROLES", "").strip()
-    if dc_token and not dc_allowed:
-        print("  Discord control bot: NOT STARTED — DISCORD_ALLOWED_ROLES is "
-              "empty.\n"
-              "    Every command would be denied, so it is better not to run. Set "
-              "it to the\n"
-              "    comma-separated role names allowed to control the bot "
-              "(e.g. trader,admin) and restart.\n"
-              "    Trading is unaffected.")
-    elif dc_token:
-        dc_bot = DiscordControlBot(state_manager=state, risk_manager=risk)
-        dc_bot.start(dc_token)
-        print(f"  Discord control bot started "
-              f"({len(dc_bot.authorized_count())} authorized role(s))")
-    else:
-        print("  Discord control bot: no token configured (skipped)")
+    # Control is done from the dashboard (/admin), not chat bots.
 
     # 6-hour and 24-hour reports. The old 60-minute reporter fired 24 times a
     # day, almost all of them reporting no change, and that is exactly how a
@@ -535,70 +448,96 @@ def main():
     install_error_capture()
     heartbeat.beat(health="starting", force=True)
 
-    from data_feeds.nse_feed import NSEFeed
-    from long_term.fundamentals import FundamentalsFetcher
-    from long_term.news_sentiment import NewsSentiment
-    nse_feed = NSEFeed()
-    nse_watchlist = CONFIG.get("nse", {}).get("watchlist",
-        ["SCOM", "EQTY", "KCB", "BAT", "EABL", "SAFARICOM", "DTK",
-         "COOP", "ABSA", "KNC", "NIC"])
-    nse_interval = CONFIG.get("nse", {}).get("analysis_interval_minutes", 60) * 60
-    last_nse_check = 0
     last_retrain_check = 0
-    fundamentals = FundamentalsFetcher()
-    news = NewsSentiment()
-
-    def check_nse_stocks():
-        results = []
-        for ticker in nse_watchlist:
-            try:
-                df = nse_feed.get_ohlcv(ticker, timeframe="1d", limit=200)
-                if df is None or len(df) < 30:
-                    continue
-                profile = fundamentals.get_profile(ticker)
-                sentiment = news.get_sentiment(ticker)
-                df["ma50"] = df["close"].rolling(50).mean()
-                df["ma200"] = df["close"].rolling(200).mean()
-                last = df.iloc[-1]
-                above_200 = last["close"] > last["ma200"] if not pd.isna(last.get("ma200")) else None
-                golden_cross = last["ma50"] > last["ma200"] if not pd.isna(last.get("ma200")) and not pd.isna(last.get("ma50")) else None
-                price = float(last["close"])
-                msg_parts = [f"NSE: {ticker} @ KES {price:.2f}"]
-                if above_200 is not None:
-                    msg_parts.append(f"{'Above' if above_200 else 'Below'} 200DMA")
-                if golden_cross is not None:
-                    msg_parts.append("Golden cross" if golden_cross else "No golden cross")
-                if sentiment and sentiment.get("avg_sentiment") is not None:
-                    msg_parts.append(f"News: {sentiment['label']} ({sentiment['avg_sentiment']:+.2f})")
-                results.append("\n  ".join(msg_parts))
-            except Exception:
-                continue
-        if results:
-            notifier.notify("nse_alert", "NSE Kenya Analysis:\n" + "\n".join(results))
+    news = None            # news sentiment (NewsAPI) was removed; the strategy runs without it
 
     standby = False
+    forced_dry = False          # set by the dashboard "dry_run" verb; cleared only by a restart
+
+    def mode_label() -> str:
+        live = LIVE_TRADING and not forced_dry
+        return "LIVE - REAL MONEY" if live else "DRY-RUN (simulated)"
+
+    def publish_mode():
+        """Tell the dashboard what mode we are in and whether the kill switch is armed."""
+        rs = state.get_risk_state()
+        heartbeat.extra.update({
+            "mode": mode_label(), "live": bool(LIVE_TRADING and not forced_dry),
+            "kill_switch": str(rs.get("halt_reason") or "").startswith("KILL SWITCH"),
+            "markets": [f"{v}:{sym}" for v, sym in all_markets],
+        })
+
+    def close_all_positions(reason: str) -> int:
+        closed = 0
+        for pos in state.get_open_positions():
+            ex = executors.get(pos["exchange"])
+            if ex is None:
+                continue
+            try:
+                px = feed_router.latest_price(pos["symbol"])
+                ex.close_trade(pos["client_order_id"], px, reason)
+                closed += 1
+            except Exception as e:
+                print(f"Kill switch: could not close {pos['symbol']}: {e}")
+        return closed
 
     def apply_dashboard_commands():
         """Execute queued dashboard commands. Returns True if the engine must exit."""
-        nonlocal standby
+        nonlocal standby, forced_dry
         for cmd in control_channel.poll_commands():
             verb = cmd["command"]
+            args = cmd.get("args") or {}
             log_system_event("dashboard_command", f"{verb} by {cmd.get('by')}", cmd)
             control_channel.append_audit(cmd)
             if verb == "halt":
                 state.update_risk_state(trading_halted=1,
                                         halt_reason=f"Dashboard halt ({cmd.get('by')})")
             elif verb == "resume":
+                locked = str(state.get_risk_state().get("halt_reason") or "").startswith("KILL SWITCH")
+                if locked and not args.get("release_kill"):
+                    print("Resume refused: kill switch is armed (needs release_kill).")
+                    continue
                 standby = False
                 state.update_risk_state(trading_halted=0, halt_reason=None)
             elif verb == "standby":
                 standby = True
                 state.update_risk_state(trading_halted=1,
                                         halt_reason=f"Dashboard standby ({cmd.get('by')})")
+            elif verb == "kill":
+                state.update_risk_state(trading_halted=1,
+                                        halt_reason=f"KILL SWITCH ({cmd.get('by')})")
+                closed = close_all_positions("kill_switch") if args.get("close_positions") else 0
+                notifier.notify("kill_switch", f"KILL SWITCH engaged by {cmd.get('by')}. "
+                                f"{closed} position(s) closed.", priority="high")
+            elif verb == "dry_run":
+                forced_dry = True
+                for ex in executors.values():
+                    if hasattr(ex, "dry_run"):
+                        ex.dry_run = True
+                notifier.notify("mode_change", "Dashboard switched the engine to DRY-RUN "
+                                "(simulated orders).", priority="high")
+            elif verb == "dry_test":
+                def _sig(symbol):
+                    return get_strategy_signal(
+                        feed_router, symbol,
+                        trading_balance=state.get_risk_state()["trading_balance"],
+                        risk_fraction=CONFIG["risk"]["max_position_pct"] / 100,
+                        ml_models=ml_models, market_regime=None, news_sentiment=news,
+                        strategy_cfg=CONFIG.get("strategy", {}), feature_store=feature_store,
+                        signal_aggregator=signal_aggregator)
+                try:
+                    dry_test.run_dry_test(executors, feed_router, all_markets, _sig, mode_label())
+                except Exception as e:
+                    print(f"Dry test failed: {e}")
+            elif verb == "stop":
+                heartbeat.beat(health="stopped", force=True)
+                print("Dashboard requested stop; exiting.")
+                return True
             elif verb == "restart":
                 heartbeat.beat(health="restarting", force=True)
                 print("Dashboard requested restart; exiting for supervisor to relaunch.")
                 return True
+        publish_mode()
         return False
 
     while True:
@@ -627,14 +566,6 @@ def main():
             continue
 
         now = time.time()
-
-        # NSE analysis on schedule
-        if now - last_nse_check >= nse_interval:
-            try:
-                check_nse_stocks()
-                last_nse_check = now
-            except Exception as e:
-                print(f"NSE analysis error: {e}")
 
         # Auto-retrain ML models (once per cycle)
         if now - last_retrain_check >= 3600:
@@ -667,9 +598,6 @@ def main():
         # signal that persists would otherwise re-open the same trade each tick.
         open_keys = {(p["exchange"], p["symbol"]) for p in state.get_open_positions()}
         for exchange_name, symbol in all_markets:
-            if exchange_name == "nse":
-                continue
-
             executor = executors.get(exchange_name)
             if executor is None:
                 continue
@@ -758,12 +686,12 @@ def main():
             except Exception as e:
                 print(f"Arbitrage detection error: {e}")
 
-        # Safe-haven rotation (equities vs gold, runs every 15 minutes)
+        # Safe-haven watch (crypto drawdown vs tokenised gold, every 15 minutes; alert only)
         last_sh_check = getattr(main, "_last_sh_check", 0)
         if now - last_sh_check >= 900:
             try:
-                equity_df = feed_router.get_ohlcv("SPY", timeframe="1h", limit=100)
-                gold_df = feed_router.get_ohlcv("GLD", timeframe="1h", limit=100)
+                equity_df = feed_router.get_ohlcv("BTC/USDT", timeframe="1h", limit=100)
+                gold_df = feed_router.get_ohlcv("PAXG/USDT", timeframe="1h", limit=100)
                 if equity_df is not None and gold_df is not None:
                     threshold = CONFIG.get("strategy", {}).get("safe_haven_drawdown_threshold", -5.0)
                     sh_signal = generate_safe_haven_rotation_signal(equity_df, gold_df, threshold)
@@ -798,24 +726,6 @@ def main():
                 main._last_dca_check = now
             except Exception as e:
                 print(f"DCA signal error: {e}")
-
-        # Options signals (runs every 30 minutes for stocks/ETFs)
-        last_opt_check = getattr(main, "_last_opt_check", 0)
-        if now - last_opt_check >= 1800:
-            try:
-                options_symbols = CONFIG.get("execution", {}).get("alpaca_markets", [])
-                for opt_sym in options_symbols:
-                    df = feed_router.get_ohlcv(opt_sym, timeframe="1h", limit=100)
-                    if df is not None and len(df) >= 50:
-                        opt_signal = generate_options_signal(df, cfg=CONFIG.get("strategy", {}))
-                        if opt_signal:
-                            print(f"  OPTIONS: {opt_sym} — "
-                                  f"{', '.join(opt_signal.get('strategies', []))}")
-                            notifier.notify("options_signal",
-                                f"Options: {opt_sym} — {len(opt_signal['signals'])} signal(s)")
-                main._last_opt_check = now
-            except Exception as e:
-                print(f"Options signal error: {e}")
 
         # Portfolio position reconciliation (check exchange balances vs tracked state)
         try:

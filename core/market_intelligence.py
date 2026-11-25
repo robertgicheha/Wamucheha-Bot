@@ -5,7 +5,7 @@ Dollar Index (DXY) trend, and cross-asset correlation signals.
 This module feeds into the strategy ensemble as an additional filter:
 - Risk-off regimes reduce position sizes or block trades entirely.
 - Extreme Fear/Greed readings adjust entry thresholds.
-- DXY trend impacts forex pair selection.
+- DXY trend matters for gold (strong dollar is a headwind) and risk assets.
 """
 import os
 import json
@@ -62,56 +62,42 @@ class MarketIntelligence:
         return None
 
     def get_dxy_trend(self, feed_router=None) -> dict | None:
-        """Estimate Dollar Index (DXY) trend using USD-based pairs as proxy.
-        DXY itself may not be available via free APIs, so we use EUR/USD inverse
-        as a proxy (EUR/USD is ~57% of DXY)."""
+        """Dollar Index (DXY) trend from free yfinance data (ticker DX-Y.NYB).
+
+        Failures are cached for 10 minutes so a blocked network costs one quick
+        attempt, not one per trading-loop tick."""
         if not self.cfg.get("dxy_enabled", True):
             return None
 
         cache_key = "dxy_trend"
         if cache_key in self._cache:
             ts, data = self._cache[cache_key]
-            if time.time() - ts < self._cache_ttl:
+            if time.time() - ts < (self._cache_ttl if data else 600):
                 return data
 
+        result = None
         try:
-            if feed_router is None:
-                return None
-
-            # Use EUR/USD as DXY proxy (inverse correlation)
-            df = feed_router.get_ohlcv("EUR/USD", timeframe="1h", limit=50)
-            if df is None or len(df) < 20:
-                return None
-
-            ema_20 = df["close"].ewm(span=20, adjust=False).mean()
-            ema_50 = df["close"].ewm(span=50, adjust=False).mean()
-
-            last_price = float(df.iloc[-1]["close"])
-            last_ema20 = float(ema_20.iloc[-1])
-            last_ema50 = float(ema_50.iloc[-1])
-
-            # EUR/USD rising = DXY weakening, EUR/USD falling = DXY strengthening
-            if last_price < last_ema20 < last_ema50:
-                trend = "strengthening"  # DXY strong (bearish for gold, mixed for crypto)
-            elif last_price > last_ema20 > last_ema50:
-                trend = "weakening"  # DXY weak (bullish for gold, bullish for crypto)
-            else:
-                trend = "neutral"
-
-            change_24h = ((last_price - float(df.iloc[-24]["close"])) / float(df.iloc[-24]["close"]) * 100) \
-                if len(df) >= 24 else 0
-
-            result = {
-                "trend": trend,
-                "eur_usd": last_price,
-                "change_24h_pct": round(change_24h, 3),
-            }
-            self._cache[cache_key] = (time.time(), result)
-            return result
-
+            import yfinance as yf
+            df = yf.Ticker("DX-Y.NYB").history(period="10d", interval="1h", timeout=8)
+            if df is not None and len(df) >= 50:
+                close = df["Close"]
+                ema_20 = close.ewm(span=20, adjust=False).mean()
+                ema_50 = close.ewm(span=50, adjust=False).mean()
+                last, e20, e50 = float(close.iloc[-1]), float(ema_20.iloc[-1]), float(ema_50.iloc[-1])
+                # Dollar rising is a headwind for gold and crypto; falling is a tailwind.
+                if last > e20 > e50:
+                    trend = "strengthening"
+                elif last < e20 < e50:
+                    trend = "weakening"
+                else:
+                    trend = "neutral"
+                prev = float(close.iloc[-24]) if len(close) >= 24 else last
+                result = {"trend": trend, "dxy": round(last, 3),
+                          "change_24h_pct": round((last - prev) / prev * 100, 3)}
         except Exception as e:
-            logger.warning(f"DXY trend estimation failed: {e}")
-            return None
+            logger.warning(f"DXY trend unavailable: {e}")
+        self._cache[cache_key] = (time.time(), result)
+        return result
 
     def get_market_regime(self, feed_router=None) -> dict:
         """Determine overall market regime from multiple signals."""

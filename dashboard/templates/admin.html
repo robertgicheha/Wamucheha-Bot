@@ -39,7 +39,15 @@ canvas{width:100%;height:240px;display:block}
 #toast{position:fixed;bottom:16px;right:16px;background:var(--panel);border:1px solid var(--line);padding:10px 14px;border-radius:8px;display:none;max-width:360px}
 .note{background:var(--panel);border-left:3px solid var(--warn);padding:8px 12px;border-radius:4px;margin-bottom:12px;color:var(--mute)}
 [hidden]{display:none!important}
+h2.sec{font-size:13px;color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:18px 0 8px}
+h2.sec:first-child{margin-top:0}
+.modebar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;padding:8px 12px;border-radius:8px;border:1px solid var(--line);background:var(--panel)}
+.modebar.live{border-color:var(--bad)}.modebar.kill{border-color:var(--bad);background:rgba(248,81,73,.12)}
+.cards-wide{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+button.kill{background:var(--bad);color:#fff;border-color:var(--bad);font-weight:700}
+.dt-ok{color:var(--ok)}.dt-bad{color:var(--bad)}.dt-warn{color:var(--warn)}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 <div id="login" class="card" hidden>
@@ -60,13 +68,32 @@ canvas{width:100%;height:240px;display:block}
 </header>
 <nav id="tabs"></nav>
 <main>
+ <div id="modebar" class="modebar"></div>
  <section id="t-overview">
+  <h2 class="sec">Money</h2>
+  <div class="grid" id="kpis-money"></div>
+  <h2 class="sec">Performance</h2>
   <div class="grid" id="kpis"></div>
   <div class="two" style="margin-top:12px">
-    <div class="card"><h3>System health</h3><div id="health"></div></div>
     <div class="card"><h3>Equity (cumulative closed P&amp;L)</h3><canvas id="c-eq"></canvas></div>
+    <div class="card"><h3>System health</h3><div id="health" class="scroll" style="max-height:300px"></div></div>
   </div>
-  <div class="card" style="margin-top:12px"><h3>Open positions</h3><div class="scroll" id="positions"></div></div>
+  <div class="card" style="margin-top:12px"><h3>Open positions</h3><div class="scroll" id="positions" style="max-height:220px"></div></div>
+  <div class="card" style="margin-top:12px"><h3>Live trade log (newest first)</h3><div class="scroll" id="tradelog" style="max-height:360px"></div></div>
+ </section>
+
+ <section id="t-market" hidden>
+  <div class="row">
+    <select id="mk-sym" title="Symbol"></select>
+    <select id="mk-tf" title="Timeframe"></select>
+    <select id="mk-src" title="Data source"><option value="auto">Source: auto</option><option value="mt5">MT5 terminal</option><option value="exchange">Exchange (public)</option><option value="yfinance">yfinance</option></select>
+    <label class="sub"><input type="checkbox" id="mk-ema" checked> EMA 9 / 21</label>
+    <label class="sub"><input type="checkbox" id="mk-vol" checked> Volume</label>
+    <label class="sub"><input type="checkbox" id="mk-trd" checked> My trades</label>
+    <span class="sub" id="mk-info"></span>
+  </div>
+  <div class="card"><div id="mk-chart" style="height:480px"></div></div>
+  <div class="note" style="margin-top:12px">Candles come read-only from the MT5 terminal when it is reachable, otherwise from public exchange data (no keys). Green arrows are buy entries, red are sell entries; circles are exits. Prices can differ slightly between sources.</div>
  </section>
 
  <section id="t-trades" hidden>
@@ -113,12 +140,22 @@ canvas{width:100%;height:240px;display:block}
 
  <section id="t-control" hidden>
   <div class="note" id="ctlnote"></div>
-  <div class="grid">
-   <div class="card"><h3>Halt trading</h3><p class="sub">Stops new trades. Open positions keep their stops. Engine stays up.</p><button class="act danger" data-cmd="halt">Halt</button></div>
-   <div class="card"><h3>Resume</h3><p class="sub">Clears the halt and leaves standby.</p><button class="act" data-cmd="resume">Resume</button></div>
-   <div class="card"><h3>Shutdown (standby)</h3><p class="sub">Halts trading and idles the engine. The process stays alive (a supervisor would restart a real exit). Use Resume to wake it.</p><button class="act danger" data-cmd="standby">Standby</button></div>
-   <div class="card"><h3>Restart engine</h3><p class="sub">Engine exits cleanly; the container/systemd supervisor starts it again.</p><button class="act danger" data-cmd="restart">Restart</button></div>
+  <h2 class="sec">Run state</h2>
+  <div class="grid cards-wide">
+   <div class="card"><h3>Start engine</h3><p class="sub">Launches the bot process if it is not running (native Windows/Linux runs; with Docker use <code>docker compose up -d engine</code>).</p><button class="act" id="btn-start">Start</button></div>
+   <div class="card"><h3>Pause (halt)</h3><p class="sub">Stops opening new trades. Open positions keep their stops. The engine stays up and keeps monitoring.</p><button class="act" data-cmd="halt">Pause</button></div>
+   <div class="card"><h3>Resume</h3><p class="sub">Clears a pause and leaves standby. If the kill switch is armed you must type <b>release</b>.</p><button class="act" data-cmd="resume">Resume</button></div>
+   <div class="card"><h3>Standby</h3><p class="sub">Pauses trading and idles the engine without exiting. Resume wakes it.</p><button class="act danger" data-cmd="standby">Standby</button></div>
+   <div class="card"><h3>Restart</h3><p class="sub">Engine exits cleanly and the supervisor (Docker/systemd) relaunches it. Natively there is no supervisor, so use Stop then Start.</p><button class="act danger" data-cmd="restart">Restart</button></div>
+   <div class="card"><h3>Stop</h3><p class="sub">Ends the engine process. Under Docker/systemd it will be relaunched; use Standby there instead.</p><button class="act danger" data-cmd="stop">Stop</button></div>
   </div>
+  <h2 class="sec">Safety</h2>
+  <div class="grid cards-wide">
+   <div class="card" style="border-color:var(--bad)"><h3>Kill switch</h3><p class="sub">Immediately stops all trading and LOCKS it: a normal resume is refused until you type <b>release</b>.</p><label class="sub"><input type="checkbox" id="kill-close"> also close every open position at market</label><br><br><button class="act kill" data-cmd="kill">KILL SWITCH</button></div>
+   <div class="card"><h3>Mode</h3><div id="modecard" class="sub"></div><br><button class="act" data-cmd="dry_run">Switch to DRY-RUN</button><p class="sub">There is deliberately no button for LIVE. Going live needs <code>LIVE_TRADING=true</code> in <code>.env</code> and a restart, so a stray click can never risk real money.</p></div>
+   <div class="card"><h3>Dry test</h3><p class="sub">Checks connections, candle data and strategy decisions for every market. Places <b>no orders</b>.</p><button class="act" data-cmd="dry_test">Run dry test</button> <span class="sub" id="dt-state"></span></div>
+  </div>
+  <div class="card" style="margin-top:12px"><h3>Dry test result</h3><div class="scroll" id="drytest" style="max-height:340px"></div></div>
   <div class="card" style="margin-top:12px"><h3>Command audit (executed by the engine)</h3><div class="scroll" id="audit"></div></div>
   <div class="card" style="margin-top:12px"><h3>Effective config (read-only)</h3><pre class="log" id="cfg"></pre></div>
  </section>
@@ -128,7 +165,7 @@ canvas{width:100%;height:240px;display:block}
 
 <script>
 const $ = s => document.querySelector(s);
-const TABS = [["overview","Overview"],["trades","Trades"],["analysis","Analysis"],["predict","Projection"],["errors","Errors"],["logs","Logs"],["signals","Signals & Events"],["control","Control"]];
+const TABS = [["overview","Overview"],["market","Market"],["trades","Trades"],["analysis","Analysis"],["predict","Projection"],["errors","Errors"],["logs","Logs"],["signals","Signals & Events"],["control","Control"]];
 let KEY = sessionStorage.getItem("adminKey") || "", tab = "overview", timer = null;
 
 const el = (tag, props = {}, ...kids) => { const e = document.createElement(tag); Object.assign(e, props); kids.flat().forEach(k => e.append(k)); return e; };
@@ -181,24 +218,90 @@ function barChart(id, items) {
 function engPill(e) { const p = $("#engpill"); const m = {running: "ok", halted: "warn", standby: "warn", starting: "warn", stale: "warn", offline: "bad", unknown: "bad", restarting: "warn"}[e.state] || "warn"; p.className = "pill " + m; p.textContent = "Engine: " + e.state; }
 const dur = s => s == null ? "–" : s > 86400 ? (s / 86400).toFixed(1) + " d" : s > 3600 ? (s / 3600).toFixed(1) + " h" : Math.round(s / 60) + " m";
 
+let MODE = {kill_switch: false, live: false};
+function modeBar(o) {
+  MODE = o.mode; const b = $("#modebar"), m = o.mode, e = o.engine;
+  b.className = "modebar" + (m.kill_switch ? " kill" : m.live ? " live" : "");
+  const bits = [el("span", {className: "pill " + (m.live ? "bad" : "ok"), textContent: m.live ? "LIVE - REAL MONEY" : "DRY-RUN (simulated)"}),
+    el("span", {className: "pill " + (e.state === "running" ? "ok" : e.state === "offline" || e.state === "unknown" ? "bad" : "warn"), textContent: "Engine: " + e.state})];
+  if (m.kill_switch) bits.push(el("span", {className: "pill bad", textContent: "KILL SWITCH ARMED"}));
+  if (o.risk.trading_halted && !m.kill_switch) bits.push(el("span", {className: "pill warn", textContent: "Paused: " + (o.risk.halt_reason || "halted")}));
+  if (m.markets && m.markets.length) bits.push(el("span", {className: "sub", textContent: "Markets: " + m.markets.join(", ")}));
+  b.replaceChildren(...bits);
+}
 async function loadOverview() {
-  const [o, h, a, pos] = await Promise.all([api("/overview"), api("/health"), api("/analytics"), api("/positions")]);
-  engPill(o.engine); const m = o.metrics, r = o.risk;
-  $("#kpis").replaceChildren(
-    kpi("Trading balance", usd(r.trading_balance), "peak $" + num(r.peak_balance)),
+  const [o, h, a, pos, tr] = await Promise.all([api("/overview"), api("/health"), api("/analytics"), api("/positions"), api("/trades?n=40")]);
+  engPill(o.engine); modeBar(o); const m = o.metrics, r = o.risk, c = o.capital, n = m.trades || 0;
+  $("#kpis-money").replaceChildren(
+    kpi("Starting capital", usd(c.starting_capital), "what the account began with"),
+    kpi("Total after trades", usd(c.balance_now), "trading balance now (peak $" + num(r.peak_balance) + ")", cls(c.balance_now - c.starting_capital)),
+    kpi("Paid out to you", usd(c.paid_out), "profit already moved out"),
+    kpi("Total value", usd(c.total_value), (c.return_pct == null ? "–" : (c.return_pct >= 0 ? "+" : "") + c.return_pct + "%") + " vs starting capital", cls(c.return_pct)),
     kpi("Today P&L", usd(o.today.pnl, 4), o.today.trades + " trades", cls(o.today.pnl)),
-    kpi("All-time P&L", usd(m.total_pnl, 4), (m.trades || 0) + " closed trades", cls(m.total_pnl)),
-    kpi("Win rate", m.trades ? m.win_rate_pct + "%" : "–", "PF " + num(m.profit_factor)),
-    kpi("Max drawdown", m.trades ? num(m.max_drawdown_pct) + "%" : "–", usd(m.max_drawdown, 4), m.max_drawdown_pct < -5 ? "bad" : ""),
-    kpi("Trading", r.trading_halted ? "HALTED" : "ACTIVE", r.halt_reason || "", r.trading_halted ? "warn" : "ok"),
+    kpi("Net P&L (all time)", usd(m.total_pnl || 0, 4), n + " closed trades", cls(m.total_pnl)));
+  $("#kpis").replaceChildren(
+    kpi("Profit (gross wins)", usd(m.gross_profit || 0, 4), (m.wins || 0) + " winning trades", "ok"),
+    kpi("Loss (gross losses)", usd(m.gross_loss || 0, 4), (m.losses || 0) + " losing trades", (m.gross_loss || 0) < 0 ? "bad" : ""),
+    kpi("Win rate", n ? m.win_rate_pct + "%" : "–", (m.wins || 0) + " of " + n),
+    kpi("Loss rate", n ? m.loss_rate_pct + "%" : "–", (m.breakeven || 0) + " breakeven"),
+    kpi("Efficiency", m.efficiency_pct == null ? "–" : m.efficiency_pct + "%", "net P&L as % of gross wins", m.efficiency_pct == null ? "" : m.efficiency_pct >= 50 ? "ok" : m.efficiency_pct > 0 ? "warn" : "bad"),
+    kpi("Profit factor", num(m.profit_factor), "gross wins / gross losses (>1.3 is healthy)", m.profit_factor == null ? "" : m.profit_factor >= 1.3 ? "ok" : m.profit_factor >= 1 ? "warn" : "bad"),
+    kpi("Expectancy / trade", usd(m.expectancy || 0, 4), "avg payoff " + num(m.payoff_ratio) + "x", cls(m.expectancy)),
+    kpi("Max drawdown", n ? num(m.max_drawdown_pct) + "%" : "–", usd(m.max_drawdown || 0, 4), m.max_drawdown_pct < -5 ? "bad" : ""),
+    kpi("Fees paid", usd(m.total_fees || 0, 4)),
     kpi("Open positions", o.open_positions, "loss streak " + (r.consecutive_losses ?? 0)),
     kpi("Uptime", dur(o.engine.uptime_seconds), (o.engine.restarts ?? "–") + " restarts"),
     kpi("Errors (24h)", o.errors_24h, "see Errors tab", o.errors_24h > 20 ? "bad" : o.errors_24h ? "warn" : "ok"));
   put("#health", table(h.checks, [{h: "Check", k: "name"}, {h: "Status", f: r => r.ok ? "OK" : "PROBLEM", c: r => r.ok ? "ok" : "bad"}, {h: "Detail", k: "detail"}]));
   const eq = a.equity_curve.map(p => p.cumulative_pnl);
   lineChart("#c-eq", [{y: eq, color: getComputedStyle(document.documentElement).getPropertyValue("--acc")}]);
-  put("#positions", table(pos.positions, [{h: "Symbol", k: "symbol"}, {h: "Venue", k: "exchange"}, {h: "Side", k: "side"}, {h: "Amount", k: "amount"}, {h: "Entry", k: "entry_price"}, {h: "Opened", k: "opened_at"}]));
+  put("#positions", table(pos.positions, [{h: "Symbol", k: "symbol"}, {h: "Venue", k: "exchange"}, {h: "Side", k: "side"}, {h: "Amount", k: "amount"}, {h: "Entry", k: "entry_price"}, {h: "Stop", k: "stop_loss_price"}, {h: "Target", k: "take_profit_price"}, {h: "Opened", k: "opened_at"}]));
+  put("#tradelog", table(tr.trades, [{h: "Time", f: r => (r.closed_at || r.opened_at || "").replace("T", " ").slice(0, 19)}, {h: "Symbol", k: "symbol"}, {h: "Side", k: "side"}, {h: "Status", k: "status"}, {h: "Entry", k: "entry_price"}, {h: "Exit", k: "exit_price"}, {h: "P&L", f: r => r.pnl == null ? "open" : usd(r.pnl, 4), c: r => cls(r.pnl)}, {h: "Result", f: r => r.pnl == null ? "" : r.pnl > 0 ? "WIN" : r.pnl < 0 ? "LOSS" : "FLAT", c: r => cls(r.pnl)}, {h: "Reason", k: "reason"}]));
 }
+
+/* ---------- Market: candlesticks ---------- */
+const MK = {chart: null, candle: null, vol: null, e9: null, e21: null, key: "", ready: false};
+const emaOf = (cs, p) => { const k = 2 / (p + 1); let e = null; return cs.map(c => { e = e === null ? c.close : c.close * k + e * (1 - k); return {time: c.time, value: e}; }); };
+function mkTheme() { const st = getComputedStyle(document.documentElement), g = k => st.getPropertyValue(k).trim(); return {layout: {background: {color: g("--panel")}, textColor: g("--mute")}, grid: {vertLines: {color: g("--line")}, horzLines: {color: g("--line")}}, rightPriceScale: {borderColor: g("--line")}, timeScale: {borderColor: g("--line"), timeVisible: true, secondsVisible: false}, crosshair: {mode: 0}}; }
+function mkInit() {
+  if (MK.chart) return true;
+  if (typeof LightweightCharts === "undefined") { $("#mk-info").textContent = "Chart library failed to load (needs internet access to cdn.jsdelivr.net)."; return false; }
+  const box = $("#mk-chart"), st = getComputedStyle(document.documentElement), g = k => st.getPropertyValue(k).trim();
+  MK.chart = LightweightCharts.createChart(box, {...mkTheme(), width: box.clientWidth, height: box.clientHeight});
+  MK.candle = MK.chart.addCandlestickSeries({upColor: g("--ok"), downColor: g("--bad"), borderUpColor: g("--ok"), borderDownColor: g("--bad"), wickUpColor: g("--ok"), wickDownColor: g("--bad")});
+  MK.vol = MK.chart.addHistogramSeries({priceFormat: {type: "volume"}, priceScaleId: "vol", color: g("--mute")});
+  MK.chart.priceScale("vol").applyOptions({scaleMargins: {top: .82, bottom: 0}});
+  MK.e9 = MK.chart.addLineSeries({color: "#58a6ff", lineWidth: 1, priceLineVisible: false, lastValueVisible: false});
+  MK.e21 = MK.chart.addLineSeries({color: "#d29922", lineWidth: 1, priceLineVisible: false, lastValueVisible: false});
+  new ResizeObserver(() => MK.chart && MK.chart.applyOptions({width: box.clientWidth, height: box.clientHeight})).observe(box);
+  ["mk-sym", "mk-tf", "mk-src", "mk-ema", "mk-vol", "mk-trd"].forEach(i => $("#" + i).onchange = () => loadMarket(true));
+  return true;
+}
+async function loadMarket(force) {
+  if (!mkInit()) return;
+  if (!$("#mk-sym").options.length) {
+    const s = await api("/symbols");
+    $("#mk-sym").replaceChildren(...s.symbols.map(x => el("option", {value: x, textContent: x + (s.traded.includes(x) ? "  (traded)" : "")})));
+    $("#mk-tf").replaceChildren(...s.timeframes.map(x => el("option", {value: x, textContent: x, selected: x === "15m"})));
+    if (s.traded.length) $("#mk-sym").value = s.traded[0];
+  }
+  const sym = $("#mk-sym").value, tf = $("#mk-tf").value, src = $("#mk-src").value, key = sym + "|" + tf + "|" + src;
+  let d;
+  try { d = await api(`/candles?symbol=${encodeURIComponent(sym)}&tf=${tf}&limit=500&source=${src}`); }
+  catch (e) { $("#mk-info").textContent = "No data: " + e.message; MK.candle.setData([]); MK.vol.setData([]); MK.e9.setData([]); MK.e21.setData([]); MK.candle.setMarkers([]); return; }
+  const range = (key === MK.key && !force) ? MK.chart.timeScale().getVisibleLogicalRange() : null;
+  MK.candle.setData(d.candles);
+  MK.vol.setData($("#mk-vol").checked ? d.candles.map(c => ({time: c.time, value: c.volume, color: c.close >= c.open ? "rgba(63,185,80,.45)" : "rgba(248,81,73,.45)"})) : []);
+  MK.e9.setData($("#mk-ema").checked ? emaOf(d.candles, 9) : []); MK.e21.setData($("#mk-ema").checked ? emaOf(d.candles, 21) : []);
+  const mk = $("#mk-trd").checked ? d.markers.map(m => m.kind === "entry"
+    ? {time: m.time, position: m.side === "buy" ? "belowBar" : "aboveBar", color: m.side === "buy" ? "#3fb950" : "#f85149", shape: m.side === "buy" ? "arrowUp" : "arrowDown", text: m.side + " @" + m.price}
+    : {time: m.time, position: "inBar", color: m.pnl > 0 ? "#3fb950" : "#f85149", shape: "circle", text: "exit " + (m.pnl == null ? "" : usd(m.pnl, 2))}).sort((a, b) => a.time - b.time) : [];
+  MK.candle.setMarkers(mk);
+  if (range) MK.chart.timeScale().setVisibleLogicalRange(range); else MK.chart.timeScale().fitContent();
+  MK.key = key; const last = d.candles[d.candles.length - 1];
+  $("#mk-info").textContent = `${d.source} · last ${num(d.last_price, 5)} · O ${num(last.open, 5)} H ${num(last.high, 5)} L ${num(last.low, 5)} C ${num(last.close, 5)} · ${d.candles.length} candles`;
+}
+
 async function loadTrades() {
   const t = await api("/trades?n=300");
   put("#trades", table(t.trades, [{h: "Closed", f: r => r.closed_at || r.opened_at}, {h: "Venue", k: "exchange"}, {h: "Symbol", k: "symbol"}, {h: "Side", k: "side"}, {h: "Status", k: "status"}, {h: "Entry", k: "entry_price"}, {h: "Exit", k: "exit_price"}, {h: "P&L", f: r => r.pnl == null ? "–" : num(r.pnl, 4), c: r => cls(r.pnl)}, {h: "Fees", f: r => num(r.fees, 4)}, {h: "Reason", k: "reason"}, {h: "Regime", k: "regime"}]));
@@ -248,15 +351,24 @@ async function loadSignals() {
   const s = await api("/signals?n=200");
   put("#signals", table(s.events, [{h: "Time", k: "ts"}, {h: "Type", k: "type"}, {h: "Event", f: r => r.event || r.action || ""}, {h: "Symbol", k: "symbol"}, {h: "Score/Conf", f: r => r.score ?? r.confidence ?? ""}, {h: "Detail", f: r => r.details || (r.strategies || []).join(", ") || ""}]));
 }
+function renderDryTest(d) {
+  const rows = (d.checks || []);
+  const head = el("p", {className: d.passed ? "dt-ok" : rows.length ? "dt-bad" : "sub", textContent: (d.ts ? new Date(d.ts).toLocaleString() + " - " : "") + (d.summary || "") + (d.mode ? " (" + d.mode + ")" : "")});
+  const t = rows.length ? table(rows, [{h: "Check", k: "name"}, {h: "Result", f: r => r.ok ? (r.level === "warn" ? "WARN" : "OK") : "FAIL", c: r => r.ok ? (r.level === "warn" ? "warn" : "ok") : "bad"}, {h: "Detail", k: "detail"}]) : el("span");
+  $("#drytest").replaceChildren(head, t);
+}
 async function loadControl() {
-  const [a, c, p] = await Promise.all([api("/audit"), api("/config"), api("/ping")]);
-  $("#ctlnote").textContent = p.control_enabled ? "Commands are queued and executed by the engine within seconds. Restart and Standby ask you to type the command to confirm." : "Control actions are DISABLED: DASHBOARD_SECRET_KEY is still the default. Change it in .env and redeploy.";
+  const [a, c, p, o, d] = await Promise.all([api("/audit"), api("/config"), api("/ping"), api("/overview"), api("/dry-test")]);
+  modeBar(o); engPill(o.engine);
+  $("#ctlnote").textContent = p.control_enabled ? "Commands are queued and executed by the engine within seconds. Dangerous ones (kill, restart, stop, standby) ask you to type a word." : "Control actions are DISABLED: DASHBOARD_SECRET_KEY is still the default. Change it in .env and restart the dashboard.";
+  $("#modecard").textContent = o.mode.label + (o.mode.live ? " - orders are real" : " - no real orders are sent");
   put("#audit", table(a.entries, [{h: "When", f: r => new Date(r.executed_at * 1000).toLocaleString()}, {h: "Command", k: "command"}, {h: "By", k: "by"}]));
+  renderDryTest(d);
   $("#cfg").textContent = JSON.stringify(c, null, 2);
 }
-const LOADERS = {overview: loadOverview, trades: loadTrades, analysis: loadAnalysis, predict: loadProjection, errors: loadErrors, logs: () => loadLogs(false), signals: loadSignals, control: loadControl};
+const LOADERS = {overview: loadOverview, market: loadMarket, trades: loadTrades, analysis: loadAnalysis, predict: loadProjection, errors: loadErrors, logs: () => loadLogs(false), signals: loadSignals, control: loadControl};
 
-async function refresh() { try { await LOADERS[tab](); $("#clock").textContent = "updated " + new Date().toLocaleTimeString(); } catch (e) { if (e.message !== "unauthorized") toast("Load failed: " + e.message); } }
+async function refresh() { try { await LOADERS[tab](); if (!["overview", "control"].includes(tab)) api("/overview").then(o => { modeBar(o); engPill(o.engine); }).catch(() => {});$("#clock").textContent = "updated " + new Date().toLocaleTimeString(); } catch (e) { if (e.message !== "unauthorized") toast("Load failed: " + e.message); } }
 function show(t) { tab = t; document.querySelectorAll("main > section").forEach(s => s.hidden = s.id !== "t-" + t); document.querySelectorAll("nav button").forEach(b => b.classList.toggle("on", b.dataset.t === t)); refresh(); }
 function start() {
   $("#login").hidden = true; $("#app").hidden = false;
@@ -271,12 +383,42 @@ async function signIn() { KEY = $("#key").value.trim() || KEY; try { await api("
 
 $("#go").onclick = signIn; $("#key").onkeydown = e => e.key === "Enter" && signIn(); $("#out").onclick = signOut;
 $("#runproj").onclick = loadProjection; $("#errgo").onclick = loadErrors; $("#loggo").onclick = () => loadLogs(false);
+async function sendCmd(cmd, extra = {}) {
+  const r = await api("/control", {method: "POST", body: JSON.stringify({command: cmd, ...extra})});
+  toast(r.note); setTimeout(refresh, 2500); return r;
+}
+const TYPED = {restart: "restart", standby: "standby", stop: "stop", kill: "KILL"};
 document.querySelectorAll("[data-cmd]").forEach(b => b.onclick = async () => {
-  const cmd = b.dataset.cmd; let confirm = "";
-  if (cmd === "restart" || cmd === "standby") { confirm = prompt(`This will ${cmd} the engine. Type "${cmd}" to confirm:`) || ""; if (confirm !== cmd) return toast("Cancelled."); }
-  else if (!window.confirm(`Send "${cmd}" to the engine?`)) return;
-  try { const r = await api("/control", {method: "POST", body: JSON.stringify({command: cmd, confirm})}); toast(r.note); setTimeout(refresh, 2500); } catch (e) { toast("Failed: " + e.message); }
+  const cmd = b.dataset.cmd; let confirm = "", extra = {};
+  try {
+    if (cmd === "resume" && MODE.kill_switch) {
+      confirm = prompt('The KILL SWITCH is armed. Type "release" to allow trading again:') || "";
+      if (confirm !== "release") return toast("Cancelled.");
+    } else if (TYPED[cmd]) {
+      const extraMsg = cmd === "kill" ? ($("#kill-close").checked ? "\nAll open positions will be CLOSED at market." : "\nOpen positions stay open with their stops.") : "";
+      confirm = prompt(`This will ${cmd === "kill" ? "engage the KILL SWITCH and lock trading" : cmd + " the engine"}.${extraMsg}\nType "${TYPED[cmd]}" to confirm:`) || "";
+      if (confirm !== TYPED[cmd]) return toast("Cancelled.");
+      if (cmd === "kill") extra.close_positions = $("#kill-close").checked;
+    } else if (cmd === "dry_run") {
+      if (!window.confirm("Force the engine into DRY-RUN? Orders become simulated until it is restarted.")) return;
+    }
+    await sendCmd(cmd, {confirm, ...extra});
+    if (cmd === "dry_test") pollDryTest();
+  } catch (e) { toast("Failed: " + e.message); }
 });
+async function pollDryTest() {
+  const before = (await api("/dry-test")).ts || "", st = $("#dt-state");
+  for (let i = 0; i < 30; i++) {
+    st.textContent = "running... " + (i * 2) + "s";
+    await new Promise(r => setTimeout(r, 2000));
+    const d = await api("/dry-test");
+    if (d.ts && d.ts !== before) { renderDryTest(d); st.textContent = d.summary; return; }
+  }
+  st.textContent = "no result yet: is the engine running?";
+}
+$("#btn-start").onclick = async () => {
+  try { const r = await api("/engine/start", {method: "POST", body: "{}"}); toast(r.note); setTimeout(refresh, 4000); } catch (e) { toast("Failed: " + e.message); }
+};
 addEventListener("resize", () => refresh());
 if (KEY) { signIn(); } else { $("#login").hidden = false; }
 </script>

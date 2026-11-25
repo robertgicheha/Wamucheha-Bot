@@ -1,5 +1,14 @@
+.venv/
 venv/
 .git/
+.vscode/
 __pycache__/
 *.pyc
+.pytest_cache/
 .env
+.env.*
+data/
+tests/
+docs/
+*.md
+node_modules/

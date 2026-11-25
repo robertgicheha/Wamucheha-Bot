@@ -1,10 +1,10 @@
 """
-Control-channel authorization and executor accounting invariants.
+Executor accounting invariants.
 
-Both test groups here guard a failure that produced a bot that looked healthy
-and behaved unsafely. Neither is reachable from a normal end-to-end run, so
-they are tested at the boundary instead: the source of the auth rule, and the
-executor signature that the fee model depends on.
+These guard a failure that produced a bot that looked healthy and misreported
+its costs. It is not reachable from a normal end-to-end run, so it is tested at
+the boundary: the executor signature that the fee model depends on.
+(Control is via the dashboard now; its auth is covered in test_admin_console.py.)
 """
 import ast
 import importlib
@@ -44,158 +44,10 @@ def _fresh_import(rel_path: str, env: dict):
     return module
 
 
-class ControlAuthFailClosedTest(unittest.TestCase):
-    """An empty allowlist must deny everyone, not allow everyone.
-
-    The original code did the opposite: `if not ALLOWED_USERS: return True`.
-    That made an unconfigured bot fully controllable by anyone who could DM it,
-    which included /resume (clears a risk-manager circuit breaker) and /deposit
-    (forges the cash-flow ledger behind every ROI figure).
-    """
-
-    def test_telegram_empty_allowlist_denies_everyone(self):
-        tg = _fresh_import("control/telegram_bot.py", {"TELEGRAM_ALLOWED_USERS": ""})
-        for user_id in (1, 42, 123456789, 999999999):
-            self.assertFalse(
-                tg._is_authorized(user_id),
-                f"an empty TELEGRAM_ALLOWED_USERS must deny user {user_id}")
-
-    def test_discord_empty_allowlist_denies_everyone(self):
-        dc = _fresh_import("control/discord_bot.py", {"DISCORD_ALLOWED_ROLES": ""})
-
-        class FakeRole:
-            def __init__(self, name):
-                self.name = name
-
-        class FakeCtx:
-            def __init__(self, roles):
-                self.author = type("A", (), {"roles": roles})()
-
-        ctx = FakeCtx([FakeRole("admin"), FakeRole("everyone")])
-        self.assertFalse(
-            dc._is_authorized(ctx),
-            "an empty DISCORD_ALLOWED_ROLES must deny even a user who is admin")
-
-    def test_telegram_allows_only_listed_ids(self):
-        tg = _fresh_import("control/telegram_bot.py",
-                           {"TELEGRAM_ALLOWED_USERS": "111, 222 ,333"})
-        self.assertTrue(tg._is_authorized(111))
-        self.assertTrue(tg._is_authorized(222))
-        self.assertTrue(tg._is_authorized(333))
-        self.assertFalse(tg._is_authorized(444))
-        self.assertFalse(tg._is_authorized(0))
-
-    def test_discord_allows_only_listed_roles_case_insensitively(self):
-        dc = _fresh_import("control/discord_bot.py",
-                           {"DISCORD_ALLOWED_ROLES": "Trader, admin"})
-
-        class FakeRole:
-            def __init__(self, name):
-                self.name = name
-
-        class FakeCtx:
-            def __init__(self, roles):
-                self.author = type("A", (), {"roles": roles})()
-
-        self.assertTrue(dc._is_authorized(FakeCtx([FakeRole("trader")])))
-        self.assertTrue(dc._is_authorized(FakeCtx([FakeRole("ADMIN")])))
-        self.assertFalse(dc._is_authorized(FakeCtx([FakeRole("member")])))
-        self.assertFalse(dc._is_authorized(FakeCtx([])))
-
-    def test_malformed_id_is_dropped_not_fatal_and_never_widens_access(self):
-        """A typo in the list must not stop the bot booting, and must not
-        accidentally authorize the wrong person."""
-        tg = _fresh_import("control/telegram_bot.py",
-                           {"TELEGRAM_ALLOWED_USERS": "111, notanumber, 222"})
-        self.assertTrue(tg._is_authorized(111))
-        self.assertTrue(tg._is_authorized(222))
-        self.assertFalse(tg._is_authorized(0))
-        self.assertFalse(tg._is_authorized(-111))
-
-    def test_allow_all_pattern_is_absent_from_both_control_bots(self):
-        """Belt and braces: if someone reintroduces `if not ALLOWED: return True`,
-        the behavioural tests above would catch it, but this pins the literal so
-        the intent is greppable in review."""
-        for rel in ("control/telegram_bot.py", "control/discord_bot.py"):
-            src = (ROOT / rel).read_text(encoding="utf-8")
-            self.assertNotRegex(
-                src, r"if not ALLOWED_(USERS|ROLES)\s*:\s*\n\s*return True",
-                f"{rel} allows every caller when the allowlist is empty")
-            self.assertNotIn(
-                "empty = anyone can control", src,
-                f"{rel} documents the allow-all behaviour in .env.example text")
-
-    def test_main_refuses_to_start_a_control_bot_with_no_allowlist(self):
-        """A token plus an empty allowlist used to print 'control bot started'.
-        That is worse than skipping: every command then fails at the auth check
-        and it looks like the bot is broken rather than unconfigured."""
-        src = (ROOT / "main.py").read_text(encoding="utf-8")
-        tree = ast.parse(src)
-
-        starts = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
-                    and node.func.attr == "start" and isinstance(node.func.value, ast.Name):
-                starts[node.func.value.id] = node.lineno
-        self.assertIn("tg_bot", starts)
-        self.assertIn("dc_bot", starts)
-
-        # The guard must exist and must appear BEFORE the start() call, so an
-        # empty allowlist can never reach a running bot.
-        for var, env_key, start_var in (("tg_allowed", "TELEGRAM_ALLOWED_USERS", "tg_bot"),
-                                        ("dc_allowed", "DISCORD_ALLOWED_ROLES", "dc_bot")):
-            self.assertIn(f"{var} = os.environ.get(\"{env_key}\"", src,
-                          f"main.py must read {env_key} before starting the bot")
-            guard_line = next(
-                ln for ln, line in enumerate(src.split("\n"), 1)
-                if f"{var} = os.environ.get" in line)
-            self.assertLess(
-                guard_line, starts[start_var],
-                f"{env_key} is read at line {guard_line} but "
-                f"{start_var}.start() is at line {starts[start_var]}; the check "
-                f"must come first")
-
-
-class ResumeGoesThroughRiskManagerTest(unittest.TestCase):
-    """/resume must clear the halt via RiskManager.resume_trading.
-
-    Writing `trading_halted=0` directly to the state store has the same effect
-    on trading but skips the circuit_breaker_reset notification, so the only
-    record of who re-armed a halted bot is a state row changing.
-    """
-
-    def _cmd_body(self, rel: str, name: str) -> str:
-        """Body of a single `def <name>` using the AST, so a decorator or a
-        same-named string elsewhere in the file cannot throw the boundaries
-        off."""
-        tree = ast.parse((ROOT / rel).read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
-                    and node.name == name:
-                return ast.get_source_segment(
-                    (ROOT / rel).read_text(encoding="utf-8"), node) or ""
-        self.fail(f"{rel} has no function named {name}")
-
-    def test_telegram_resume_calls_resume_trading(self):
-        body = self._cmd_body("control/telegram_bot.py", "_cmd_resume")
-        self.assertIn("resume_trading", body)
-        # The bare update_risk_state is a deliberate fallback for the case where
-        # no risk manager was injected, so it may appear — but only guarded, never
-        # as the primary path.
-        self.assertIn("if risk is None", body)
-        self.assertLess(body.index("if risk is None"),
-                        body.index("resume_trading"))
-
-    def test_discord_resume_calls_resume_trading(self):
-        body = self._cmd_body("control/discord_bot.py", "cmd_resume")
-        self.assertIn("resume_trading", body)
-        self.assertIn("if risk is None", body)
-
-
 class ExecutorFeeAccountingTest(unittest.TestCase):
     """Every venue that fills a trade must report gross P&L, entry and exit fees.
 
-    Only ExecutionManager (ccxt) was wired to FeeModel. MT5, OANDA and Alpaca
+    Only ExecutionManager (ccxt) was wired to FeeModel. MT5
     omitted the arguments, so the notifier's defaults filled them with 0.0 and
     every report claimed those venues cost nothing, and held_seconds was always
     zero because opened_at was never passed.
@@ -203,8 +55,6 @@ class ExecutorFeeAccountingTest(unittest.TestCase):
 
     EXECUTORS = {
         "core/mt5_executor.py": "MT5Executor",
-        "core/oanda_executor.py": "OandaExecutor",
-        "core/alpaca_executor.py": "AlpacaExecutor",
         "core/execution_manager.py": "ExecutionManager",
     }
 
@@ -247,7 +97,7 @@ class ExecutorFeeAccountingTest(unittest.TestCase):
         src = (ROOT / "main.py").read_text(encoding="utf-8")
         tree = ast.parse(src)
 
-        wanted = {"MT5Executor", "OandaExecutor", "AlpacaExecutor", "ExecutionManager"}
+        wanted = {"MT5Executor", "ExecutionManager"}
         seen = {}
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \

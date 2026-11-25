@@ -14,25 +14,18 @@ Endpoints:
   GET  /api/strategy-stats    -> per-strategy accuracy/win-rate
   GET  /api/exchange-health   -> per-exchange API failure rate
   GET  /api/slippage          -> signal-vs-fill execution quality
-  GET  /api/long-term/summary -> long-term buy/sell candidates + movers
-  GET  /api/nse/summary       -> NSE Kenya exchange-wide counts, sectors, movers
-  GET  /api/nse/stocks        -> every listed NSE security (filter/sort/paginate)
-  GET  /api/nse/stock/{tkr}   -> one security: fundamentals, P/E, chart series
-  GET  /api/nse/forecast/{tkr}-> 1w/1m/3m/6m price projections for one security
   GET  /api/open-positions    -> current open positions
   POST /api/kill-switch       -> emergency halt (auth required)
   POST /api/resume            -> resume trading (auth required)
-  POST /api/terminal          -> execute VPS command (auth required)
   WS   /ws                    -> real-time data streaming (trades, prices, balance)
   GET  /admin                 -> admin console UI (API under /api/admin, key required)
-  GET  /                      -> dashboard HTML UI
+  GET  /                      -> redirects to /admin
 """
 import json
 import os
 import re
 import sys
 import asyncio
-import subprocess
 import time
 import yaml
 from pathlib import Path
@@ -64,8 +57,7 @@ app = FastAPI(title="Wamucheha Trading Bot Dashboard")
 
 # CORS is a browser-side control only; it does not stop curl. The dashboard is
 # served behind a reverse proxy that enforces auth, so this list is scoped to
-# the real origin instead of "*". "*" plus the public terminal route meant any
-# website could drive an authenticated dashboard.
+# the real origin instead of "*", so no other website can drive an authenticated dashboard.
 _ALLOWED_ORIGINS = [
     o.strip()
     for o in os.environ.get("DASHBOARD_ALLOWED_ORIGINS", "").split(",")
@@ -80,11 +72,6 @@ app.add_middleware(
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET_KEY", "change_me")
-
-# The terminal runs real shell commands as the container user (root). That is
-# remote code execution, so it is opt-in: it stays off unless explicitly
-# enabled, even when the endpoint is reachable.
-TERMINAL_ENABLED = os.environ.get("ENABLE_TERMINAL_API", "0") == "1"
 
 _start_time = datetime.now(timezone.utc)
 _state_manager = None
@@ -164,28 +151,6 @@ def _load_market_regime():
         except Exception:
             pass
     return {}
-
-
-# The long-term and NSE caches are written by long_term/daily_digest.py, which
-# owns their paths. Importing it here rather than re-hardcoding the strings
-# keeps the writer and the reader from drifting apart; its own imports are
-# cheap because the heavy ones live inside its functions.
-from long_term import daily_digest as _daily_digest  # noqa: E402
-
-_TICKER_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-]{0,11}$")
-
-
-def _normalise_ticker(ticker: str) -> str:
-    """Uppercase an NSE ticker and reject anything that isn't one.
-
-    NSE tickers are alphanumeric with an optional dash (KPLC-P4), so anything
-    outside that shape is a bad request rather than something to pass on."""
-    key = (ticker or "").strip().upper()
-    return key if _TICKER_RE.match(key) else ""
-
-
-def _read_nse_cache() -> dict:
-    return _daily_digest.read_nse_cache()
 
 
 # ---------- Health & Status ----------
@@ -318,131 +283,10 @@ def slippage():
     return slippage_tracker.get_stats()
 
 
-# ---------- Long-Term Investing ----------
-
-@app.get("/api/long-term/summary")
-def long_term_summary():
-    cache = _daily_digest.read_cache()
-    if not cache:
-        return {"buy_candidates": [], "sell_candidates": [], "movers": {},
-                "updated_at": None, "analysis": None, "market_outlook": None,
-                "note": "No data yet — long_term/scheduler.py hasn't run a refresh."}
-    return cache
-
-
 @app.get("/api/open-positions")
 def open_positions():
     state = _get_state()
     return {"positions": state.get_open_positions()}
-
-
-# ---------- NSE Kenya (whole exchange) ----------
-
-@app.get("/api/nse/summary")
-def nse_summary():
-    """Exchange-wide metadata: counts, sector breakdown, movers and any
-    caveats. Cheap enough to poll."""
-    cache = _read_nse_cache()
-    return {
-        "updated_at": cache.get("updated_at"),
-        "trading_date": cache.get("trading_date"),
-        "fetched_at": cache.get("fetched_at"),
-        "source": cache.get("source"),
-        "stale": cache.get("stale", False),
-        "counts": cache.get("counts", {}),
-        "sectors": cache.get("sectors", []),
-        "gainers": cache.get("gainers", []),
-        "losers": cache.get("losers", []),
-        "notes": cache.get("notes", []),
-        "disclaimer": cache.get("disclaimer"),
-    }
-
-
-@app.get("/api/nse/stocks")
-def nse_stocks(q: str = "", sector: str = "", sort: str = "change_pct",
-               limit: int = 0):
-    """Every listed NSE security, filtered and sorted server-side so the
-    browser is not handed 70 rows of chart series it does not need.
-
-    sort accepts: change_pct, ticker, name, price, pe_ratio, volume, score.
-    `limit=0` returns everything. Note that the per-ticker `chart` series is
-    stripped from list responses — use /api/nse/stock/{ticker} for one."""
-    cache = _read_nse_cache()
-    rows = cache.get("stocks", [])
-    if not rows:
-        return {"stocks": [], "total": 0, "note": cache.get("notes") or
-                "No NSE data yet — the 16:00 EAT snapshot job has not run."}
-
-    if q:
-        needle = q.strip().lower()
-        rows = [r for r in rows
-                if needle in (r.get("ticker") or "").lower()
-                or needle in (r.get("name") or "").lower()
-                or needle in (r.get("sector") or "").lower()]
-    if sector:
-        rows = [r for r in rows if (r.get("sector") or "") == sector]
-
-    # None must sort last in BOTH directions. A single sorted() call with
-    # reverse=True would flip the (is_none, value) tuple and float every
-    # unrated security to the top of a descending sort, so the missing values
-    # are partitioned off and appended after the ordered ones instead.
-    descending = sort not in ("ticker", "name")
-    present, missing = [], []
-    for r in rows:
-        (missing if r.get(sort) is None else present).append(r)
-    try:
-        present.sort(key=lambda r: r.get(sort), reverse=descending)
-    except TypeError:
-        present.sort(key=lambda r: str(r.get(sort)), reverse=descending)
-    rows = present + missing
-
-    total = len(rows)
-    if limit and limit > 0:
-        rows = rows[:limit]
-    return {
-        "stocks": [{k: v for k, v in r.items() if k != "chart"} for r in rows],
-        "total": total,
-        "counts": cache.get("counts", {}),
-        "updated_at": cache.get("updated_at"),
-    }
-
-
-@app.get("/api/nse/stock/{ticker}")
-def nse_stock(ticker: str):
-    """One security in full: fundamentals, score, trend, chart series and
-    price projections."""
-    key = _normalise_ticker(ticker)
-    if not key:
-        raise HTTPException(status_code=400, detail="Invalid ticker")
-    cache = _read_nse_cache()
-    for row in cache.get("stocks", []):
-        if row.get("ticker") == key:
-            return row
-    raise HTTPException(status_code=404, detail=f"{key} not found in the NSE snapshot")
-
-
-@app.get("/api/nse/forecast/{ticker}")
-def nse_forecast(ticker: str):
-    """Just the projections for one security — the chart tab polls this."""
-    key = _normalise_ticker(ticker)
-    if not key:
-        raise HTTPException(status_code=400, detail="Invalid ticker")
-    cache = _read_nse_cache()
-    for row in cache.get("stocks", []):
-        if row.get("ticker") == key:
-            forecast = row.get("forecast") or {}
-            return {"ticker": key, "last_price": row.get("price"),
-                    "as_of": forecast.get("as_of"),
-                    "observations": forecast.get("observations", 0),
-                    "available": forecast.get("available", False),
-                    "reason": forecast.get("reason"),
-                    "confidence": forecast.get("confidence"),
-                    "confidence_note": forecast.get("confidence_note"),
-                    "label": forecast.get("label"),
-                    "trend": forecast.get("trend"),
-                    "horizons": forecast.get("horizons", []),
-                    "disclaimer": forecast.get("disclaimer")}
-    raise HTTPException(status_code=404, detail=f"{key} not found in the NSE snapshot")
 
 
 # ---------- Control ----------
@@ -487,45 +331,6 @@ def transactions(n: int = 200):
     state = _get_state()
     trades = state.get_recent_trades(n)
     return {"transactions": trades}
-# ---------- Terminal ----------
-
-@app.post("/api/terminal")
-def terminal_exec(body: dict, x_dashboard_key: str = Header(None)):
-    if not TERMINAL_ENABLED:
-        raise HTTPException(
-            status_code=403,
-            detail="Terminal API is disabled. Set ENABLE_TERMINAL_API=1 to enable.",
-        )
-    if x_dashboard_key != DASHBOARD_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
-
-    command = body.get("command", "").strip()
-    if not command:
-        raise HTTPException(status_code=400, detail="No command provided")
-
-    # Block dangerous commands
-    blocked = ["rm -rf", "mkfs", "dd if=", "> /dev/", "shutdown", "reboot", "halt",
-                "init 0", "init 6", "format", ":(){ :|:& };:"]
-    for b in blocked:
-        if b in command.lower():
-            raise HTTPException(status_code=400, detail=f"Blocked dangerous command: {b}")
-
-    try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=30,
-            cwd=str(Path(__file__).parent.parent),
-        )
-        return {
-            "stdout": result.stdout[-5000:] if result.stdout else "",
-            "stderr": result.stderr[-2000:] if result.stderr else "",
-            "returncode": result.returncode,
-        }
-    except subprocess.TimeoutExpired:
-        return {"stdout": "", "stderr": "Command timed out after 30s", "returncode": -1}
-    except Exception as e:
-        return {"stdout": "", "stderr": str(e), "returncode": -1}
-
-
 # ---------- WebSocket ----------
 
 @app.websocket("/ws")
@@ -566,7 +371,9 @@ def admin_page(request: Request):
 
 
 # ---------- Dashboard UI ----------
+from fastapi.responses import RedirectResponse  # noqa: E402
 
-@app.get("/", response_class=HTMLResponse)
-def index(request: Request):
-    return templates.TemplateResponse(request, "index.html")
+
+@app.get("/", include_in_schema=False)
+def index():
+    return RedirectResponse("/admin")

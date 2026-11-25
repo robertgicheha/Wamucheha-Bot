@@ -1,6 +1,11 @@
 {
   "venvPath": ".",
   "venv": ".venv",
-  "pythonVersion": "3.14",
-  "typeCheckingMode": "basic"
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "include": ["core", "strategy", "dashboard", "reporting", "scripts", "control", "alerts",
+              "data_feeds", "ml", "long_term", "config", "tests", "main.py", "feed_router.py"],
+  "exclude": ["**/node_modules", "**/__pycache__", ".venv", "data", "docs", "deploy", "docker"],
+  "ignore": [".venv"],
+  "useLibraryCodeForTypes": false
 }

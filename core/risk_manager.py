@@ -50,8 +50,7 @@ MT5_CONTRACT_SIZE = {"XAU": 100, "XAG": 5000, "BTC": 1, "ETH": 1}
 
 def position_notional_usd(pos: dict) -> float:
     """Approximate USD notional of an open position. `amount` means different
-    things per broker: coins/shares (ccxt, Alpaca), base-currency units
-    (OANDA), or lots (MT5) — amount * price is only right for the first."""
+    things per broker: coins (ccxt) or lots (MT5) — amount * price is only right for the first."""
     symbol, amount, price = pos["symbol"].upper(), pos["amount"], pos["entry_price"]
     if pos.get("exchange") == "mt5":
         size = next((v for k, v in MT5_CONTRACT_SIZE.items() if symbol.startswith(k)), 100000)
@@ -61,12 +60,6 @@ def position_notional_usd(pos: dict) -> float:
         if symbol.endswith("USD"):
             return units * price           # EURUSD, XAUUSD, BTCUSD
         return units                       # crosses: ~1 USD per base unit
-    if pos.get("exchange") == "oanda":
-        if symbol.startswith("USD/"):
-            return amount                  # base is USD
-        if symbol.endswith("/USD"):
-            return amount * price
-        return amount                      # crosses: ~1 USD per base unit
     return amount * price
 
 

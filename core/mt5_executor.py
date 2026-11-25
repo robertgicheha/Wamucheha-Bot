@@ -10,6 +10,7 @@ Key differences from ccxt/OANDA:
 - Stop-loss/take-profit are attached at order time
 - Requires the MetaTrader5 terminal to be running on the same machine
 """
+import os
 import uuid
 import logging
 from datetime import datetime, timezone
@@ -66,7 +67,13 @@ class MT5Executor:
         """Initialize connection to the MT5 terminal."""
         try:
             mt5 = get_mt5()
-            initialized = mt5.initialize()
+            # Pin the terminal (several installs may exist) and bound the wait so a
+            # missing/unresponsive terminal fails fast instead of hanging startup.
+            kwargs = {"timeout": 30000}
+            term_path = os.environ.get("MT5_TERMINAL_PATH", "").strip()
+            if term_path:
+                kwargs["path"] = term_path
+            initialized = mt5.initialize(**kwargs)
         except ImportError:
             logger.error("MetaTrader5 package not installed (Windows only). "
                          "On Linux set MT5_RPC_HOST to the mt5 container.")

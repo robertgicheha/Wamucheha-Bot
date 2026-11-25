@@ -98,7 +98,12 @@ def compute_metrics(trades: list, starting_balance: float = 0.0) -> dict:
     return {
         "trades": n,
         "wins": int(len(wins)), "losses": int(len(losses)),
+        "breakeven": int(n - len(wins) - len(losses)),
         "win_rate_pct": round(len(wins) / n * 100, 1),
+        "loss_rate_pct": round(len(losses) / n * 100, 1),
+        "gross_profit": round(gross_win, 4), "gross_loss": round(-gross_loss, 4),
+        # Share of gross winnings you kept after losses and fees: 100% = no losses at all.
+        "efficiency_pct": round(float(pnls.sum()) / gross_win * 100, 1) if gross_win > 0 else None,
         "total_pnl": round(float(pnls.sum()), 4),
         "total_fees": round(sum(_f(t.get("fees")) for t in closed), 4),
         "avg_win": round(float(wins.mean()), 4) if len(wins) else 0.0,

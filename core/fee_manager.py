@@ -52,8 +52,6 @@ DEFAULT_TAKER_BPS = {
     # Non-crypto venues. Alpaca equities are commission-free; OANDA and MT5
     # charge spread, which is already inside the fill price, so there is no
     # separate commission line to add here.
-    "alpaca": 0.0,
-    "oanda": 0.0,
     "mt5": 0.0,
 }
 FALLBACK_TAKER_BPS = 10.0
