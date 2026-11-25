@@ -92,6 +92,16 @@ if _env_balance is not None:
         print(f"WARNING: Invalid TRADING_BALANCE '{_env_balance}' in .env — using config.yaml default")
 
 
+# DISABLE_VENUES=okx,binance switches venues off without editing config.yaml. The native
+# engine uses it to stop simulated OKX crypto while crypto trades on the MT5 demo instead;
+# the Docker engine (no MT5) leaves it blank.
+_disabled_venues = {v.strip().lower() for v in os.environ.get("DISABLE_VENUES", "").split(",") if v.strip()}
+for _ex in CONFIG.get("execution", {}).get("exchanges", []):
+    if _ex.get("name", "").lower() in _disabled_venues and _ex.get("enabled"):
+        _ex["enabled"] = False
+        print(f"Venue '{_ex['name']}' disabled by DISABLE_VENUES")
+
+
 def build_notifier():
     return Notifier(
         telegram_token=os.environ.get("TELEGRAM_BOT_TOKEN"),
@@ -584,15 +594,20 @@ def main():
                 if LIVE_TRADING or forced_dry or not mt5_demo_orders or ex is None:
                     print("test_trade refused: only allowed in MT5 demo mode with a connected MT5 venue.")
                     continue
+                gold = next((s for s in CONFIG["execution"].get("mt5_markets", [])
+                             if s.upper().startswith(("XAU", "GOLD"))), None)
+                if gold is None:
+                    print("test_trade refused: no gold symbol in execution.mt5_markets.")
+                    continue
                 try:
-                    px = feed_router.latest_price("XAUUSD")
+                    px = feed_router.latest_price(gold)
                     rs = state.get_risk_state()
                     amount = rs["trading_balance"] * CONFIG["risk"]["max_position_pct"] / 100
-                    res = ex.open_trade(symbol="XAUUSD", side="buy", proposed_amount=amount,
+                    res = ex.open_trade(symbol=gold, side="buy", proposed_amount=amount,
                                         entry_price=px, stop_loss_pct=CONFIG["risk"]["stop_loss_pct"],
                                         take_profit_pct=CONFIG["risk"]["take_profit_pct"],
                                         strategies=["manual_test"], score=0.0, regime="test")
-                    print(f"test_trade: {'opened' if res else 'not opened (see rejection alert)'} XAUUSD @ {px}")
+                    print(f"test_trade: {'opened' if res else 'not opened (see rejection alert)'} {gold} @ {px}")
                 except Exception as e:
                     print(f"test_trade failed: {e}")
             elif verb == "stop":

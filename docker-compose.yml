@@ -26,6 +26,7 @@ services:
     - engine-control:/app/data/control   # dashboard -> engine command mailbox
     environment:
       PYTHONUNBUFFERED: '1'
+      DISABLE_VENUES: ""      # Docker has no MT5, so keep the simulated OKX crypto here
     networks:
     - trading-net
     healthcheck:
@@ -53,6 +54,8 @@ services:
     - engine-data:/app/data:ro
     - engine-control:/app/data/control   # writable: the only place the dashboard can write
     - ./config:/app/config:ro
+    environment:
+      DISABLE_VENUES: ""
     networks:
     - trading-net
     depends_on:

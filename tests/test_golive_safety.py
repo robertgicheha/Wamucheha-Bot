@@ -194,3 +194,15 @@ def test_preflight_script_runs_and_reports_cleanly():
     assert r.returncode in (0, 1)
 
 
+
+
+def test_feed_router_sends_slashless_symbols_to_mt5_and_pairs_to_ccxt(monkeypatch):
+    """XAUUSD / BTCUSD (no slash) are MT5 contracts; BTC/USDT is a ccxt exchange pair."""
+    from data_feeds import feed_router
+    r = feed_router.FeedRouter.__new__(feed_router.FeedRouter)
+    r.feeds = {"okx": feed_router.MarketData.__new__(feed_router.MarketData), "mt5": object()}
+    assert r._classify_symbol("XAUUSD") == "mt5"
+    assert r._classify_symbol("BTCUSD") == "mt5"
+    assert r._classify_symbol("ETHUSD") == "mt5"
+    assert r._classify_symbol("BTC/USDT") == "okx"
+    assert r._classify_symbol("PAXG/USDT") == "okx"

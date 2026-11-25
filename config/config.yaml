@@ -119,6 +119,9 @@ execution:
       markets: []
   mt5_markets:
     - "XAUUSD"  # spot gold via the MT5 terminal
+    # Crypto CFDs through MT5 (BTCUSD, ETHUSD) need a broker that lists them. The
+    # MetaQuotes-Demo server does NOT (only Forex, Metals, Indexes and Nasdaq stocks/ETFs).
+    # On a broker that does, e.g. Fusion Markets demo, add:  - "BTCUSD"  - "ETHUSD"
   # MT5's minimum order is 0.01 lot (~$1,000 EURUSD, ~$4,000 gold) — far above
   # max_position_pct of a small trading balance. false: skip such trades.
   # true: trade the minimum lot anyway (only sensible on a demo account).

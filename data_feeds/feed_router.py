@@ -3,7 +3,8 @@ Feed router: picks the right data source for a symbol.
 
 Scope is deliberately narrow, crypto and gold only:
 - Crypto pairs written BASE/QUOTE (BTC/USDT, ETH/USDT, PAXG/USDT) -> ccxt exchange feed
-- Gold written without a slash (XAUUSD, GOLD)                      -> MetaTrader 5 feed
+- Anything without a slash (XAUUSD gold, or BTCUSD / ETHUSD crypto CFDs when the
+  broker lists them)                                                -> MetaTrader 5 feed
 """
 import os
 
@@ -42,7 +43,7 @@ class FeedRouter:
 
     def _classify_symbol(self, symbol: str) -> str:
         """Returns the feed name to use for a given symbol."""
-        if "/" not in symbol and symbol.upper() in GOLD_SYMBOLS:
+        if "/" not in symbol:
             return "mt5"
         # Anything BASE/QUOTE is a crypto pair: first enabled ccxt exchange.
         for name, feed in self.feeds.items():

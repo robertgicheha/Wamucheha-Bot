@@ -32,3 +32,5 @@ data/control/
 data/engine_heartbeat.json*
 data/.last_retrain
 data/engine.pid
+data/trade_log.jsonl
+data/events.log

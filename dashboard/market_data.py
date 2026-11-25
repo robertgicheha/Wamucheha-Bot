@@ -11,14 +11,19 @@ short cache keeps auto-refresh from hammering any of them.
 """
 import concurrent.futures
 import os
+import threading
 import time
 
 TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
 _SECONDS = {"1m": 60, "5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
-CCXT_EXCHANGES = ["binance", "okx", "bybit"]
+# okx first: it is the venue in config.yaml and works from most networks. PRICE_EXCHANGES overrides.
+CCXT_EXCHANGES = [e.strip() for e in os.environ.get("PRICE_EXCHANGES", "okx,binance,bybit").split(",") if e.strip()]
+_ccxt_down_until: dict = {}   # exchange -> unix time before which it is skipped (it just failed)
 DEFAULT_CRYPTO = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
 
 _cache: dict = {}
+_slow_cache: dict = {}
+_mt5_lock = threading.Lock()   # the MT5 API is not safe to drive from several threads at once
 CACHE_TTL = 8
 _mt5_down_until = 0.0
 _ccxt_clients: dict = {}
@@ -70,7 +75,7 @@ def _from_mt5(symbol: str, tf: str, limit: int) -> list:
                  "low": float(r["low"]), "close": float(r["close"]),
                  "volume": float(r["tick_volume"])} for r in rates]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+    with _mt5_lock, concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         fut = ex.submit(work)
         try:
             return fut.result(timeout=8)
@@ -83,23 +88,32 @@ def _from_ccxt(symbol: str, tf: str, limit: int) -> tuple:
     import ccxt
     last = None
     for name in CCXT_EXCHANGES:
+        if time.time() < _ccxt_down_until.get(name, 0):
+            continue                                   # failed recently: do not wait on it again
         try:
-            ex = _ccxt_clients.get(name) or getattr(ccxt, name)({"enableRateLimit": True, "timeout": 8000})
+            ex = _ccxt_clients.get(name) or getattr(ccxt, name)({"enableRateLimit": True, "timeout": 5000})
             _ccxt_clients[name] = ex
             raw = ex.fetch_ohlcv(symbol, tf, limit=limit)
             if raw:
                 return [{"time": int(r[0] // 1000), "open": r[1], "high": r[2], "low": r[3],
                          "close": r[4], "volume": r[5] or 0} for r in raw], name
-        except Exception as e:                       # geo-block, unknown pair, timeout: try next
+        except ccxt.BadSymbol as e:                    # this exchange just does not list it: not an outage
             last = e
+        except Exception as e:                         # geo-block, timeout, DNS: back off this exchange
+            last = e
+            _ccxt_down_until[name] = time.time() + 300
     raise RuntimeError(f"no exchange returned {symbol}: {last}")
 
 
-_YF_MAP = {"XAUUSD": "GC=F", "XAGUSD": "SI=F"}
+_YF_MAP = {"XAUUSD": "GC=F", "XAGUSD": "SI=F", "BTCUSD": "BTC-USD", "ETHUSD": "ETH-USD",
+           "SOLUSD": "SOL-USD", "XRPUSD": "XRP-USD", "LTCUSD": "LTC-USD"}
 
 
 def _from_yfinance(symbol: str, tf: str, limit: int) -> list:
     import yfinance as yf
+    # Brokers append account-type suffixes (Exness: XAUUSDm, BTCUSDc). Strip one for lookup.
+    if "/" not in symbol and len(symbol) > 6 and symbol[-1] in "mcMC" and symbol[:-1].isalpha() and symbol[:-1].isupper():
+        symbol = symbol[:-1]
     if "/" in symbol:
         base, quote = symbol.split("/")
         ysym = f"{base}-{'USD' if quote in ('USDT', 'USDC') else quote}"
@@ -154,3 +168,47 @@ def fetch_candles(symbol: str, tf: str = "15m", limit: int = 300, source: str = 
               "last_price": candles[-1]["close"], "fallback_notes": errors}
     _cache[key] = (time.time(), result)
     return result
+
+
+def _change_24h(symbol: str):
+    """% change versus ~24h ago, from hourly candles (cached for 2 minutes: it moves slowly)."""
+    hit = _slow_cache.get(symbol)
+    if hit and time.time() - hit[0] < 120:
+        return hit[1]
+    val = None
+    try:
+        cs = fetch_candles(symbol, "1h", 30)["candles"]
+        ref = cs[-24]["close"] if len(cs) >= 24 else cs[0]["close"]
+        if ref:
+            val = round((cs[-1]["close"] - ref) / ref * 100, 3)
+    except Exception:
+        pass
+    _slow_cache[symbol] = (time.time(), val)
+    return val
+
+
+def snapshot(symbol: str) -> dict:
+    """Latest price + 24h change for one symbol. Never raises: a dead feed becomes an error row."""
+    try:
+        c = fetch_candles(symbol, "1m", 30)
+        return {"symbol": symbol, "price": c["last_price"], "source": c["source"],
+                "change_pct": _change_24h(symbol), "ts": c["candles"][-1]["time"]}
+    except Exception as e:
+        return {"symbol": symbol, "price": None, "error": str(e)[:160]}
+
+
+_pool = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="snap")
+
+
+def snapshots(symbols: list, timeout: float = 6.0) -> list:
+    """Snapshots for several symbols in parallel. A slow feed must not stall the page: after
+    `timeout` seconds it is reported as loading, keeps running in the background, and its
+    result is served from cache on the next refresh."""
+    if not symbols:
+        return []
+    futs = {s: _pool.submit(snapshot, s) for s in symbols}
+    concurrent.futures.wait(list(futs.values()), timeout=timeout)
+    out = []
+    for s, f in futs.items():
+        out.append(f.result() if f.done() else {"symbol": s, "price": None, "error": "loading..."})
+    return out

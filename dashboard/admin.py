@@ -380,14 +380,35 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _in_container() -> bool:
+    return Path("/.dockerenv").exists()
+
+
 @router.post("/engine/start")
 def engine_start(request: Request, _=Depends(require_control_key)):
-    """Launch main.py as a detached process. Only for native (non-container) runs; in
-    Docker the engine is its own supervised service and is started with docker compose."""
-    if Path("/.dockerenv").exists():
-        raise HTTPException(400, "running in a container: start the engine service with "
-                                 "`docker compose up -d engine` instead")
+    """Start the engine.
+
+    Native run: launch main.py as a detached process.
+    Docker: the engine is a separate, always-supervised container that this dashboard
+    cannot launch, so Start means "wake it": resume it if it is paused or in standby.
+    """
+    who = f"dashboard@{request.client.host if request.client else '?'}"
     status = _engine_status()
+    if _in_container():
+        state = status["state"]
+        if state in ("standby", "halted"):
+            if _read_json(HEARTBEAT).get("kill_switch"):
+                raise HTTPException(409, "the kill switch is armed: use Resume and type 'release'")
+            control_channel.send_command("resume", by=who)
+            return {"started": True, "via": "resume",
+                    "note": "The engine container is already up; sent Resume to wake it from "
+                            f"{state}. Trading restarts within seconds."}
+        if state in ("running", "starting", "restarting"):
+            raise HTTPException(409, f"the engine container is already {state}. In Docker the engine "
+                                     "runs all the time; use Pause / Standby to hold it back.")
+        raise HTTPException(409, f"the engine container is not responding (state: {state}). Docker "
+                                 "restarts it automatically; if it stays offline, run "
+                                 "`docker compose up -d engine` on the host.")
     if status["state"] in ("running", "halted", "standby", "starting", "restarting"):
         raise HTTPException(409, f"engine is already {status['state']}")
     try:
@@ -402,9 +423,7 @@ def engine_start(request: Request, _=Depends(require_control_key)):
                             stdin=subprocess.DEVNULL, creationflags=flags,
                             start_new_session=(os.name != "nt"))
     PID_FILE.write_text(str(proc.pid))
-    control_channel.append_audit({"command": "start",
-                                  "by": f"dashboard@{request.client.host if request.client else '?'}",
-                                  "id": f"pid{proc.pid}"})
+    control_channel.append_audit({"command": "start", "by": who, "id": f"pid{proc.pid}"})
     return {"started": True, "pid": proc.pid,
             "note": "Engine launching. It appears as running in about a minute; output goes to "
                     "data/logs/engine_stdout.log."}
@@ -460,3 +479,108 @@ def candles(symbol: str, tf: str = "15m", limit: int = 300, source: str = "auto"
                               "pnl": t.get("pnl")})
     data["markers"] = marks
     return data
+
+
+# ---------- live terminal data ----------
+def _asset_class(symbol: str) -> str:
+    u = (symbol or "").upper()
+    if u.startswith(("XAU", "PAXG", "GOLD")):
+        return "gold"
+    if "/" in u or u.startswith(("BTC", "ETH", "SOL", "XRP", "LTC", "BNB", "DOGE", "ADA")):
+        return "crypto"
+    return "other"
+
+
+def _watchlist() -> list:
+    """Symbols the bot trades (from config), gold first. Falls back to sensible defaults."""
+    syms = []
+    try:
+        import yaml
+        cfg = yaml.safe_load((ROOT / "config" / "config.yaml").read_text(encoding="utf-8"))
+        ex = cfg.get("execution", {})
+        off = {v.strip().lower() for v in os.environ.get("DISABLE_VENUES", "").split(",") if v.strip()}
+        syms += list(ex.get("mt5_markets", []))
+        for e in ex.get("exchanges", []):
+            if e.get("enabled") and e.get("name", "").lower() not in off:
+                syms += list(e.get("markets") or [])
+    except Exception:
+        pass
+    syms = syms or ["XAUUSD", "BTC/USDT", "ETH/USDT"]
+    seen, out = set(), []
+    for x in sorted(syms, key=lambda v: (_asset_class(v) != "gold", v)):
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def _floating_pnl(pos: dict, price: float) -> dict:
+    """Unrealised P&L in USD for one open position at `price`."""
+    from core.risk_manager import MT5_CONTRACT_SIZE
+    entry, amount = float(pos["entry_price"]), float(pos["amount"])
+    direction = 1 if pos.get("side") == "buy" else -1
+    size = 1.0
+    if pos.get("exchange") == "mt5":
+        sym = pos["symbol"].upper()
+        size = next((v for k, v in MT5_CONTRACT_SIZE.items() if sym.startswith(k)), 100000)
+    pnl = (price - entry) * amount * size * direction
+    cost = entry * amount * size
+    return {"pnl": round(pnl, 4), "pnl_pct": round(pnl / cost * 100, 3) if cost else None}
+
+
+@router.get("/live", dependencies=[Depends(require_key)])
+def live():
+    """Everything the terminal needs on each tick: prices for the watchlist and for every
+    open position, floating P&L, and the account balance. Cheap and cached upstream."""
+    snap = _read_json(SNAPSHOT_PATH)
+    watch = _watchlist()
+    try:
+        positions = _state().get_open_positions()
+    except Exception:
+        positions = []
+    extra = [p["symbol"] for p in positions if p["symbol"] not in watch]
+    rows = market_data.snapshots(watch + extra)
+    px = {r["symbol"]: r.get("price") for r in rows}
+    open_rows, open_pnl = [], 0.0
+    for p in positions:
+        price = px.get(p["symbol"])
+        fl = _floating_pnl(p, price) if price else {"pnl": None, "pnl_pct": None}
+        if fl["pnl"] is not None:
+            open_pnl += fl["pnl"]
+        open_rows.append({**p, "price": price, "asset": _asset_class(p["symbol"]), **fl})
+    balance = snap.get("trading_balance") or 0.0
+    return {"ts": datetime.now(timezone.utc).isoformat(), "balance": balance,
+            "open_pnl": round(open_pnl, 4), "equity": round(balance + open_pnl, 4),
+            "prices": [dict(r, asset=_asset_class(r["symbol"])) for r in rows if r["symbol"] in watch],
+            "positions": open_rows}
+
+
+@router.get("/ledger", dependencies=[Depends(require_key)])
+def ledger(n: int = 300):
+    """Closed trades with profit per trade and the account balance AFTER each one."""
+    snap = _read_json(SNAPSHOT_PATH)
+    trades = sorted(_closed_trades(5000), key=lambda t: str(t.get("closed_at") or t.get("opened_at") or ""))
+    try:
+        flows = _state().get_cash_flow_totals()
+    except Exception:
+        flows = {}
+    total = sum((t.get("pnl") or 0) for t in trades)
+    start = (snap.get("trading_balance") or 0.0) - total + flows.get("swept", 0.0)
+    bal, rows, curve = start, [], []
+    for t in trades:
+        pnl = float(t.get("pnl") or 0.0)
+        bal += pnl
+        rows.append({"id": t.get("id"), "symbol": t.get("symbol"), "side": t.get("side"),
+                     "asset": _asset_class(t.get("symbol")), "exchange": t.get("exchange"),
+                     "opened_at": t.get("opened_at"), "closed_at": t.get("closed_at"),
+                     "entry_price": t.get("entry_price"), "exit_price": t.get("exit_price"),
+                     "amount": t.get("amount"), "pnl": round(pnl, 4), "fees": t.get("fees"),
+                     "reason": t.get("reason"), "balance_after": round(bal, 4)})
+        curve.append({"ts": t.get("closed_at"), "balance": round(bal, 4)})
+    summary = {}
+    for a in ("gold", "crypto"):
+        sub = [r for r in rows if r["asset"] == a]
+        summary[a] = {"trades": len(sub), "wins": sum(1 for r in sub if r["pnl"] > 0),
+                      "pnl": round(sum(r["pnl"] for r in sub), 4)}
+    return {"start_balance": round(start, 4), "balance": round(bal, 4), "summary": summary,
+            "trades": list(reversed(rows))[: max(1, min(n, 1000))], "curve": curve}

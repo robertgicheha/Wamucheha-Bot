@@ -270,3 +270,89 @@ def test_mt5_demo_flag_is_honoured_only_for_demo_servers():
     src = (Path(__file__).resolve().parent.parent / "main.py").read_text(encoding="utf-8")
     assert '"demo" in mt5_server.lower()' in src
     assert "dry_run=not (LIVE_TRADING or mt5_demo_orders)" in src
+
+
+# ---------- Start inside Docker ----------
+def _hb(state_health, **extra):
+    from datetime import datetime, timezone
+    (Path(_TMP) / "engine_heartbeat.json").write_text(json.dumps(
+        {"ts": datetime.now(timezone.utc).isoformat(), "health": state_health, **extra}))
+
+
+def test_start_in_docker_resumes_a_paused_engine(client, monkeypatch):
+    from dashboard import admin
+    monkeypatch.setattr(admin, "_in_container", lambda: True)
+    _hb("standby")
+    r = client.post("/api/admin/engine/start", headers=H)
+    assert r.status_code == 200 and r.json()["via"] == "resume"
+    assert control_channel.poll_commands()[0]["command"] == "resume"
+
+
+def test_start_in_docker_explains_when_already_running_or_offline(client, monkeypatch):
+    from dashboard import admin
+    monkeypatch.setattr(admin, "_in_container", lambda: True)
+    _hb("running")
+    r = client.post("/api/admin/engine/start", headers=H)
+    assert r.status_code == 409 and "already running" in r.json()["detail"]
+    (Path(_TMP) / "engine_heartbeat.json").unlink()
+    r = client.post("/api/admin/engine/start", headers=H)
+    assert r.status_code == 409 and "docker compose up -d engine" in r.json()["detail"]
+    assert control_channel.pending_count() == 0
+
+
+def test_start_in_docker_will_not_bypass_the_kill_switch(client, monkeypatch):
+    from dashboard import admin
+    monkeypatch.setattr(admin, "_in_container", lambda: True)
+    _hb("halted", kill_switch=True)
+    r = client.post("/api/admin/engine/start", headers=H)
+    assert r.status_code == 409 and "kill switch" in r.json()["detail"]
+    assert control_channel.pending_count() == 0
+
+
+# ---------- terminal data: /live and /ledger ----------
+def _seed_trades():
+    from core.state_manager import StateManager
+    sm = StateManager(stake_amount=1.0, initial_trading_balance=1000.0)
+    for i, (sym, pnl) in enumerate([("XAUUSD", 5.0), ("BTC/USDT", -2.0), ("XAUUSD", 3.0)]):
+        cid = f"led-{sym}-{i}"
+        sm.record_trade_open(cid, "mt5" if sym == "XAUUSD" else "okx", sym, "buy", 0.01, 100.0, 95.0, 110.0, ["ema"], 0.5, "trend")
+        sm.record_trade_close(cid, 101.0, pnl, "tp" if pnl > 0 else "sl")
+    return sm
+
+
+def test_ledger_has_running_balance_and_asset_summary(client):
+    _seed_trades()
+    j = client.get("/api/admin/ledger", headers=H).json()
+    rows = list(reversed(j["trades"]))           # API returns newest first
+    assert len(rows) >= 3
+    bal = j["start_balance"]
+    for r in rows:                                # every row's balance_after = previous + its pnl
+        bal = round(bal + r["pnl"], 4)
+        assert r["balance_after"] == bal
+    assert abs(j["balance"] - rows[-1]["balance_after"]) < 1e-6
+    assert j["summary"]["gold"]["trades"] >= 2 and j["summary"]["crypto"]["trades"] >= 1
+    assert client.get("/api/admin/ledger").status_code == 401
+
+
+def test_live_returns_prices_positions_and_floating_pnl(client, monkeypatch):
+    from dashboard import market_data
+    from core.state_manager import StateManager
+    sm = StateManager(stake_amount=1.0, initial_trading_balance=1000.0)
+    sm.record_trade_open("live-open-1", "mt5", "XAUUSD", "buy", 0.01, 3500.0, 3430.0, 3590.0, ["ema"], 0.5, "trend")
+    sm.record_trade_open("live-open-2", "okx", "BTC/USDT", "sell", 0.5, 60000.0, 61000.0, 58000.0, ["ema"], 0.5, "trend")
+    prices = {"XAUUSD": 3510.0, "BTC/USDT": 59000.0}
+    monkeypatch.setattr(market_data, "snapshots", lambda syms: [
+        {"symbol": s, "price": prices.get(s), "change_pct": 1.2, "source": "fake"} for s in syms])
+    j = client.get("/api/admin/live", headers=H).json()
+    pos = {p["symbol"]: p for p in j["positions"]}
+    assert abs(pos["XAUUSD"]["pnl"] - 10.0) < 1e-6          # 0.01 lot * 100 oz * (3510 - 3500)
+    assert abs(pos["BTC/USDT"]["pnl"] - 500.0) < 1e-6        # short 0.5 BTC, price fell 1000
+    assert abs(j["open_pnl"] - 510.0) < 1e-6 and abs(j["equity"] - (j["balance"] + 510.0)) < 1e-6
+    assert any(r["symbol"] == "XAUUSD" and r["asset"] == "gold" for r in j["prices"])
+    assert client.get("/api/admin/live").status_code == 401
+
+
+def test_live_survives_a_dead_price_feed(client, monkeypatch):
+    from dashboard import market_data
+    monkeypatch.setattr(market_data, "snapshots", lambda syms: [{"symbol": s, "price": None, "error": "down"} for s in syms])
+    assert client.get("/api/admin/live", headers=H).status_code == 200
