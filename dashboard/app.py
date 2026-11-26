@@ -15,8 +15,6 @@ Endpoints:
   GET  /api/exchange-health   -> per-exchange API failure rate
   GET  /api/slippage          -> signal-vs-fill execution quality
   GET  /api/open-positions    -> current open positions
-  POST /api/kill-switch       -> emergency halt (auth required)
-  POST /api/resume            -> resume trading (auth required)
   WS   /ws                    -> real-time data streaming (trades, prices, balance)
   GET  /admin                 -> admin console UI (API under /api/admin, key required)
   GET  /                      -> redirects to /admin
@@ -76,6 +74,29 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type", "X-Dashboard-Key"],
 )
+
+# ---------- access control ----------
+def _readonly() -> bool:
+    """DASHBOARD_READONLY=1 makes this instance a viewer: nothing can change state through it.
+    Use it for any copy you expose beyond this PC (tunnel, phone, remote analysis)."""
+    return os.environ.get("DASHBOARD_READONLY", "").strip().lower() in ("1", "true", "yes")
+
+
+@app.middleware("http")
+async def _access_guard(request: Request, call_next):
+    if _readonly() and request.method not in ("GET", "HEAD", "OPTIONS"):
+        return JSONResponse({"detail": "this dashboard is read-only"}, status_code=403)
+    path = request.url.path
+    # The older /api/* data routes used to answer anyone. They now need the dashboard key,
+    # exactly like /api/admin/*, which does its own check (and rate limiting).
+    if path.startswith("/api/") and not path.startswith("/api/admin/"):
+        from dashboard import admin as _admin
+        try:
+            _admin.require_key(request, request.headers.get("x-dashboard-key"))
+        except HTTPException as e:
+            return JSONResponse({"detail": e.detail}, status_code=e.status_code)
+    return await call_next(request)
+
 templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 DASHBOARD_SECRET = os.environ.get("DASHBOARD_SECRET_KEY", "change_me")
@@ -298,26 +319,6 @@ def open_positions():
 
 # ---------- Control ----------
 
-@app.post("/api/kill-switch")
-def kill_switch(x_dashboard_key: str = Header(None)):
-    if x_dashboard_key != DASHBOARD_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    state = _get_state()
-    state.update_risk_state(trading_halted=1, halt_reason="Manual kill switch via dashboard")
-    return {"status": "halted"}
-
-
-@app.post("/api/resume")
-def resume(x_dashboard_key: str = Header(None)):
-    if x_dashboard_key != DASHBOARD_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    state = _get_state()
-    state.update_risk_state(trading_halted=0, halt_reason=None)
-    return {"status": "resumed"}
-
-
-
-# ---------- Bot Control API ----------
 @app.get("/api/bot/status")
 def bot_status():
     snapshot = _load_snapshot()
@@ -342,6 +343,11 @@ def transactions(n: int = 200):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    import hmac as _hmac
+    given = websocket.query_params.get("key") or websocket.headers.get("x-dashboard-key") or ""
+    if not DASHBOARD_SECRET or not _hmac.compare_digest(given.encode(), DASHBOARD_SECRET.encode()):
+        await websocket.close(code=1008)          # policy violation: the live stream needs the key
+        return
     await ws_manager.connect(websocket)
     try:
         while True:

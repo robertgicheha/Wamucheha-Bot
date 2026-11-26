@@ -57,8 +57,14 @@ def require_key(request: Request, x_dashboard_key: str = Header(None)):
         raise HTTPException(401, "unauthorized")
 
 
+def _readonly() -> bool:
+    return os.environ.get("DASHBOARD_READONLY", "").strip().lower() in ("1", "true", "yes")
+
+
 def require_control_key(request: Request, x_dashboard_key: str = Header(None)):
     require_key(request, x_dashboard_key)
+    if _readonly():
+        raise HTTPException(403, "this dashboard is read-only")
     if _secret() in ("", "change_me"):
         raise HTTPException(403, "control actions are disabled until DASHBOARD_SECRET_KEY "
                                  "is changed from its default")
@@ -127,7 +133,8 @@ def _signature(line: str) -> str:
 # ---------- read endpoints ----------
 @router.get("/ping", dependencies=[Depends(require_key)])
 def ping():
-    return {"ok": True, "control_enabled": _secret() not in ("", "change_me")}
+    return {"ok": True, "readonly": _readonly(),
+            "control_enabled": _secret() not in ("", "change_me") and not _readonly()}
 
 
 @router.get("/overview", dependencies=[Depends(require_key)])

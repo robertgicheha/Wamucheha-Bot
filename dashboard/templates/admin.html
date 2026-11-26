@@ -73,6 +73,7 @@ h2.sec:first-child{margin-top:0}
 .modebar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px;padding:8px 12px;border-radius:10px;border:1px solid var(--line);background:var(--panel)}
 .modebar.live{border-color:var(--bad)}.modebar.kill{border-color:var(--bad);background:rgba(240,69,90,.12)}
 .cards-wide{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}
+.ro [data-cmd],.ro #btn-start{display:none!important}
 .dt-ok{color:var(--ok)}.dt-bad{color:var(--bad)}.dt-warn{color:var(--warn)}
 .iconbtn{padding:6px 10px;line-height:1}
 /* ---- terminal home ---- */
@@ -163,6 +164,7 @@ h2.sec:first-child{margin-top:0}
     <div><small>Today</small><b id="h-today">–</b></div>
   </div>
   <div class="hctl">
+    <span id="rop" class="pill warn" hidden title="This copy cannot change anything">READ-ONLY</span>
     <span id="modepill" class="pill">…</span>
     <span id="engpill" class="pill">…</span>
     <span class="livedot" id="livedot" title="Live data"></span>
@@ -672,7 +674,7 @@ function start() {
   loadLogs(true).catch(() => {});
 }
 function signOut() { sessionStorage.removeItem("adminKey"); KEY = ""; clearInterval(timer); $("#app").hidden = true; $("#login").hidden = false; }
-async function signIn() { KEY = $("#key").value.trim() || KEY; try { await api("/ping"); sessionStorage.setItem("adminKey", KEY); $("#loginerr").textContent = ""; start(); } catch (e) { $("#loginerr").textContent = e.message; } }
+async function signIn() { KEY = $("#key").value.trim() || KEY; try { const pg = await api("/ping"); document.body.classList.toggle("ro", !!pg.readonly); $("#rop").hidden = !pg.readonly; sessionStorage.setItem("adminKey", KEY); $("#loginerr").textContent = ""; start(); } catch (e) { $("#loginerr").textContent = e.message; } }
 
 $("#refreshsel").onchange = setRefresh;
 $("#theme").onclick = () => setTheme(curTheme() === "dark" ? "light" : "dark"); themeIcon();

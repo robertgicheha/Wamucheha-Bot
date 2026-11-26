@@ -358,3 +358,55 @@ def test_live_survives_a_dead_price_feed(client, monkeypatch):
     from dashboard import market_data
     monkeypatch.setattr(market_data, "snapshots", lambda syms: [{"symbol": s, "price": None, "error": "down"} for s in syms])
     assert client.get("/api/admin/live", headers=H).status_code == 200
+
+
+# ---------- remote exposure: legacy routes, websocket, read-only mode ----------
+LEGACY_GETS = ["/api/status", "/api/trades", "/api/profit", "/api/account", "/api/open-positions",
+               "/api/equity", "/api/bot/status", "/api/transactions", "/api/slippage"]
+
+
+@pytest.mark.parametrize("path", LEGACY_GETS)
+def test_legacy_data_routes_need_the_key(client, path):
+    assert client.get(path).status_code == 401
+    assert client.get(path, headers={"X-Dashboard-Key": "wrong"}).status_code == 401
+    assert client.get(path, headers=H).status_code != 401
+
+
+def test_legacy_kill_switch_and_resume_are_gone(client):
+    """/api/resume could clear the kill-switch lock without the 'release' confirmation."""
+    for p in ("/api/kill-switch", "/api/resume"):
+        assert client.post(p, headers=H).status_code in (404, 405)
+
+
+def test_health_stays_public_but_leaks_no_secrets(client):
+    r = client.get("/health")
+    assert r.status_code == 200 and "trading_balance" not in r.text
+
+
+def test_websocket_needs_the_key(client):
+    from starlette.websockets import WebSocketDisconnect
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws"):
+            pass
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect("/ws?key=nope"):
+            pass
+
+
+def test_read_only_mode_blocks_every_state_change_but_allows_viewing(client, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_READONLY", "1")
+    assert client.get("/api/admin/ping", headers=H).json()["readonly"] is True
+    assert client.get("/api/admin/overview", headers=H).status_code == 200      # viewing works
+    assert client.get("/api/admin/ledger", headers=H).status_code == 200
+    for path, body in (("/api/admin/control", {"command": "halt"}),
+                       ("/api/admin/control", {"command": "kill", "confirm": "KILL"}),
+                       ("/api/admin/control", {"command": "test_trade", "confirm": "TEST"}),
+                       ("/api/admin/engine/start", {})):
+        r = client.post(path, json=body, headers=H)
+        assert r.status_code == 403 and "read-only" in r.json()["detail"], path
+    assert control_channel.pending_count() == 0
+
+
+def test_read_only_flag_reaches_the_ui(client, monkeypatch):
+    html = client.get("/admin").text
+    assert 'id="rop"' in html and ".ro [data-cmd]" in html
