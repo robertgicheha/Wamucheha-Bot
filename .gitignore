@@ -34,3 +34,9 @@ data/.last_retrain
 data/engine.pid
 data/trade_log.jsonl
 data/events.log
+
+# Stocks & ETFs module: NSE price cache and recorded history
+data/stocks/
+
+# Self-retraining state and reports
+data/auto_train/

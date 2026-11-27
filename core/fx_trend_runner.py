@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
+from core.auto_train import TUNABLE
 from core.fx_trend_analytics import flip_analysis, signal_levels, strength
 from core.fx_trend_broker import Broker, Position
 from core.fx_trend_journal import Journal
@@ -78,7 +79,9 @@ def _save(path: Path, obj: dict) -> None:
 class FxTrendRunner:
     def __init__(self, broker: Broker, cfg: RunnerConfig,
                  notify: Callable[[str], None] = lambda msg: None,
-                 base_dir: Path | str = ".", journal: Journal | None = None):
+                 base_dir: Path | str = ".", journal: Journal | None = None, tuner=None):
+        self.tuner = tuner                  # core.auto_train.Tuner, or None for config settings only
+        self._risk_scale = 1.0
         self.broker, self.cfg, self.notify = broker, cfg, notify
         self.base = Path(base_dir)
         self.journal = journal if journal is not None else Journal(self.base / cfg.journal_file)
@@ -103,6 +106,37 @@ class FxTrendRunner:
             self._act("close", pos.pair, f"CLOSE {pos.pair} ({reason})")
             if not self.cfg.dry_run:
                 self.broker.close(pos)
+
+    def _apply_tuning(self) -> None:
+        """Takes up retrained settings, but never swaps the rules under an open position."""
+        if self.tuner is None:
+            return
+        state_path = self.base / self.cfg.state_file
+        try:
+            wanted, scale, note = self.tuner()
+            state = _load(state_path)
+            if self.broker.positions():
+                # Keep (or, after a restart, restore) the settings the position was opened under.
+                wanted = self.tuner.restore(state.get("active_params")) or self.cfg.params
+            scale = min(1.0, max(0.0, float(scale)))          # tuning can only ever reduce risk
+            if wanted != self.cfg.params:
+                self.cfg.params = wanted
+                msg = (f"strategy settings now: {wanted.rules} (breakout {wanted.breakout_len}/{wanted.exit_len}, "
+                       f"SMA {wanted.sma_len}, momentum {wanted.mom_len}, stop {wanted.atr_stop_mult} x ATR) [{note}]")
+                self.notify("FX trend bot: " + msg)
+                self._event("tuning", msg)
+            if scale != self._risk_scale:
+                self._risk_scale = scale
+                msg = (f"risk per trade reduced to {scale:.0%} of normal: recent results are negative"
+                       if scale < 1 else "risk per trade is back to normal")
+                self.notify("FX trend bot: " + msg)
+                self._event("tuning", msg, level="WARNING" if scale < 1 else "INFO")
+            values = {k: getattr(self.cfg.params, k) for k in TUNABLE}
+            if state.get("active_params") != values:
+                state["active_params"] = values
+                _save(state_path, state)
+        except Exception:
+            logger.exception("tuning failed: keeping the current settings")
 
     # ------------------------------------------------------------------
     def snapshot(self, now: datetime | None = None) -> dict:
@@ -167,6 +201,8 @@ class FxTrendRunner:
     # ------------------------------------------------------------------
     def run_once(self, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
+        if not (self.base / self.cfg.kill_file).exists():
+            self._apply_tuning()
         cfg, p = self.cfg, self.cfg.params
         state_path = self.base / cfg.state_file
         state = _load(state_path)
@@ -236,7 +272,7 @@ class FxTrendRunner:
         # ---- journal the analysis for the dashboard ------------------------
         sig_rows = []
         for pair, row in rows.items():
-            if p.rules == "breakout":      # the closes that would flip the signal next bar
+            if p.rules in ("breakout", "ensemble"):  # the closes that would flip the signal next bar
                 up = max(float(frames[pair]["high"].tail(p.breakout_len).max()), float(row["sma"]))
                 dn = max(float(frames[pair]["low"].tail(p.exit_len).min()), float(row["sma"]))
             else:
@@ -308,13 +344,14 @@ class FxTrendRunner:
                     continue
                 entry = q.ask if want > 0 else q.bid
                 stop = initial_stop(want, entry, row["atr"], p.atr_stop_mult)
-                lots = min(self.broker.lots_for_risk(pair, want, equity * p.risk_pct / 100.0, entry, stop),
+                risk_pct = p.risk_pct * self._risk_scale
+                lots = min(self.broker.lots_for_risk(pair, want, equity * risk_pct / 100.0, entry, stop),
                            cfg.max_lots_per_order)
                 if lots <= 0:
                     skip(pair, "risk-sized lot below broker minimum")
                     continue
                 self._act("open", pair, f"OPEN {pair} {'LONG' if want > 0 else 'SHORT'} {lots} lots "
-                                        f"@~{entry:.5f} SL {stop:.5f} (risk {p.risk_pct}%)")
+                                        f"@~{entry:.5f} SL {stop:.5f} (risk {risk_pct:g}%)")
                 if not cfg.dry_run and self.broker.open(pair, want, lots, stop) is None:
                     self.notify(f"FX trend bot: ORDER FAILED {pair}")
                     self._event("order", f"OPEN FAILED {pair}", pair, "ERROR")

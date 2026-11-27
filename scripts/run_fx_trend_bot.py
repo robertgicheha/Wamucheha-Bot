@@ -29,6 +29,7 @@ import yaml
 ROOT = Path(__file__).parent.parent
 sys.path.append(str(ROOT))
 
+from core import auto_train
 from core.fx_trend_broker import MT5Broker
 from core.fx_trend_runner import FxTrendRunner, RunnerConfig
 from strategy.fx_trend import TrendParams
@@ -62,7 +63,8 @@ def make_notifier():
             requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                           data={"chat_id": chat, "text": f"[FX trend] {msg}"}, timeout=10)
         except Exception as e:
-            log.warning("telegram failed: %s", e)
+            from core.log_redact import redact
+            log.warning("telegram failed: %s", redact(e))
     return notify
 
 
@@ -129,7 +131,12 @@ def main():
     pid_file.write_text(str(os.getpid()))
     stop_file.unlink(missing_ok=True)
 
-    runner = FxTrendRunner(broker, cfg, notify=notify, base_dir=ROOT)
+    train_cfg = auto_train.settings(y.get("auto_train"))
+    store = auto_train.Store(ROOT)
+    live_account = not cfg.dry_run and not broker.is_demo()
+    tuner = auto_train.Tuner(TrendParams(**y["strategy"]), store, train_cfg, live_account)
+    trainer = auto_train.BackgroundTrainer(ROOT, store, train_cfg, str(Path(args.config).resolve()), notify)
+    runner = FxTrendRunner(broker, cfg, notify=notify, base_dir=ROOT, tuner=tuner)
     msg = f"started ({'DRY-RUN' if cfg.dry_run else 'ORDERS ENABLED'}), pairs={cfg.pairs}"
     log.info(msg)
     notify(msg)
@@ -154,6 +161,7 @@ def main():
                                       "equity": result.get("equity")}))
             if result.get("skipped") == "kill_switch" or args.once:
                 break
+            trainer.poll()      # starts or collects a background retraining run when one is due
             interruptible_sleep(sch["poll_seconds"], stop_file, kill_file)
     finally:
         pid_file.unlink(missing_ok=True)

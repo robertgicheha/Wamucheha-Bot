@@ -42,3 +42,20 @@ fx_trend:
     state_file: data/fx_trend_state.json
     snapshot_file: data/fx_trend_snapshot.json
     journal_file: data/fx_trend.db
+
+  # Self-retraining (core/auto_train.py). Every interval it re-tests 63 trend settings and replaces
+  # the ones above ONLY if the challenger passes every test on data not used to choose it.
+  # It tunes rule type, lengths and stop width. It never changes risk_pct, loss halts or lot caps;
+  # if recent results are negative it can only REDUCE risk. Settings edited above always win:
+  # changing them discards anything promoted. Report: python -m scripts.run_auto_train --status
+  # Undo: python -m scripts.run_auto_train --rollback
+  auto_train:
+    enabled: true
+    auto_apply: true            # false: recommend only
+    allow_apply_on_live: false  # keep false: promoted settings are for dry-run and demo accounts
+    interval_days: 7
+    min_days_between_promotions: 28
+    reduce_risk_when_degraded: true
+    degraded_risk_scale: 0.5
+    costs:                      # PRICE units. Gold: dollars per ounce. Use your broker's real numbers.
+      XAUUSD: {spread: 0.30, slippage: 0.10, swap_bps_per_day: 1.4}

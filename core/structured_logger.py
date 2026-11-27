@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field, asdict
 from collections import defaultdict
 
+from core.log_redact import redact
+
 LOG_DIR = Path(__file__).parent.parent / "data" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -514,7 +516,7 @@ def _append_error_line(line: str):
         if ERROR_LOG.exists() and ERROR_LOG.stat().st_size > _ERROR_MAX_BYTES:
             ERROR_LOG.replace(ERROR_LOG.with_suffix(".log.1"))     # keep one generation
         with open(ERROR_LOG, "a", encoding="utf-8") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {line.rstrip()}\n")
+            f.write(f"{datetime.now(timezone.utc).isoformat()} {redact(line.rstrip())}\n")
     except Exception:
         pass
 

@@ -376,6 +376,9 @@ async def websocket_endpoint(websocket: WebSocket):
 # ---------- Admin console ----------
 from dashboard.admin import router as _admin_router  # noqa: E402
 app.include_router(_admin_router)
+from dashboard.stocks_admin import assets as _stocks_assets, router as _stocks_router  # noqa: E402
+app.include_router(_stocks_router)
+app.include_router(_stocks_assets)
 
 
 @app.get("/admin", response_class=HTMLResponse)

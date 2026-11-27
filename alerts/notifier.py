@@ -23,8 +23,10 @@ from pathlib import Path
 import requests
 
 from alerts import formatting as f
+from core.log_redact import RedactingFilter
 
 logger = logging.getLogger("notifier")
+logger.addFilter(RedactingFilter())   # errors from requests quote the token URL
 EVENT_LOG = Path(__file__).parent.parent / "data" / "events.log"
 TRADE_LOG = Path(__file__).parent.parent / "data" / "trade_log.jsonl"
 

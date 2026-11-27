@@ -54,8 +54,10 @@ services:
     - engine-data:/app/data:ro
     - engine-control:/app/data/control   # writable: the only place the dashboard can write
     - ./config:/app/config:ro
+    - stocks-data:/app/stocks-data   # Stocks & ETFs: NSE price cache and recorded history
     environment:
       DISABLE_VENUES: ""
+      STOCKS_DATA_DIR: /app/stocks-data
     networks:
     - trading-net
     depends_on:
@@ -64,6 +66,8 @@ volumes:
   engine-data:
     driver: local
   engine-control:
+    driver: local
+  stocks-data:
     driver: local
 networks:
   trading-net:

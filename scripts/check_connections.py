@@ -30,7 +30,8 @@ def run(name, fn):
     try:
         print(f"[PASS] {name}: {fn()}")
     except Exception as e:
-        print(f"[FAIL] {name}: {type(e).__name__}: {str(e)[:300]}")
+        from core.log_redact import redact
+        print(f"[FAIL] {name}: {type(e).__name__}: {redact(e)[:300]}")
 
 
 def nonzero(bal):

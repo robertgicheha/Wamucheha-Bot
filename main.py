@@ -776,6 +776,8 @@ def main():
         # Cross-exchange arbitrage (crypto only, runs every 5 minutes)
         last_arb_check = getattr(main, "_last_arb_check", 0)
         if now - last_arb_check >= 300:
+            # Timed from the attempt, not from success: a failure must not retry every loop.
+            main._last_arb_check = now
             try:
                 arb_prices = {}
                 for ex_name in ["binance", "okx", "kraken"]:
@@ -817,13 +819,14 @@ def main():
                     notifier.notify("arbitrage_opportunity",
                         f"Triangular: {' -> '.join(opp['path'])} | {opp['profit_pct']:.3f}%")
 
-                main._last_arb_check = now
             except Exception as e:
                 print(f"Arbitrage detection error: {e}")
 
         # Safe-haven watch (crypto drawdown vs tokenised gold, every 15 minutes; alert only)
         last_sh_check = getattr(main, "_last_sh_check", 0)
         if now - last_sh_check >= 900:
+            # Timed from the attempt, not from success: a failure must not retry every loop.
+            main._last_sh_check = now
             try:
                 active = [sym for _, sym in all_markets]
                 btc = find_symbol("BTC/USDT", active)
@@ -841,13 +844,14 @@ def main():
                             f"Safe-Haven: {sh_signal['action']} | "
                             f"Equity DD {sh_signal['equity_drawdown_pct']:.1f}% | "
                             f"Gold momentum {sh_signal['gold_momentum_pct']:.1f}%")
-                main._last_sh_check = now
             except Exception as e:
                 print(f"Safe-haven rotation error: {e}")
 
         # DCA signals (runs every 4 hours for configured DCA symbols)
         last_dca_check = getattr(main, "_last_dca_check", 0)
         if now - last_dca_check >= 14400:
+            # Timed from the attempt, not from success: a failure must not retry every loop.
+            main._last_dca_check = now
             try:
                 dca_symbols = CONFIG.get("strategy", {}).get("dca_symbols", ["BTC/USDT", "ETH/USDT"])
                 dca_cfg = {
@@ -862,7 +866,6 @@ def main():
                         if dca_signal:
                             print(f"  DCA: {dca_sym} — amount ${dca_signal['amount']:.2f} "
                                   f"(vol_scale={dca_signal['vol_scale']:.2f})")
-                main._last_dca_check = now
             except Exception as e:
                 print(f"DCA signal error: {e}")
 

@@ -1,0 +1,15 @@
+{
+  "active_params": {
+    "rules": "breakout",
+    "breakout_len": 55,
+    "exit_len": 20,
+    "sma_len": 100,
+    "mom_len": 90,
+    "atr_stop_mult": 3.0
+  },
+  "week": "2026-W48",
+  "week_start_equity": 9904.22,
+  "last_bar": "2026-11-26",
+  "prev_equity": 9904.22,
+  "last_run": "2026-11-27T10:04:30+00:00"
+}

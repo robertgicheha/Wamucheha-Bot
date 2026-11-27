@@ -28,6 +28,12 @@ class MarketIntelligence:
         self.cfg = config.get("intelligence", {})
         self._cache = {}
         self._cache_ttl = 300  # 5 minutes
+        self._last_good = {}   # key -> (unix time, reading)
+
+    def _fallback(self, key: str, max_age: int) -> dict | None:
+        """The last successful reading, if it is still recent enough to use."""
+        stamp, data = self._last_good.get(key, (0, None))
+        return data if data and time.time() - stamp < max_age else None
 
     def get_fear_greed(self) -> dict | None:
         """Fetch Crypto Fear & Greed Index from alternative.me API."""
@@ -39,6 +45,7 @@ class MarketIntelligence:
             ts, data = self._cache[cache_key]
             if time.time() - ts < self._cache_ttl:
                 return data
+        failure = "no data returned"
 
         try:
             resp = requests.get(
@@ -55,11 +62,18 @@ class MarketIntelligence:
                     "timestamp": entry["timestamp"],
                 }
                 self._cache[cache_key] = (time.time(), result)
+                self._last_good[cache_key] = (time.time(), result)
                 return result
         except Exception as e:
-            logger.warning(f"Fear & Greed fetch failed: {e}")
+            failure = str(e)
 
-        return None
+        # Cached like a success, so an outage costs one attempt per 5 minutes and not one per loop.
+        # The index is published once a day, so yesterday's reading is still meaningful.
+        result = self._fallback(cache_key, 24 * 3600)
+        logger.warning(f"Fear & Greed fetch failed ({'using the last reading' if result else 'skipping it'}), "
+                       f"retrying in 5 min: {failure}")
+        self._cache[cache_key] = (time.time(), result)
+        return result
 
     def get_dxy_trend(self, feed_router=None) -> dict | None:
         """Dollar Index (DXY) trend from free yfinance data (ticker DX-Y.NYB).
@@ -94,8 +108,13 @@ class MarketIntelligence:
                 prev = float(close.iloc[-24]) if len(close) >= 24 else last
                 result = {"trend": trend, "dxy": round(last, 3),
                           "change_24h_pct": round((last - prev) / prev * 100, 3)}
+                self._last_good[cache_key] = (time.time(), result)
+            else:
+                logger.warning("DXY trend: Yahoo returned too little data (usually temporary)")
         except Exception as e:
             logger.warning(f"DXY trend unavailable: {e}")
+        if result is None:
+            result = self._fallback(cache_key, 6 * 3600)
         self._cache[cache_key] = (time.time(), result)
         return result
 

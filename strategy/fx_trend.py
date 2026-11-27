@@ -12,6 +12,10 @@ Two entry/exit rule sets, picked by TrendParams.rules:
   long  after a close above the prior breakout_len-bar high AND above SMA(sma_len)
   flat  after a close below the prior exit_len-bar low OR below SMA(sma_len)
 
+"ensemble" (long/flat):
+  long while at least ENSEMBLE_VOTES of the ENSEMBLE_CHANNELS breakout systems above
+  are long. Several channel lengths voting depend less on any one lucky setting.
+
 "momentum" (default):
   long  when close > SMA(sma_len)  AND  close / close[mom_len] - 1 > 0
   short when close < SMA(sma_len)  AND  close / close[mom_len] - 1 < 0
@@ -33,6 +37,10 @@ import pandas as pd
 from strategy.crypto_trend import TrendConfig, compute_target_exposure
 
 
+ENSEMBLE_CHANNELS = ((20, 10), (55, 20), (100, 50))   # (entry high, exit low) lengths in days
+ENSEMBLE_VOTES = 2
+
+
 @dataclass(frozen=True)
 class TrendParams:
     sma_len: int = 100
@@ -42,13 +50,15 @@ class TrendParams:
     risk_pct: float = 0.5          # % of equity lost if the initial stop is hit
     allow_short: bool = True
     max_leverage_per_pos: float = 5.0   # cap on notional / equity for one position
-    rules: str = "momentum"        # "momentum" | "breakout"
+    rules: str = "momentum"        # "momentum" | "breakout" | "ensemble"
     breakout_len: int = 55         # breakout rules only
     exit_len: int = 20             # breakout rules only
 
     @property
     def warmup(self) -> int:
         extra = (self.breakout_len, self.exit_len) if self.rules == "breakout" else ()
+        if self.rules == "ensemble":
+            extra = tuple(n for channel in ENSEMBLE_CHANNELS for n in channel)
         return max(self.sma_len, self.mom_len, self.atr_len, *extra) + 1
 
 
@@ -81,6 +91,13 @@ def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.D
             trend_ma_days=p.sma_len, atr_days=p.atr_len))
         ready = out[["sma", "mom", "atr"]].notna().all(axis=1)
         out["signal"] = (exposure > 0).astype(int).where(ready, 0).astype(int)
+        return out
+    if p.rules == "ensemble":
+        votes = sum((compute_target_exposure(out, TrendConfig(
+            breakout_days=entry, exit_days=leave, trend_ma_days=p.sma_len, atr_days=p.atr_len)) > 0).astype(int)
+            for entry, leave in ENSEMBLE_CHANNELS)
+        ready = out[["sma", "mom", "atr"]].notna().all(axis=1)
+        out["signal"] = (votes >= ENSEMBLE_VOTES).astype(int).where(ready, 0).astype(int)
         return out
     if p.rules != "momentum":
         raise ValueError(f"unknown strategy rules: {p.rules!r}")

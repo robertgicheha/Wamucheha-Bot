@@ -32,3 +32,16 @@ No strategy is guaranteed to profit. Validate on a demo account first.
 
 ## Tests
 `pytest tests/test_fx_trend.py tests/test_fx_trend_runner.py tests/test_fx_admin.py`
+
+## Self-retraining
+`core/auto_train.py`, run weekly by the bot in a separate process (settings: `auto_train` in `config/fx_trend.yaml`).
+
+* Tries 63 settings: breakout, multi-length breakout ensemble and momentum rules, with three trend filters and three stop widths.
+* The current settings are replaced only if a challenger passes all nine tests (walk-forward on unseen years,
+  a hold-out it was not chosen on, drawdown, robustness, reshuffled trades) and 28 days have passed since the last change.
+* Risk per trade, loss halts, lot caps and the long-only setting are never tuned. Losing recent results halve the risk.
+* Promoted settings apply in dry-run and on demo accounts only, and only once no position is open.
+* Commands: `python -m scripts.run_auto_train` with `--dry-report`, `--status` or `--rollback`.
+* Output: `data/auto_train/` and `data/logs/auto_train.log`; the admin console shows it under Control.
+
+Weekly re-runs reuse the same hold-out, so passing is weaker evidence than it looks. Nothing here guarantees profit.

@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from core import control_channel, dry_test
 from dashboard import market_data
+from core.log_redact import redact
 from core.state_manager import SNAPSHOT_PATH
 from reporting import analytics
 
@@ -90,9 +91,18 @@ def _tail(path: Path, n: int, max_bytes: int = 2_000_000) -> list:
         with open(path, "rb") as f:
             f.seek(max(0, size - max_bytes))
             data = f.read().decode("utf-8", errors="replace")
-        return data.splitlines()[-n:]
+        return [redact(line) for line in data.splitlines()[-n:]]     # older logs may still hold a token
     except OSError:
         return []
+
+
+@router.get("/autotrain", dependencies=[Depends(require_key)])
+def autotrain_status():
+    """What self-retraining last decided, and why. Read-only."""
+    from core import auto_train
+    store = auto_train.Store(ROOT)
+    return {"status": store.read(store.status_file), "report": store.read(store.report_file),
+            "promoted": store.read(store.champion_file)}
 
 
 def _closed_trades(limit=5000) -> list:

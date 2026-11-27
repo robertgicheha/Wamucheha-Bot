@@ -1,0 +1,21 @@
+{
+  "ts": "2026-11-27T10:12:30+00:00",
+  "mode": "dry_run",
+  "account": {
+    "login": 591172,
+    "server": "FusionMarkets-Demo",
+    "balance": 9929.96,
+    "equity": 9901.56,
+    "margin": 82.39,
+    "free_margin": 9819.17,
+    "currency": "USD",
+    "leverage": 500
+  },
+  "positions": [],
+  "floating_pnl": 0,
+  "last_bar": "2026-11-26",
+  "halted": false,
+  "pairs": [
+    "XAUUSD"
+  ]
+}

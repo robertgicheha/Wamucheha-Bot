@@ -1,0 +1,76 @@
+# Stocks & ETFs research module (admin console tab "Stocks & ETFs").
+# Research only: nothing here places orders.
+
+# US watch universe. Add or remove tickers freely; any other ticker can still be looked up
+# from the console. Each entry is "TICKER: Name".
+us:
+  stocks:
+    AAPL: Apple
+    MSFT: Microsoft
+    NVDA: NVIDIA
+    GOOGL: Alphabet
+    AMZN: Amazon
+    META: Meta Platforms
+    TSLA: Tesla
+    AVGO: Broadcom
+    AMD: Advanced Micro Devices
+    PLTR: Palantir
+    NFLX: Netflix
+    COIN: Coinbase
+    BRK.B: Berkshire Hathaway
+    JPM: JPMorgan Chase
+    BAC: Bank of America
+    V: Visa
+    MA: Mastercard
+    JNJ: Johnson & Johnson
+    UNH: UnitedHealth
+    LLY: Eli Lilly
+    PFE: Pfizer
+    ABBV: AbbVie
+    KO: Coca-Cola
+    PEP: PepsiCo
+    PG: Procter & Gamble
+    WMT: Walmart
+    COST: Costco
+    MCD: McDonald's
+    XOM: Exxon Mobil
+    CVX: Chevron
+    CAT: Caterpillar
+    DIS: Walt Disney
+    VZ: Verizon
+    T: AT&T
+    O: Realty Income
+  etfs:
+    SPY: SPDR S&P 500
+    VOO: Vanguard S&P 500
+    VTI: Vanguard Total US Market
+    QQQ: Invesco Nasdaq-100
+    DIA: SPDR Dow Jones
+    IWM: iShares Russell 2000
+    VXUS: Vanguard Total International
+    VWO: Vanguard Emerging Markets
+    SCHD: Schwab US Dividend Equity
+    VYM: Vanguard High Dividend Yield
+    VIG: Vanguard Dividend Appreciation
+    JEPI: JPMorgan Equity Premium Income
+    XLK: Technology Select Sector
+    XLF: Financial Select Sector
+    XLE: Energy Select Sector
+    XLV: Health Care Select Sector
+    SMH: VanEck Semiconductor
+    BND: Vanguard Total Bond Market
+    TLT: iShares 20+ Year Treasury
+    GLD: SPDR Gold Shares
+    VNQ: Vanguard Real Estate
+
+# NSE dividends. Neither the Sokowatch feed nor Yahoo Finance supplies NSE dividend data,
+# so only what you enter here is shown. Take figures from the company's own announcement.
+# dividend_per_share is the total for the last 12 months in KES; the yield is worked out
+# from the live price. Format:
+#
+#   nse_dividends:
+#     SYMBOL:
+#       dividend_per_share: 0.00
+#       book_closure: "YYYY-MM-DD"   # optional
+#       note: "where the figure came from"   # optional
+nse_dividends: {}

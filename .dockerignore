@@ -12,3 +12,6 @@ tests/
 docs/
 *.md
 node_modules/
+
+# A separate app kept inside this folder: its node_modules and .env.local secrets must never enter an image
+Sokowatch-Web/
