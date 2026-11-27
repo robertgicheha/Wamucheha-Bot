@@ -9,6 +9,7 @@ other bots' positions.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Protocol
@@ -85,10 +86,16 @@ class MT5Broker:
     def connect(self) -> bool:
         try:
             mt5 = get_mt5()
-            if not mt5.initialize():
+            # Same terminal as the main engine; several MT5 installs may exist.
+            path = os.environ.get("MT5_TERMINAL_PATH", "").strip()
+            if not mt5.initialize(**({"path": path} if path else {})):
                 logger.error("MT5 initialize failed: %s", mt5.last_error())
                 return False
-            if self.login and not mt5.login(self.login, password=self.password, server=self.server):
+            info = mt5.account_info()
+            already = bool(info and self.login and int(info.login) == int(self.login)
+                           and (not self.server or info.server == self.server))
+            if self.login and not already and not mt5.login(
+                    self.login, password=self.password, server=self.server):
                 logger.error("MT5 login failed: %s", mt5.last_error())
                 mt5.shutdown()
                 return False

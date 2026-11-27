@@ -16,6 +16,22 @@ GOLD_SYMBOLS = {"XAUUSD", "GOLD", "XAUUSDM", "XAUUSD."}
 CCXT_EXCHANGES = ("binance", "okx", "kraken", "coinbase", "bybit")
 
 
+def find_symbol(wanted: str, symbols) -> str | None:
+    """The symbol actually traded for `wanted`'s asset: "BTC/USDT" may be listed as
+    "BTCUSD" at an MT5 broker, and tokenised gold (PAXG) as spot gold "XAUUSD".
+    None if that asset is not among the active symbols."""
+    symbols = list(symbols)
+    if wanted in symbols:
+        return wanted
+    base = wanted.split("/")[0].upper()
+    prefixes = ("PAXG", "XAU", "GOLD") if base in ("PAXG", "XAU", "GOLD") else (base,)
+    for prefix in prefixes:
+        for s in symbols:
+            if s.upper().split("/")[0].startswith(prefix):
+                return s
+    return None
+
+
 class FeedRouter:
     def __init__(self, config: dict):
         self.feeds = {}

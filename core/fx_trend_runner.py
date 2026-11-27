@@ -53,6 +53,8 @@ class RunnerConfig:
     weekly_loss_halt_pct: float = 4.0
     max_spread_pips: float = 3.0
     max_lots_per_order: float = 1.0
+    max_consecutive_losses: int = 0        # 0 = off
+    loss_streak_reset: str = ""            # ignore trades closed before this ISO time
     kill_file: str = "data/fx_trend.KILL"
     state_file: str = "data/fx_trend_state.json"
     snapshot_file: str = "data/fx_trend_snapshot.json"
@@ -142,6 +144,17 @@ class FxTrendRunner:
             logger.exception("trade sync failed")
             return 0
 
+    def losing_streak(self) -> int:
+        """Losses in a row, newest first, net of commission and swap."""
+        streak = 0
+        for t in self.journal.trades(200):
+            if (t["close_time"] or "") <= self.cfg.loss_streak_reset:
+                break
+            if t["profit"] + (t["commission"] or 0) + (t["swap"] or 0) > 0:
+                break
+            streak += 1
+        return streak
+
     def tick(self, now: datetime | None = None) -> dict:
         now = now or datetime.now(timezone.utc)
         try:
@@ -203,8 +216,17 @@ class FxTrendRunner:
         daily_pct = (equity / prev_eq - 1) * 100 if prev_eq else 0.0
         weekly_pct = (equity / state["week_start_equity"] - 1) * 100 if state.get("week_start_equity") else 0.0
         halted = daily_pct <= -cfg.daily_loss_halt_pct or weekly_pct <= -cfg.weekly_loss_halt_pct
+        self.sync_trades(now, force=True)      # count stops hit since the last cycle
+        streak = self.losing_streak()
+        streak_halt = bool(cfg.max_consecutive_losses) and streak >= cfg.max_consecutive_losses
+        if streak_halt:
+            msg = (f"entries HALTED after {streak} losses in a row. Review, then set "
+                   f"risk.loss_streak_reset in the config and restart to resume.")
+            self.notify("FX trend bot: " + msg)
+            self._event("halt", msg, level="WARNING")
+        halted = halted or streak_halt
         self._halted = halted
-        if halted:
+        if halted and not streak_halt:
             msg = f"entries HALTED (day {daily_pct:.2f}%, week {weekly_pct:.2f}%)"
             self.notify("FX trend bot: " + msg)
             self._event("halt", msg, level="WARNING")
@@ -214,7 +236,11 @@ class FxTrendRunner:
         # ---- journal the analysis for the dashboard ------------------------
         sig_rows = []
         for pair, row in rows.items():
-            up, dn = signal_levels(frames[pair]["close"], float(row["sma"]), p.mom_len)
+            if p.rules == "breakout":      # the closes that would flip the signal next bar
+                up = max(float(frames[pair]["high"].tail(p.breakout_len).max()), float(row["sma"]))
+                dn = max(float(frames[pair]["low"].tail(p.exit_len).min()), float(row["sma"]))
+            else:
+                up, dn = signal_levels(frames[pair]["close"], float(row["sma"]), p.mom_len)
             sig_rows.append({
                 "pair": pair, "side": int(row["signal"]), "close": float(row["close"]),
                 "sma": float(row["sma"]), "mom": float(row["mom"]), "atr": float(row["atr"]),

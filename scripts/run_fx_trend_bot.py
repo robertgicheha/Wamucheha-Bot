@@ -98,6 +98,8 @@ def main():
         max_open_positions=rk["max_open_positions"], max_net_per_currency=rk["max_net_per_currency"],
         daily_loss_halt_pct=rk["daily_loss_halt_pct"], weekly_loss_halt_pct=rk["weekly_loss_halt_pct"],
         max_spread_pips=rk["max_spread_pips"], max_lots_per_order=rk["max_lots_per_order"],
+        max_consecutive_losses=rk.get("max_consecutive_losses", 0),
+        loss_streak_reset=str(rk.get("loss_streak_reset") or ""),
         kill_file=sch["kill_file"], state_file=sch["state_file"],
         snapshot_file=sch.get("snapshot_file", "data/fx_trend_snapshot.json"),
         journal_file=sch.get("journal_file", "data/fx_trend.db"),

@@ -321,6 +321,7 @@ class MT5Executor:
         if not pos:
             return
 
+        broker_close = None
         if not self.dry_run:
             try:
                 mt5 = get_mt5()
@@ -347,14 +348,79 @@ class MT5Executor:
                     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
                         raise RuntimeError(result.comment if result else f"No result {mt5.last_error()}")
                 else:
-                    # Broker already closed it (its SL/TP fired) — just record the close.
-                    logger.info(f"MT5 {pos['symbol']} position already closed at broker")
+                    # No open position found. Record a close only if the broker's deal
+                    # history confirms one; otherwise keep it open and retry.
+                    broker_close = self._broker_close(pos)
+                    if broker_close is None:
+                        logger.warning(f"MT5 {pos['symbol']}: no open position and no closing "
+                                       f"deal yet; keeping it open")
+                        return
             except Exception as e:
                 # Leave the position open so the monitor retries next tick.
                 logger.error(f"MT5 close error: {e}")
                 self.notifier.notify("trade_rejected", f"MT5 {pos['symbol']} close failed: {e}",
                                      priority="high")
                 return
+
+        if broker_close is not None:
+            reason = broker_close["reason"]
+        self._record_close(pos, exit_price, reason, broker_close)
+
+    def sync_broker_closes(self) -> int:
+        """Record trades the BROKER closed (its stop-loss / take-profit fired, or a manual
+        close in the terminal). Without this, a stop hit while price later recovers is never
+        recorded, so the loss is missing from the balance, the daily loss limit and the
+        consecutive-loss breaker. Returns the number of closes recorded."""
+        if self.dry_run:
+            return 0
+        recorded = 0
+        for pos in self.state.get_open_positions():
+            if (pos.get("exchange") or "").lower() != "mt5":
+                continue
+            try:
+                if self._find_position_ticket(pos["symbol"], pos["client_order_id"]):
+                    continue
+                closed = self._broker_close(pos)
+            except Exception as e:
+                logger.warning(f"MT5 broker sync {pos['symbol']}: {e}")
+                continue
+            if closed is not None:
+                self._record_close(pos, closed["exit_price"], closed["reason"], closed)
+                recorded += 1
+        return recorded
+
+    def _broker_close(self, pos: dict) -> dict | None:
+        """The realised result of a position from MT5 deal history, or None if the history
+        does not show it fully closed. Never estimates."""
+        mt5 = get_mt5()
+        now = int(datetime.now(timezone.utc).timestamp())
+        try:
+            start = int(datetime.fromisoformat(pos["opened_at"]).timestamp())
+        except (KeyError, TypeError, ValueError):
+            start = now - 90 * 86400
+        # Wide window: deal times are in broker server time, not UTC.
+        deals = mt5.history_deals_get(start - 2 * 86400, now + 2 * 86400) or ()
+        tag = pos["client_order_id"][:31]
+        entry = next((d for d in deals if d.symbol == pos["symbol"] and d.entry == 0
+                      and d.comment == tag), None)
+        if entry is None:
+            return None
+        legs = [d for d in deals if d.position_id == entry.position_id]
+        exits = [d for d in legs if d.entry != 0]
+        volume = sum(d.volume for d in exits)
+        if volume + 1e-9 < float(pos["amount"]):
+            return None                                   # still (partly) open
+        net = sum(d.profit + d.swap + d.commission + getattr(d, "fee", 0.0) for d in legs)
+        return {
+            "pnl": float(net),
+            "exit_price": sum(d.price * d.volume for d in exits) / volume,
+            "reason": {4: "stop_loss_hit", 5: "take_profit_hit"}.get(exits[-1].reason,
+                                                                    "closed_at_broker"),
+        }
+
+    def _record_close(self, pos: dict, exit_price: float, reason: str,
+                      broker_close: dict = None):
+        client_order_id = pos["client_order_id"]
 
         # ── Gross vs net ───────────────────────────────────────────────
         # `amount` is lots, so a raw (exit - entry) * amount is wrong by the
@@ -366,22 +432,26 @@ class MT5Executor:
         lots = float(pos["amount"])
         contract_size = self._contract_size(pos["symbol"])
         gross_pnl = direction * (exit_price - pos["entry_price"]) * lots * contract_size
+        if broker_close is not None:               # the fill the broker actually reports
+            exit_price = broker_close["exit_price"]
+            gross_pnl = direction * (exit_price - pos["entry_price"]) * lots * contract_size
         exit_notional = self._notional_usd(pos["symbol"], lots, exit_price)
 
         entry_fee = float(pos.get("entry_fee") or 0.0)
         exit_fee_info = self.fees.cost_for_fill("mt5", pos["symbol"], exit_notional)
         exit_fee = exit_fee_info["cost"]
 
-        broker_pnl = None
-        try:
-            mt5 = get_mt5()
-            open_type = mt5.ORDER_TYPE_BUY if pos["side"] == "buy" else mt5.ORDER_TYPE_SELL
-            calc = mt5.order_calc_profit(open_type, pos["symbol"], lots,
-                                         pos["entry_price"], exit_price)
-            if calc is not None:
-                broker_pnl = float(calc)
-        except Exception as e:
-            logger.warning(f"MT5 order_calc_profit failed, using modelled P&L: {e}")
+        broker_pnl = broker_close["pnl"] if broker_close is not None else None
+        if broker_pnl is None:
+            try:
+                mt5 = get_mt5()
+                open_type = mt5.ORDER_TYPE_BUY if pos["side"] == "buy" else mt5.ORDER_TYPE_SELL
+                calc = mt5.order_calc_profit(open_type, pos["symbol"], lots,
+                                             pos["entry_price"], exit_price)
+                if calc is not None:
+                    broker_pnl = float(calc)
+            except Exception as e:
+                logger.warning(f"MT5 order_calc_profit failed, using modelled P&L: {e}")
 
         if broker_pnl is not None:
             # The broker's realized figure is already net of the spread and any
@@ -428,7 +498,10 @@ class MT5Executor:
     def _find_position_ticket(self, symbol: str, client_order_id: str = "") -> int:
         """Find the ticket of the position this bot order opened (matched by comment)."""
         mt5 = get_mt5()
-        positions = mt5.positions_get(symbol=symbol) or ()
+        positions = mt5.positions_get(symbol=symbol)
+        if positions is None:
+            # An error is not "no position": treating it as closed would drop a live trade.
+            raise RuntimeError(f"MT5 positions_get failed: {mt5.last_error()}")
         for p in positions:
             if client_order_id and p.comment == client_order_id[:31]:
                 return p.ticket

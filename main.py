@@ -38,7 +38,7 @@ from alerts.notifier import Notifier
 # module-scope that second binding silently replaces this one. The engine then
 # died at start-up with "'TextIOWrapper' object has no attribute 'venue_name'".
 from alerts import formatting as fm
-from data_feeds.feed_router import FeedRouter
+from data_feeds.feed_router import FeedRouter, find_symbol
 from strategy.technical_strategy import (
     detect_cross_exchange_arbitrage, detect_triangular_arbitrage,
     generate_portfolio_rotation_signal, generate_dca_signal,
@@ -205,6 +205,12 @@ def get_strategy_signal(feed_router: FeedRouter, symbol: str, trading_balance: f
             return None
 
     if df is None or len(df) < 50:
+        return None
+
+    # Volatility guard: no new entry on a symbol whose latest 15m candle moved violently.
+    candle = df.iloc[-1]
+    limit_pct = CONFIG.get("risk", {}).get("volatility_circuit_breaker_pct", 0)
+    if limit_pct and (candle["high"] - candle["low"]) / candle["open"] * 100 >= limit_pct:
         return None
 
     predictor = ml_models.get(symbol) if ml_models else None
@@ -589,7 +595,12 @@ def main():
                     print("Resume refused: kill switch is armed (needs release_kill).")
                     continue
                 standby = False
-                state.update_risk_state(trading_halted=0, halt_reason=None)
+                streak = state.get_risk_state()["consecutive_losses"]
+                if streak >= CONFIG["risk"]["max_consecutive_losses"]:
+                    # Without resetting the streak the next signal would halt again at once.
+                    risk.resume_trading(cmd.get("by"))
+                else:
+                    state.update_risk_state(trading_halted=0, halt_reason=None)
             elif verb == "standby":
                 standby = True
                 state.update_risk_state(trading_halted=1,
@@ -673,6 +684,15 @@ def main():
         except Exception as e:
             print(f"Trade digest error: {e}")
 
+        # Also while halted: broker-side stops can fire at any time and must be counted.
+        for ex in executors.values():
+            if hasattr(ex, "sync_broker_closes"):
+                try:
+                    ex.sync_broker_closes()
+                except Exception as e:
+                    print(f"Broker sync error: {e}")
+        risk_state = state.get_risk_state()
+
         if risk_state["trading_halted"]:
             time.sleep(5)       # short, so a dashboard "resume" takes effect promptly
             continue
@@ -709,11 +729,14 @@ def main():
         # One position per symbol per broker — the loop runs every 15s, so a
         # signal that persists would otherwise re-open the same trade each tick.
         open_keys = {(p["exchange"], p["symbol"]) for p in state.get_open_positions()}
-        for exchange_name, symbol in all_markets:
+        cooling_off = risk.loss_cooldown_remaining() > 0     # exits above still run
+        # Markets this engine watches and manages but must not open new trades on.
+        no_entry = set(CONFIG["execution"].get("no_new_entries") or [])
+        for exchange_name, symbol in ([] if cooling_off else all_markets):
             executor = executors.get(exchange_name)
             if executor is None:
                 continue
-            if (exchange_name, symbol) in open_keys:
+            if (exchange_name, symbol) in open_keys or symbol in no_entry:
                 continue
             if not market_is_open(exchange_name, symbol, executor):
                 continue
@@ -802,8 +825,11 @@ def main():
         last_sh_check = getattr(main, "_last_sh_check", 0)
         if now - last_sh_check >= 900:
             try:
-                equity_df = feed_router.get_ohlcv("BTC/USDT", timeframe="1h", limit=100)
-                gold_df = feed_router.get_ohlcv("PAXG/USDT", timeframe="1h", limit=100)
+                active = [sym for _, sym in all_markets]
+                btc = find_symbol("BTC/USDT", active)
+                gold = find_symbol("PAXG/USDT", active)
+                equity_df = feed_router.get_ohlcv(btc, timeframe="1h", limit=100) if btc else None
+                gold_df = feed_router.get_ohlcv(gold, timeframe="1h", limit=100) if gold else None
                 if equity_df is not None and gold_df is not None:
                     threshold = CONFIG.get("strategy", {}).get("safe_haven_drawdown_threshold", -5.0)
                     sh_signal = generate_safe_haven_rotation_signal(equity_df, gold_df, threshold)
@@ -828,7 +854,8 @@ def main():
                     "dca_base_amount": CONFIG.get("strategy", {}).get("dca_base_amount", 100),
                     "dca_volatility_sizing": CONFIG.get("strategy", {}).get("dca_volatility_sizing", True),
                 }
-                for dca_sym in dca_symbols:
+                active = [sym for _, sym in all_markets]
+                for dca_sym in filter(None, (find_symbol(s, active) for s in dca_symbols)):
                     df = feed_router.get_ohlcv(dca_sym, timeframe="1h", limit=200)
                     if df is not None and len(df) >= 50:
                         dca_signal = generate_dca_signal(df, cfg=dca_cfg)

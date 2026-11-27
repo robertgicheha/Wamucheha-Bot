@@ -1,26 +1,36 @@
-# FX daily trend-following bot. Separate from config.yaml on purpose: this bot
-# is self-contained and does not share the engine's state or risk manager.
+# Daily trend-following bot, currently set up for GOLD only. Separate from config.yaml on
+# purpose: this bot is self-contained and does not share the engine's state or risk manager.
+# (The earlier eight-pair FX momentum setup is in git history.)
 fx_trend:
-  dry_run: true            # true = log intended trades only. Flip after demo validation.
-  magic: 774201            # only positions with this magic are ever touched
-  symbol_suffix: ""        # e.g. "m" or ".r" if your broker names EURUSDm
-  pairs: [EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, USDCHF, EURJPY, GBPJPY]
+  dry_run: true            # true = log intended trades only. Orders need --send-orders.
+  magic: 774202            # only positions with this magic are touched. Not 774201: another
+                           # copy of this bot on this PC uses that number.
+  symbol_suffix: ""        # e.g. "m" or ".r" if your broker renames symbols
+  pairs: [XAUUSD]
 
   strategy:
+    rules: breakout        # long after a 55-day high above SMA100; out on a 20-day low or below SMA100
+    breakout_len: 55
+    exit_len: 20
     sma_len: 100
-    mom_len: 90
-    atr_len: 14
-    atr_stop_mult: 3.0
-    risk_pct: 0.5          # % of equity lost if a stop is hit
-    allow_short: true
+    mom_len: 90            # unused by breakout rules (shown on the dashboard only)
+    atr_len: 20
+    atr_stop_mult: 3.0     # broker stop 3 x ATR away, trailing in the trade's favour
+    risk_pct: 0.75         # % of equity lost if a stop is hit. If the 0.01 minimum lot would
+                           # risk more than this, the trade is SKIPPED (never rounded up).
+                           # Nov 2026: 0.01 lot at a 3 x ATR stop risks about $300, roughly 3.1%
+                           # of a $9,900 balance, so at current volatility this skips entries.
+    allow_short: false
 
   risk:
-    max_open_positions: 6
-    max_net_per_currency: 3   # blocks e.g. long EURUSD+GBPUSD+AUDUSD+NZDUSD (one USD bet)
+    max_open_positions: 1
+    max_net_per_currency: 1
     daily_loss_halt_pct: 2.0
     weekly_loss_halt_pct: 4.0
-    max_spread_pips: 3.0
-    max_lots_per_order: 1.0
+    max_consecutive_losses: 8   # stop opening trades after 8 losses in a row
+    loss_streak_reset: ""       # to resume after that halt: today's date, e.g. "2027-01-31", then restart
+    max_spread_pips: 50         # gold "pip" here is $0.01, so 50 = a $0.50 spread
+    max_lots_per_order: 0.05
 
   schedule:
     # Daily bars close at the broker's rollover. Each poll is cheap: it refreshes

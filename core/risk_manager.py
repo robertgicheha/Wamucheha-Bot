@@ -134,6 +134,11 @@ class RiskManager:
                            proposed_action=f"open {symbol} on {venue}")
             return RiskDecision(False, "Consecutive loss limit hit")
 
+        wait = self.loss_cooldown_remaining()
+        if wait > 0:
+            return RiskDecision(False, f"Cooling off after a losing streak: "
+                                       f"{wait / 60:.0f} min left")
+
         daily_loss_limit = -abs(risk_state["trading_balance"] * self.cfg["max_daily_loss_pct"] / 100)
         if risk_state["daily_pnl"] <= daily_loss_limit:
             self._halt("Daily loss limit reached", until_tomorrow=True)
@@ -233,6 +238,25 @@ class RiskManager:
             return RiskDecision(False, "Computed position size is zero")
 
         return RiskDecision(True, "OK", position_size=size)
+
+    def loss_cooldown_remaining(self) -> float:
+        """Seconds until new entries are allowed again. After `loss_cooldown_after` losses
+        in a row, entries pause for `loss_cooldown_minutes` counted from the latest close,
+        well before the hard halt at max_consecutive_losses. 0 = trading allowed."""
+        after = self.cfg.get("loss_cooldown_after", 0)
+        minutes = self.cfg.get("loss_cooldown_minutes", 0)
+        if not after or not minutes:
+            return 0.0
+        if self.state.get_risk_state()["consecutive_losses"] < after:
+            return 0.0
+        closed = [t["closed_at"] for t in self.state.get_recent_trades(50) if t.get("closed_at")]
+        if not closed:
+            return 0.0
+        last = datetime.fromisoformat(str(max(closed)))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+        return max(0.0, minutes * 60 - elapsed)
 
     # ---------- portfolio-level helpers ----------
     def _calc_asset_class_exposure(self, open_positions: list, asset_class: str,

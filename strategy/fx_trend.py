@@ -5,7 +5,14 @@ PURE FUNCTIONS ONLY: no broker calls, no I/O, no clock. The same functions feed
 strategy/fx_trend_backtest.py and (later) a live runner, so a backtest describes
 what live trading would do.
 
-Rules (all evaluated on a CLOSED daily bar; trades are filled at the NEXT open):
+Rules (all evaluated on a CLOSED daily bar; trades are filled at the NEXT open).
+Two entry/exit rule sets, picked by TrendParams.rules:
+
+"breakout" (long/flat, same rules as strategy/crypto_trend.py):
+  long  after a close above the prior breakout_len-bar high AND above SMA(sma_len)
+  flat  after a close below the prior exit_len-bar low OR below SMA(sma_len)
+
+"momentum" (default):
   long  when close > SMA(sma_len)  AND  close / close[mom_len] - 1 > 0
   short when close < SMA(sma_len)  AND  close / close[mom_len] - 1 < 0
   flat  otherwise (the two filters disagree)
@@ -23,6 +30,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from strategy.crypto_trend import TrendConfig, compute_target_exposure
+
 
 @dataclass(frozen=True)
 class TrendParams:
@@ -33,10 +42,14 @@ class TrendParams:
     risk_pct: float = 0.5          # % of equity lost if the initial stop is hit
     allow_short: bool = True
     max_leverage_per_pos: float = 5.0   # cap on notional / equity for one position
+    rules: str = "momentum"        # "momentum" | "breakout"
+    breakout_len: int = 55         # breakout rules only
+    exit_len: int = 20             # breakout rules only
 
     @property
     def warmup(self) -> int:
-        return max(self.sma_len, self.mom_len, self.atr_len) + 1
+        extra = (self.breakout_len, self.exit_len) if self.rules == "breakout" else ()
+        return max(self.sma_len, self.mom_len, self.atr_len, *extra) + 1
 
 
 def atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
@@ -61,6 +74,16 @@ def compute_indicators(df: pd.DataFrame, p: TrendParams = TrendParams()) -> pd.D
     out["sma"] = out["close"].rolling(p.sma_len, min_periods=p.sma_len).mean()
     out["mom"] = out["close"] / out["close"].shift(p.mom_len) - 1.0
     out["atr"] = atr(out, p.atr_len)
+
+    if p.rules == "breakout":
+        exposure = compute_target_exposure(out, TrendConfig(
+            breakout_days=p.breakout_len, exit_days=p.exit_len,
+            trend_ma_days=p.sma_len, atr_days=p.atr_len))
+        ready = out[["sma", "mom", "atr"]].notna().all(axis=1)
+        out["signal"] = (exposure > 0).astype(int).where(ready, 0).astype(int)
+        return out
+    if p.rules != "momentum":
+        raise ValueError(f"unknown strategy rules: {p.rules!r}")
 
     long_ = (out["close"] > out["sma"]) & (out["mom"] > 0)
     short_ = (out["close"] < out["sma"]) & (out["mom"] < 0) if p.allow_short else False

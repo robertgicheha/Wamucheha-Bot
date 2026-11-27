@@ -44,6 +44,8 @@ fees:
 
 risk:
   max_consecutive_losses: 8          # hard stop, per your spec
+  loss_cooldown_after: 3             # after this many losses in a row, pause new entries...
+  loss_cooldown_minutes: 240         # ...for this long after the latest close (0 = off)
   max_daily_loss_pct: 5              # % of trading_balance; drawdown limit < 5%
   max_drawdown_pct: 5                # peak-to-trough drawdown halt limit
   max_position_pct: 3                # % of trading_balance risked on any single trade
@@ -123,6 +125,10 @@ execution:
     - "ETHUSD"
     # Symbol names are broker-specific: Exness uses "XAUUSDm"; MetaQuotes-Demo has no crypto;
     # Exness Kenya lists no crypto at all. Check the names in the terminal's Market Watch.
+  # The 15-minute strategy opens NO new trades on these; open positions are still managed.
+  # Backtest (Nov 2025-Nov 2026): BTC and ETH lost after costs, gold was about break-even.
+  # Gold is handled by the daily trend bot instead (config/fx_trend.yaml).
+  no_new_entries: ["XAUUSD", "BTCUSD", "ETHUSD"]
   # MT5's minimum order is 0.01 lot (~$1,000 EURUSD, ~$4,000 gold) — far above
   # max_position_pct of a small trading balance. false: skip such trades.
   # true: trade the minimum lot anyway (only sensible on a demo account).

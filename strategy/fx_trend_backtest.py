@@ -56,6 +56,7 @@ class BtConfig:
     max_net_per_currency: int = 3        # e.g. at most 3 net long-USD legs open at once
     daily_loss_halt_pct: float = 2.0     # no new entries next bar after a day down this much
     weekly_loss_halt_pct: float = 4.0    # no new entries for rest of ISO week
+    min_units: dict = field(default_factory=dict)  # smallest order per pair, in base units
     trading_enabled_from: pd.Timestamp | None = None  # evaluate only from here (warm-up before)
 
 
@@ -175,8 +176,8 @@ def run_backtest(frames: dict[str, pd.DataFrame], p: TrendParams = TrendParams()
                 stop = initial_stop(want, entry, atr_prev, p.atr_stop_mult)
                 eq = mark()
                 notional = position_notional(eq, p.risk_pct, entry, stop, p.max_leverage_per_pos)
-                if notional <= 0:
-                    continue
+                if notional <= 0 or notional / entry < cfg.min_units.get(pair, 0):
+                    continue                  # live skips it: below the broker minimum
                 pos[pair] = dict(side=want, entry=entry, stop=stop, notional=notional,
                                  entry_time=date, equity_at_entry=eq, swap_total=0.0)
                 for c, s in legs.items():

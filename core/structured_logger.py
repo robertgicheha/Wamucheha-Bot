@@ -434,6 +434,7 @@ class EngineHeartbeat:
     def __init__(self, path=HEARTBEAT_PATH):
         self.path = path
         self._last_write = 0.0
+        self._last_health = None
         self._run_started = time.time()
         # A previous run that ended less than this long ago means this is a
         # restart, not a cold boot — worth knowing, because a crash loop looks
@@ -456,9 +457,13 @@ class EngineHeartbeat:
 
     def beat(self, health: str = "running", force: bool = False):
         now = time.time()
-        if not force and now - self._last_write < HEARTBEAT_INTERVAL:
+        # Only unchanged status is throttled. A change (starting -> running,
+        # running -> halted ...) is written at once so the dashboard never lags.
+        if (not force and health == self._last_health
+                and now - self._last_write < HEARTBEAT_INTERVAL):
             return
         self._last_write = now
+        self._last_health = health
         payload = {
             "run_started_epoch": self._run_started,
             "run_started": datetime.fromtimestamp(
